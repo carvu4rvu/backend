@@ -2903,6 +2903,7 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       .from('student_basic_details')
       .select(`
         usn, full_name, college_email, personal_email,
+        phone_country_code, phone_number,
         school_id, program_id, major_id, minor_id, specialization_id,
         year_of_joining, current_year, current_semester,
         social_links, profile_image
