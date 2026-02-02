@@ -52,6 +52,9 @@ router.get('/email-recipients', authenticateToken, emailRecipientsController.get
 // Alumni (me before :identifier; codes before :identifier to avoid matching "codes" as id)
 router.get('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniMe);
 router.put('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.updateAlumniMe);
+// Alumni: HR Recommendations
+router.post('/alumni/hr-recommendations', authenticateToken, authorizeRoles('alumni'), placementController.submitHrRecommendation);
+router.get('/alumni/hr-recommendations', authenticateToken, authorizeRoles('alumni'), placementController.getMyHrRecommendations);
 // Alumni: view student profile (limited access)
 router.get('/alumni/student/:usn', authenticateToken, authorizeRoles('alumni'), placementController.getStudentProfileForAlumni);
 router.get('/alumni', authenticateToken, placementController.getAllAlumni);
@@ -94,5 +97,8 @@ router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin', 'supera
 
 // Dashboard Stats
 router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getDashboardStats);
+
+// HR Recommendations (admin)
+router.get('/hr-recommendations', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getAllHrRecommendations);
 
 module.exports = router;

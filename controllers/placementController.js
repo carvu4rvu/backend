@@ -2888,6 +2888,122 @@ exports.getDashboardStats = async (req, res) => {
 };
 
 /**
+ * Helper: Resolve alumni ID from request user email
+ */
+async function resolveAlumniId(req) {
+  const email = (req.user && req.user.email) ? String(req.user.email).trim().toLowerCase() : null;
+  if (!email) return null;
+  
+  const { data } = await supabase
+    .from('alumni')
+    .select('id')
+    .ilike('personal_email', email)
+    .maybeSingle();
+  
+  return data?.id || null;
+}
+
+/**
+ * POST /placement/alumni/hr-recommendations
+ * Submit HR recommendation from alumni
+ */
+exports.submitHrRecommendation = async (req, res) => {
+  try {
+    const alumniId = await resolveAlumniId(req);
+    if (!alumniId) {
+      return res.status(403).json({ message: 'Alumni profile not found for this account' });
+    }
+
+    const b = req.body || {};
+    
+    if (!b.company_name || !b.hr_name) {
+      return res.status(400).json({ message: 'Company name and HR name are required' });
+    }
+
+    const { data, error } = await supabase
+      .from('hr_recommendations')
+      .insert({
+        alumni_id: alumniId,
+        company_name: b.company_name,
+        hr_name: b.hr_name,
+        hr_email: b.hr_email || null,
+        hr_phone: b.hr_phone || null,
+        hiring_role: b.hiring_role || null,
+        opportunity_type: b.opportunity_type || null,
+        recommendation_note: b.recommendation_note || null,
+        consent_given: b.consent_given === true,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('submitHrRecommendation insert error:', error);
+      return res.status(500).json({ message: apiMessage(error, 'Failed to submit recommendation') });
+    }
+
+    res.status(201).json({ message: 'HR recommendation submitted successfully', data });
+  } catch (err) {
+    logger.error('submitHrRecommendation:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to submit recommendation') });
+  }
+};
+
+/**
+ * GET /placement/alumni/hr-recommendations
+ * Get all HR recommendations for the logged-in alumni
+ */
+exports.getMyHrRecommendations = async (req, res) => {
+  try {
+    const alumniId = await resolveAlumniId(req);
+    if (!alumniId) {
+      return res.status(403).json({ message: 'Alumni profile not found for this account' });
+    }
+
+    const { data, error } = await supabase
+      .from('hr_recommendations')
+      .select('*')
+      .eq('alumni_id', alumniId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('getMyHrRecommendations error:', error);
+      return res.status(500).json({ message: apiMessage(error, 'Failed to fetch recommendations') });
+    }
+
+    res.json(data || []);
+  } catch (err) {
+    logger.error('getMyHrRecommendations:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to fetch recommendations') });
+  }
+};
+
+/**
+ * GET /placement/hr-recommendations (admin)
+ * Get all HR recommendations for admin review
+ */
+exports.getAllHrRecommendations = async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('hr_recommendations')
+      .select(`
+        *,
+        alumni:alumni_id (id, full_name, current_company, personal_email)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('getAllHrRecommendations error:', error);
+      return res.status(500).json({ message: apiMessage(error, 'Failed to fetch recommendations') });
+    }
+
+    res.json(data || []);
+  } catch (err) {
+    logger.error('getAllHrRecommendations:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to fetch recommendations') });
+  }
+};
+
+/**
  * GET /placement/alumni/student/:usn
  * Returns student profile for alumni viewing (limited data, excludes sensitive info)
  */
