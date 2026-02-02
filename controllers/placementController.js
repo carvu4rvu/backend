@@ -2341,6 +2341,7 @@ exports.updateAlumniMe = async (req, res) => {
       linkedin: b.linkedin ?? undefined,
       other_links: b.other_links ?? undefined,
       alumni_remark: b.alumni_remark ?? undefined,
+      profile_image: b.profile_image ?? undefined,
       updated_at: new Date().toISOString()
     };
     Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
@@ -2883,6 +2884,130 @@ exports.getDashboardStats = async (req, res) => {
   } catch (error) {
     logger.error('getDashboardStats:', error);
     res.status(500).json({ message: apiMessage(error, 'Failed to fetch dashboard stats') });
+  }
+};
+
+/**
+ * GET /placement/alumni/student/:usn
+ * Returns student profile for alumni viewing (limited data, excludes sensitive info)
+ */
+exports.getStudentProfileForAlumni = async (req, res) => {
+  try {
+    const { usn } = req.params;
+    if (!usn) {
+      return res.status(400).json({ message: 'USN is required' });
+    }
+
+    // Get basic student details
+    const { data: student, error: studentError } = await supabase
+      .from('student_basic_details')
+      .select(`
+        usn, full_name, college_email, personal_email,
+        school_id, program_id, major_id, minor_id, specialization_id,
+        year_of_joining, current_year, current_semester,
+        social_links, profile_image
+      `)
+      .eq('usn', usn)
+      .single();
+
+    if (studentError || !student) {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    // Get school, program, major names
+    const [schoolRes, programRes, majorRes] = await Promise.all([
+      student.school_id ? supabase.from('schools').select('name').eq('id', student.school_id).single() : { data: null },
+      student.program_id ? supabase.from('programs').select('name').eq('id', student.program_id).single() : { data: null },
+      student.major_id ? supabase.from('majors').select('name').eq('id', student.major_id).single() : { data: null },
+    ]);
+
+    // Get profile details (career info, resume)
+    const { data: profileDetails } = await supabase
+      .from('student_profile_details')
+      .select('brief_summary, key_expertise, hobbies_interests, career_objective, future_goals, resume_file')
+      .eq('usn', usn)
+      .single();
+
+    // Get projects (only PUBLIC and approved)
+    const { data: projects } = await supabase
+      .from('student_projects')
+      .select('*')
+      .eq('usn', usn)
+      .eq('visibility', 'PUBLIC')
+      .eq('is_approved', true)
+      .order('priority', { ascending: true });
+
+    // Get education history
+    const { data: education } = await supabase
+      .from('student_education_history')
+      .select('*')
+      .eq('usn', usn)
+      .order('year_of_passing', { ascending: false });
+
+    // Get internships
+    const { data: internships } = await supabase
+      .from('student_internships')
+      .select('*')
+      .eq('usn', usn)
+      .order('start_date', { ascending: false });
+
+    // Get trainings
+    const { data: trainings } = await supabase
+      .from('student_trainings')
+      .select('*')
+      .eq('usn', usn)
+      .order('start_date', { ascending: false });
+
+    // Get certifications
+    const { data: certifications } = await supabase
+      .from('student_certifications')
+      .select('*')
+      .eq('usn', usn)
+      .order('issue_date', { ascending: false });
+
+    // Get publications
+    const { data: publications } = await supabase
+      .from('student_publications')
+      .select('*')
+      .eq('usn', usn)
+      .order('publication_date', { ascending: false });
+
+    // Get extra-curricular activities
+    const { data: extraCurricular } = await supabase
+      .from('student_extra_curricular_activities')
+      .select('*')
+      .eq('usn', usn)
+      .order('start_date', { ascending: false });
+
+    // Get other experiences
+    const { data: otherExperiences } = await supabase
+      .from('student_other_experiences')
+      .select('*')
+      .eq('usn', usn)
+      .order('start_date', { ascending: false });
+
+    res.json({
+      usn: student.usn,
+      personal: {
+        ...student,
+        schoolName: schoolRes.data?.name || null,
+        programName: programRes.data?.name || null,
+        majorName: majorRes.data?.name || null,
+      },
+      career: profileDetails || {},
+      resume_file: profileDetails?.resume_file || null,
+      projects: projects || [],
+      education: education || [],
+      internships: internships || [],
+      trainings: trainings || [],
+      certifications: certifications || [],
+      publications: publications || [],
+      extraCurricular: extraCurricular || [],
+      otherExperiences: otherExperiences || [],
+    });
+  } catch (error) {
+    logger.error('getStudentProfileForAlumni:', error);
+    res.status(500).json({ message: apiMessage(error, 'Failed to fetch student profile') });
   }
 };
 

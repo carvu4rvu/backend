@@ -2,6 +2,8 @@ const pool = require('../config/db');
 const transporter = require('../config/smtp');
 const bcrypt = require('bcryptjs');
 const generateToken = require('../utils/jwtGenerator');
+const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
+const { validatePhoneNumber, validateOccupation } = require('../utils/profileValidators');
 
 // Helper to send email
 const sendOTPEmail = async (email, otp, purpose) => {
@@ -196,13 +198,20 @@ exports.registerStudent = async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Update Basic Details 
-    // Updated to include gender and date_of_birth
+    // Validate and normalize personal phone - must be numeric and exactly 10 digits when provided
+    const normalizedPersonal = normalizePhoneForDb(null, phone || '');
+    if (phone && !normalizedPersonal.phone_number) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Personal contact must be numeric and exactly 10 digits.' });
+    }
+    const personalPhoneNumber = normalizedPersonal.phone_number || null;
+
+    // Update Basic Details (include normalized phone)
     await client.query(`
       UPDATE student_basic_details 
       SET personal_email = $1, phone_number = $2, is_registered = true, gender = $3, date_of_birth = $4
       WHERE usn = $5
-    `, [personalEmail, phone, gender, dob, usn]);
+    `, [personalEmail, personalPhoneNumber, gender, dob, usn]);
 
     // Create User Login
     let roleRes = await client.query(`SELECT id FROM roles WHERE name = 'student'`);
@@ -255,10 +264,24 @@ exports.registerStudent = async (req, res) => {
         for (const p of parents) {
           if (!p || !p.name || !p.type) continue;
 
+          // Validate occupation (if present) and parent phone (if present)
+          const occCheck = validateOccupation(p.occupation || '');
+          if (!occCheck.valid) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: `Parent occupation invalid: ${occCheck.message}` });
+          }
+
+          const rawParentPhone = p.phone || p.phone_number || p.contact || '';
+          const parsed = normalizePhoneForDb(p.phone_country_code || null, rawParentPhone);
+          if (rawParentPhone && !parsed.phone_number) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Parent contact must be numeric and exactly 10 digits.' });
+          }
+
           await client.query(`
             INSERT INTO student_parent_details (usn, parent_type, name, occupation, phone_number, phone_country_code)
             VALUES ($1, $2, $3, $4, $5, $6)
-          `, [usn, p.type, p.name, p.occupation || null, p.phone || null, '+91']);
+          `, [usn, p.type, p.name, p.occupation || null, parsed.phone_number || null, parsed.phone_country_code || null]);
         }
       } catch (pErr) {
         console.warn("Parent insertion failed:", pErr.message);

@@ -347,6 +347,21 @@ function validateSection(value) {
 }
 
 /**
+ * Validates occupation/text fields. Optional; if present must be a string and not purely numeric.
+ * @param {string} value
+ * @param {string} fieldName
+ */
+function validateOccupation(value, fieldName = 'Occupation') {
+  if (value === null || value === undefined || value === '') return { valid: true };
+  if (typeof value !== 'string') return { valid: false, message: `${fieldName} must be text.` };
+  const trimmed = value.trim();
+  if (!trimmed) return { valid: true };
+  if (/^\d+$/.test(trimmed)) return { valid: false, message: `${fieldName} cannot be purely numeric.` };
+  if (trimmed.length > 100) return { valid: false, message: `${fieldName} is too long.` };
+  return { valid: true };
+}
+
+/**
  * Validates URL (http/https) when present. Empty/undefined is valid (optional field).
  * @param {string} value
  * @returns {ValidationResult}
@@ -402,6 +417,7 @@ module.exports = {
   validateSelfRating,
   validateBloodGroup,
   validateSection,
+  validateOccupation,
   validateUrl,
   runValidators,
   EMAIL_REGEX,

@@ -52,6 +52,8 @@ router.get('/email-recipients', authenticateToken, emailRecipientsController.get
 // Alumni (me before :identifier; codes before :identifier to avoid matching "codes" as id)
 router.get('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniMe);
 router.put('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.updateAlumniMe);
+// Alumni: view student profile (limited access)
+router.get('/alumni/student/:usn', authenticateToken, authorizeRoles('alumni'), placementController.getStudentProfileForAlumni);
 router.get('/alumni', authenticateToken, placementController.getAllAlumni);
 router.post('/alumni', authenticateToken, placementController.addAlumni);
 router.get('/alumni/codes', authenticateToken, placementController.getRegistrationCodes);
@@ -64,6 +66,11 @@ router.put('/alumni/:identifier', authenticateToken, placementController.updateA
 router.get('/projects/public', projectController.getPublicProjects);
 router.get('/projects', authenticateToken, authorizeRoles('admin', 'superadmin'), projectController.getAllProjects);
 router.patch('/projects/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), projectController.updateProject);
+
+// Alumni projects: view and like
+router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), projectController.getAlumniProjects);
+router.post('/projects/:id/like', authenticateToken, authorizeRoles('alumni'), projectController.toggleProjectLike);
+router.post('/projects/:id/view', projectController.incrementProjectView);
 
 // Violations: eligibility logs, placement violations, disciplinary records
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.getEligibilityDecisionLogs);
