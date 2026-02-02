@@ -83,6 +83,7 @@ if (typeof addJobOfferHandler !== 'function') {
 }
 router.get('/job-offers', authenticateToken, authorizeRoles('admin', 'superadmin'), getAllJobOffersHandler);
 router.post('/job-offers', authenticateToken, authorizeRoles('admin', 'superadmin'), addJobOfferHandler);
+router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.updateJobOffer);
 
 // Dashboard Stats
 router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getDashboardStats);

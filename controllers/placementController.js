@@ -2723,6 +2723,114 @@ exports.addJobOffer = async (req, res) => {
 };
 
 /**
+ * PUT /placement/job-offers/:id - update an existing job offer
+ * Body: company_id, designation, job_type, ctc_min_lpa, ctc_max_lpa, ctc_variable_pay, ctc_stock_in_lpa, 
+ *       offer_letter_status, academic_year, remarks, type_of_hiring, job_description,
+ *       internship_duration_months, internship_stipend_min, internship_stipend_max
+ */
+exports.updateJobOffer = async (req, res) => {
+  try {
+    const offerId = parseInt(req.params.id, 10);
+    if (Number.isNaN(offerId)) {
+      return res.status(400).json({ message: 'Invalid offer id' });
+    }
+
+    const b = req.body;
+
+    // First, get the existing offer to find linked placement/capstone
+    const { data: existingOffer, error: fetchError } = await supabase
+      .from('offers')
+      .select('id, student_id, company_id, placement_id, capstone_id, job_type, academic_year, remarks')
+      .eq('id', offerId)
+      .maybeSingle();
+
+    if (fetchError) {
+      logger.error('updateJobOffer fetch error:', fetchError);
+      throw fetchError;
+    }
+
+    if (!existingOffer) {
+      return res.status(404).json({ message: 'Offer not found' });
+    }
+
+    // Update the offers table
+    const offerUpdate = {};
+    if (b.company_id !== undefined) offerUpdate.company_id = b.company_id;
+    if (b.job_type !== undefined) offerUpdate.job_type = b.job_type;
+    if (b.academic_year !== undefined) offerUpdate.academic_year = b.academic_year;
+    if (b.remarks !== undefined) offerUpdate.remarks = b.remarks;
+
+    if (Object.keys(offerUpdate).length > 0) {
+      const { error: offerUpdateError } = await supabase
+        .from('offers')
+        .update(offerUpdate)
+        .eq('id', offerId);
+
+      if (offerUpdateError) {
+        logger.error('updateJobOffer offers update error:', offerUpdateError);
+      }
+    }
+
+    // Update linked placement record if exists
+    if (existingOffer.placement_id) {
+      const placementUpdate = {};
+      if (b.company_id !== undefined) placementUpdate.company_id = b.company_id;
+      if (b.designation !== undefined) placementUpdate.designation = b.designation;
+      if (b.offer_letter_status !== undefined) placementUpdate.offer_letter_status = b.offer_letter_status;
+      if (b.job_description !== undefined) placementUpdate.job_description = b.job_description;
+      if (b.ctc_min_lpa !== undefined) placementUpdate.ctc_min_lpa = b.ctc_min_lpa;
+      if (b.ctc_max_lpa !== undefined) placementUpdate.ctc_max_lpa = b.ctc_max_lpa;
+      if (b.ctc_variable_pay !== undefined) placementUpdate.ctc_variable_pay = b.ctc_variable_pay;
+      if (b.ctc_stock_in_lpa !== undefined) placementUpdate.ctc_stock_in_lpa = b.ctc_stock_in_lpa;
+      if (b.type_of_hiring !== undefined) placementUpdate.type_of_hiring = b.type_of_hiring;
+      if (b.academic_year !== undefined) placementUpdate.academic_year = b.academic_year;
+      if (b.remarks !== undefined) placementUpdate.remarks = b.remarks;
+
+      if (Object.keys(placementUpdate).length > 0) {
+        const { error: placementUpdateError } = await supabase
+          .from('placement')
+          .update(placementUpdate)
+          .eq('id', existingOffer.placement_id);
+
+        if (placementUpdateError) {
+          logger.error('updateJobOffer placement update error:', placementUpdateError);
+        }
+      }
+    }
+
+    // Update linked capstone record if exists
+    if (existingOffer.capstone_id) {
+      const capstoneUpdate = {};
+      if (b.company_name !== undefined) capstoneUpdate.company_name = b.company_name;
+      if (b.designation !== undefined) capstoneUpdate.designation = b.designation;
+      if (b.offer_letter_status !== undefined) capstoneUpdate.offer_letter_status = b.offer_letter_status;
+      if (b.internship_duration_months !== undefined) capstoneUpdate.internship_duration_months = b.internship_duration_months;
+      if (b.internship_stipend_min !== undefined) capstoneUpdate.internship_stipend_min = b.internship_stipend_min;
+      if (b.internship_stipend_max !== undefined) capstoneUpdate.internship_stipend_max = b.internship_stipend_max;
+      if (b.description !== undefined) capstoneUpdate.description = b.description;
+      if (b.academic_year !== undefined) capstoneUpdate.academic_year = b.academic_year;
+      if (b.remarks !== undefined) capstoneUpdate.remarks = b.remarks;
+
+      if (Object.keys(capstoneUpdate).length > 0) {
+        const { error: capstoneUpdateError } = await supabase
+          .from('capstone')
+          .update(capstoneUpdate)
+          .eq('id', existingOffer.capstone_id);
+
+        if (capstoneUpdateError) {
+          logger.error('updateJobOffer capstone update error:', capstoneUpdateError);
+        }
+      }
+    }
+
+    res.json({ message: 'Job offer updated successfully' });
+  } catch (err) {
+    logger.error('updateJobOffer:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to update job offer') });
+  }
+};
+
+/**
  * GET /placement/dashboard/stats
  * Returns dashboard metrics: placementSeeking, totalOffers, totalPlaced, totalInternship, totalInternshipCumFullTime
  */
