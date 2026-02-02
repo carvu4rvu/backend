@@ -2434,41 +2434,106 @@ exports.deleteRegistrationCode = async (req, res) => {
 };
 
 /**
- * GET /placement/job-offers - get all job offers with student and company details (admin)
+ * GET /placement/job-offers - get all job offers from offers, placement, and capstone tables (admin)
  */
 exports.getAllJobOffers = async (req, res) => {
   try {
-    // First, get all placement records with company info
-    const { data: placements, error: placementError } = await supabase
-      .from('placement')
+    // 1. Fetch all offers with linked placement and capstone data
+    const { data: offersData, error: offersError } = await supabase
+      .from('offers')
       .select(`
         id,
         student_id,
         company_id,
-        designation,
-        offer_letter_status,
-        ctc_min_lpa,
-        ctc_max_lpa,
-        ctc_variable_pay,
-        ctc_stock_in_lpa,
-        type_of_hiring,
+        placement_id,
+        capstone_id,
+        job_type,
         academic_year,
         remarks,
         created_at,
         updated_at,
-        companies(company_name)
+        companies(id, company_name)
       `)
       .order('created_at', { ascending: false });
 
-    if (placementError) {
-      logger.error('[placement] getAllJobOffers placement query error:', placementError);
-      throw placementError;
+    if (offersError) {
+      logger.error('[placement] getAllJobOffers offers query error:', offersError);
+      throw offersError;
     }
 
-    // Get unique student IDs from placements
-    const studentIds = [...new Set((placements || []).map(p => p.student_id).filter(Boolean))];
+    // 2. Get all unique placement_ids and capstone_ids
+    const placementIds = [...new Set((offersData || []).map(o => o.placement_id).filter(Boolean))];
+    const capstoneIds = [...new Set((offersData || []).map(o => o.capstone_id).filter(Boolean))];
 
-    // Fetch student details separately (no FK constraint between placement.student_id and student_basic_details.usn)
+    // 3. Fetch placement details
+    let placementsMap = {};
+    if (placementIds.length > 0) {
+      const { data: placements, error: placementError } = await supabase
+        .from('placement')
+        .select(`
+          id,
+          student_id,
+          company_id,
+          designation,
+          offer_letter_status,
+          job_description,
+          ctc_min_lpa,
+          ctc_max_lpa,
+          ctc_variable_pay,
+          ctc_stock_in_lpa,
+          type_of_hiring,
+          academic_year,
+          remarks,
+          companies(id, company_name)
+        `)
+        .in('id', placementIds);
+
+      if (placementError) {
+        logger.error('[placement] getAllJobOffers placements query error:', placementError);
+      } else {
+        (placements || []).forEach(p => {
+          placementsMap[p.id] = p;
+        });
+      }
+    }
+
+    // 4. Fetch capstone details
+    let capstonesMap = {};
+    if (capstoneIds.length > 0) {
+      const { data: capstones, error: capstoneError } = await supabase
+        .from('capstone')
+        .select(`
+          id,
+          usn,
+          company_name,
+          internship_duration_months,
+          designation,
+          offer_letter_status,
+          internship_stipend_min,
+          internship_stipend_max,
+          description,
+          academic_year,
+          remarks
+        `)
+        .in('id', capstoneIds);
+
+      if (capstoneError) {
+        logger.error('[placement] getAllJobOffers capstones query error:', capstoneError);
+      } else {
+        (capstones || []).forEach(c => {
+          capstonesMap[c.id] = c;
+        });
+      }
+    }
+
+    // 5. Get unique student IDs from all sources
+    const studentIds = [...new Set([
+      ...(offersData || []).map(o => o.student_id),
+      ...Object.values(placementsMap).map(p => p.student_id),
+      ...Object.values(capstonesMap).map(c => c.usn)
+    ].filter(Boolean))];
+
+    // 6. Fetch student details
     let studentsMap = {};
     if (studentIds.length > 0) {
       const { data: students, error: studentsError } = await supabase
@@ -2479,54 +2544,96 @@ exports.getAllJobOffers = async (req, res) => {
           year_of_joining,
           school_id,
           program_id,
-          schools(name),
+          schools(name, abbreviation),
           programs(name)
         `)
         .in('usn', studentIds);
 
       if (studentsError) {
         logger.error('[placement] getAllJobOffers students query error:', studentsError);
-        // Don't throw - continue with empty student data
       } else {
-        // Build a map for quick lookup
         (students || []).forEach(s => {
           studentsMap[s.usn] = s;
         });
       }
     }
 
-    // Transform data to match frontend expectations
-    const offers = (placements || []).map(p => {
-      const student = studentsMap[p.student_id] || null;
-      const school = student?.schools;
-      const program = student?.programs;
-      const company = p.companies;
+    // 7. Transform offers data
+    const results = (offersData || []).map(o => {
+      const student = studentsMap[o.student_id] || null;
+      const placement = o.placement_id ? placementsMap[o.placement_id] : null;
+      const capstone = o.capstone_id ? capstonesMap[o.capstone_id] : null;
+      const company = o.companies || placement?.companies || null;
 
       return {
-        id: p.id,
-        usn: student?.usn || p.student_id,
+        // Offer table fields
+        id: o.id,
+        offer_id: o.id,
+        student_id: o.student_id,
+        placement_id: o.placement_id,
+        capstone_id: o.capstone_id,
+        offer_job_type: o.job_type,
+        offer_academic_year: o.academic_year,
+        offer_remarks: o.remarks,
+        offer_created_at: o.created_at,
+        offer_updated_at: o.updated_at,
+
+        // Student fields
+        usn: student?.usn || o.student_id,
         student_name: student?.full_name || '',
         batch: student?.year_of_joining || null,
-        school: school?.name || '',
-        program: program?.name || '',
-        company_id: p.company_id,
-        company_name: company?.company_name || '',
-        designation: p.designation,
-        job_type: p.type_of_hiring || 'full time',
-        ctc_min_lpa: p.ctc_min_lpa,
-        ctc_max_lpa: p.ctc_max_lpa,
-        ctc: p.ctc_max_lpa || p.ctc_min_lpa, // fallback for display
-        ctc_variable_pay: p.ctc_variable_pay,
-        ctc_stock_in_lpa: p.ctc_stock_in_lpa,
-        offer_letter_status: p.offer_letter_status || 'Pending',
-        academic_year: p.academic_year,
-        remarks: p.remarks,
-        created_at: p.created_at,
-        updated_at: p.updated_at
+        school: student?.schools?.name || student?.schools?.abbreviation || '',
+        program: student?.programs?.name || '',
+
+        // Company fields (from offer or placement)
+        company_id: o.company_id || placement?.company_id,
+        company_name: company?.company_name || capstone?.company_name || '',
+
+        // Placement table fields
+        placement_designation: placement?.designation || null,
+        placement_offer_letter_status: placement?.offer_letter_status || null,
+        placement_job_description: placement?.job_description || null,
+        placement_ctc_min_lpa: placement?.ctc_min_lpa || null,
+        placement_ctc_max_lpa: placement?.ctc_max_lpa || null,
+        placement_ctc_variable_pay: placement?.ctc_variable_pay || null,
+        placement_ctc_stock_in_lpa: placement?.ctc_stock_in_lpa || null,
+        placement_type_of_hiring: placement?.type_of_hiring || null,
+        placement_academic_year: placement?.academic_year || null,
+        placement_remarks: placement?.remarks || null,
+
+        // Capstone table fields
+        capstone_company_name: capstone?.company_name || null,
+        capstone_internship_duration_months: capstone?.internship_duration_months || null,
+        capstone_designation: capstone?.designation || null,
+        capstone_offer_letter_status: capstone?.offer_letter_status || null,
+        capstone_internship_stipend_min: capstone?.internship_stipend_min || null,
+        capstone_internship_stipend_max: capstone?.internship_stipend_max || null,
+        capstone_description: capstone?.description || null,
+        capstone_academic_year: capstone?.academic_year || null,
+        capstone_remarks: capstone?.remarks || null,
+
+        // Combined/derived fields for backward compatibility
+        designation: placement?.designation || capstone?.designation || null,
+        job_type: o.job_type || placement?.type_of_hiring || (capstone ? 'capstone' : 'full time'),
+        ctc_min_lpa: placement?.ctc_min_lpa || null,
+        ctc_max_lpa: placement?.ctc_max_lpa || null,
+        ctc: placement?.ctc_max_lpa || placement?.ctc_min_lpa || null,
+        ctc_variable_pay: placement?.ctc_variable_pay || null,
+        offer_letter_status: placement?.offer_letter_status || capstone?.offer_letter_status || 'Pending',
+        academic_year: o.academic_year || placement?.academic_year || capstone?.academic_year || null,
+        remarks: o.remarks || placement?.remarks || capstone?.remarks || null,
+        internship_duration: capstone?.internship_duration_months || null,
+        internship_stipend_min: capstone?.internship_stipend_min || null,
+        internship_stipend_max: capstone?.internship_stipend_max || null,
+        created_at: o.created_at,
+        updated_at: o.updated_at,
+
+        // Source indicator
+        source: capstone ? 'capstone' : (placement ? 'placement' : 'offer')
       };
     });
 
-    res.json(offers);
+    res.json(results);
   } catch (err) {
     logger.error('[placement] getAllJobOffers:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to fetch job offers') });
