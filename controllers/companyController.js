@@ -519,14 +519,15 @@ exports.getStudentProfile = async (req, res) => {
 
     const { usn } = req.params;
 
-    // Basic details (limited fields)
+    // Basic details (including mandatory fields for company view)
     const { data: student, error: studentError } = await supabase
       .from('student_basic_details')
       .select(`
         usn, full_name, college_email,
         school_id, program_id, major_id, specialization_id,
         year_of_joining, current_year, current_semester,
-        profile_image
+        profile_image, gender, date_of_birth,
+        personal_email, phone_country_code, phone_number
       `)
       .eq('usn', usn)
       .single();
@@ -535,12 +536,21 @@ exports.getStudentProfile = async (req, res) => {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    // Profile details
+    // Profile details (resume for company view)
     const { data: profile } = await supabase
       .from('student_profile_details')
       .select('brief_summary, key_expertise, career_objective, resume_file')
       .eq('usn', usn)
       .single();
+
+    // Latest semester academics (current aggregate & live backlogs)
+    const { data: semesterRows } = await supabase
+      .from('student_semester_academics')
+      .select('academic_year, semester, result_in_sgpa, live_backlogs')
+      .eq('usn', usn)
+      .order('academic_year', { ascending: false })
+      .order('semester', { ascending: false })
+      .limit(1);
 
     // Public projects only
     const { data: projects } = await supabase
@@ -602,6 +612,25 @@ exports.getStudentProfile = async (req, res) => {
     const majors = Object.fromEntries((majorsRes.data || []).map(m => [m.id, m.name]));
     const specializations = Object.fromEntries((specializationsRes.data || []).map(s => [s.id, s.name]));
 
+    const eduList = education || [];
+    const tenthEdu = eduList.find(e => (e.education_level || '').toUpperCase() === '10TH');
+    const twelfthEdu = eduList.find(e => (e.education_level || '').toUpperCase() === '12TH');
+    const diplomaEdu = eduList.find(e => (e.education_level || '').toUpperCase() === 'DIPLOMA');
+    const latestAcad = Array.isArray(semesterRows) && semesterRows.length > 0 ? semesterRows[0] : null;
+
+    const formatDob = (d) => {
+      if (!d) return null;
+      const date = new Date(d);
+      if (isNaN(date.getTime())) return null;
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const year = date.getFullYear();
+      return `${day}-${month}-${year}`;
+    };
+
+    const officialPhone = [student.phone_country_code, student.phone_number].filter(Boolean).join(' ').trim() || null;
+    const personalEmails = student.personal_email ? [student.personal_email] : [];
+
     res.json({
       data: {
         ...student,
@@ -616,6 +645,15 @@ exports.getStudentProfile = async (req, res) => {
         capstone: capstone || [],
         education: education || [],
         certifications: certifications || [],
+        official_email: student.college_email || null,
+        personal_emails: personalEmails,
+        official_phone: officialPhone,
+        date_of_birth_formatted: formatDob(student.date_of_birth),
+        tenth_aggregate_marks: tenthEdu?.result != null ? String(tenthEdu.result) + (tenthEdu.result_type ? ` ${tenthEdu.result_type}` : '') : null,
+        twelfth_aggregate_marks: twelfthEdu?.result != null ? String(twelfthEdu.result) + (twelfthEdu.result_type ? ` ${twelfthEdu.result_type}` : '') : null,
+        diploma_aggregate_marks: diplomaEdu?.result != null ? String(diplomaEdu.result) + (diplomaEdu.result_type ? ` ${diplomaEdu.result_type}` : '') : null,
+        current_aggregate_marks: latestAcad?.result_in_sgpa != null ? String(latestAcad.result_in_sgpa) : null,
+        current_live_backlogs: latestAcad?.live_backlogs != null ? parseInt(latestAcad.live_backlogs, 10) : null,
       }
     });
   } catch (err) {
@@ -739,17 +777,24 @@ exports.getDashboardStats = async (req, res) => {
       .eq('id', companyId)
       .single();
 
-    // Get drives
+    // Get drives (include job_type for chart labels)
     const { data: drives } = await supabase
       .from('placements_drives')
-      .select('id, placement_status, number_of_registrations')
-      .eq('company_id', companyId);
+      .select('id, placement_status, number_of_registrations, job_type, academic_year')
+      .eq('company_id', companyId)
+      .order('id', { ascending: false });
 
-    const activeDrives = (drives || []).filter(d => 
+    const activeDrives = (drives || []).filter(d =>
       d.placement_status && !['completed', 'cancelled'].includes(d.placement_status.toLowerCase())
     );
 
     const totalRegistrations = (drives || []).reduce((sum, d) => sum + (d.number_of_registrations || 0), 0);
+
+    // Chart: registrations per drive (bar)
+    const chart_drives_registrations = (drives || []).slice(0, 10).map((d, i) => ({
+      label: (d.job_type || d.academic_year || `Drive ${i + 1}`).toString().slice(0, 20),
+      registrations: d.number_of_registrations || 0,
+    }));
 
     // Get offers
     const { data: offers } = await supabase
@@ -759,6 +804,13 @@ exports.getDashboardStats = async (req, res) => {
 
     const totalOffers = (offers || []).length;
     const acceptedOffers = (offers || []).filter(o => o.is_accepted === true).length;
+    const pendingOffers = totalOffers - acceptedOffers;
+
+    // Chart: offers breakdown (doughnut)
+    const chart_offers = { accepted: acceptedOffers, pending: pendingOffers };
+
+    // Chart: drives by status (for doughnut)
+    const driveStatusCounts = { active: activeDrives.length, completed: (drives || []).length - activeDrives.length };
 
     // Recent activity: recent registrations
     const driveIds = (drives || []).map(d => d.id);
@@ -795,6 +847,9 @@ exports.getDashboardStats = async (req, res) => {
           accepted_offers: acceptedOffers,
         },
         recent_activity: recentActivity,
+        chart_drives_registrations: chart_drives_registrations,
+        chart_offers: chart_offers,
+        chart_drives_status: driveStatusCounts,
       }
     });
   } catch (err) {
