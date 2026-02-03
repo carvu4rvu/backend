@@ -398,7 +398,10 @@ exports.updatePersonalProfile = async (req, res) => {
         }
 
         const bloodGroup = data.bloodGroup ?? data.blood_group;
-        if (bloodGroup !== undefined && bloodGroup !== '' && bloodGroup != null) {
+        // Make blood group mandatory
+        if (bloodGroup === undefined || bloodGroup === '' || bloodGroup == null) {
+            fieldErrors.blood_group = 'Blood group is required.';
+        } else {
             const r = validateBloodGroup(bloodGroup);
             if (!r.valid) fieldErrors.blood_group = r.message;
         }
@@ -449,7 +452,8 @@ exports.updatePersonalProfile = async (req, res) => {
         if (data.personalEmail !== undefined) updateData.personal_email = data.personalEmail || null;
         if (data.personal_email !== undefined) updateData.personal_email = data.personal_email || null;
 
-        if (rawPhone !== '' || rawCode !== '') {
+        // If client explicitly provided phone fields (even empty), process them so clearing is persisted.
+        if (data.phoneNumber !== undefined || data.phone_number !== undefined || data.phoneCountryCode !== undefined || data.phone_country_code !== undefined) {
             const { phone_country_code: normCode, phone_number: normNumber } = normalizePhoneForDb(
                 data.phoneCountryCode ?? data.phone_country_code,
                 data.phoneNumber ?? data.phone_number
@@ -497,7 +501,8 @@ exports.updatePersonalProfile = async (req, res) => {
             if (currentRow?.opt_in === true && !requestedOptIn) {
                 // One-way: cannot revert opt-in
                 delete updateData.opt_in;
-            } else if (requestedOptIn) {
+            } else if (requestedOptIn && !currentRow?.opt_in) {
+                // Only validate when changing from NOT opted-in to opted-in
                 // Fetch merged row (incoming + current) for eligibility
                 const merged = { ...updateData };
                 const { data: current } = await supabase
@@ -535,10 +540,13 @@ exports.updatePersonalProfile = async (req, res) => {
         if (data.hasAgreedPlacementPolicy !== undefined) updateData.has_agreed_placement_policy = data.hasAgreedPlacementPolicy === true;
         if (data.has_agreed_placement_policy !== undefined) updateData.has_agreed_placement_policy = data.has_agreed_placement_policy === true;
 
-        // --- 6. Clean undefined/null (keep profile_image null for clear) ---
+        // --- 6. Clean undefined/null (keep profile_image null for clear)
+        // Allow explicit nulls for specific contact fields so users can clear them.
         Object.keys(updateData).forEach((key) => {
             if (key === 'updated_at') return;
             if (key === 'profile_image' && updateData[key] === null) return;
+            // Keep explicit nulls for contact fields so clearing is persisted
+            if ((key === 'personal_email' || key === 'phone_country_code' || key === 'phone_number') && updateData[key] === null) return;
             if (updateData[key] === undefined || updateData[key] === null) delete updateData[key];
         });
 
@@ -638,21 +646,40 @@ exports.updateContactProfile = async (req, res) => {
         const { usn } = req.params;
         const data = req.body;
 
-        // --- 1. Validation (shared validators) ---
+        // --- 1. Load current contact to check if this is first save ---
+        const { data: currentContact, error: loadErr } = await supabase
+            .from('student_basic_details')
+            .select('personal_email, phone_number')
+            .eq('usn', usn)
+            .single();
+
+        if (loadErr && loadErr.code !== 'PGRST116') {
+            return sendCaughtError(res, loadErr, 'Failed to load current contact.');
+        }
+
+        const isFirstSave = !currentContact || (!currentContact.personal_email && !currentContact.phone_number);
+
+        // --- 2. Validation (shared validators) ---
         const fieldErrors = {};
 
         const personalEmail = data.personalEmail ?? data.personal_email;
-        if (personalEmail !== undefined && personalEmail !== '' && personalEmail !== null) {
+        const rawNum = (data.phoneNumber ?? data.phone_number) ?? '';
+        const rawCode = (data.phoneCountryCode ?? data.phone_country_code) ?? '';
+
+        // Email and phone are ALWAYS mandatory (never allow null/empty)
+        if (!personalEmail || personalEmail === '') {
+            fieldErrors.personal_email = 'Personal email is required.';
+        } else {
             const r = validateEmail(personalEmail);
             if (!r.valid) fieldErrors.personal_email = r.message;
         }
-
-        const rawNum = (data.phoneNumber ?? data.phone_number) ?? '';
-        const rawCode = (data.phoneCountryCode ?? data.phone_country_code) ?? '';
-        if (rawNum !== '' && rawNum != null) {
+        if (!rawNum || rawNum === '') {
+            fieldErrors.phone_number = 'Phone number is required.';
+        } else {
             const r = validatePhoneNumber(rawNum);
             if (!r.valid) fieldErrors.phone_number = r.message;
         }
+
         if (rawCode !== '' && rawCode != null) {
             const r = validateCountryCode(rawCode);
             if (!r.valid) fieldErrors.phone_country_code = r.message;
@@ -684,12 +711,16 @@ exports.updateContactProfile = async (req, res) => {
         }
 
         const updateData = {
-            personal_email: (data.personalEmail ?? data.personal_email ?? null) || null,
             phone_country_code: normCode !== undefined ? normCode : (rawCode === '' ? null : rawCode),
             phone_number: normNumber !== undefined ? normNumber : (rawNum === '' ? null : rawNum),
             social_links: data.links ?? [],
             updated_at: new Date()
         };
+
+        // Only set personal_email if client explicitly provided it (including empty to clear)
+        if (data.personalEmail !== undefined || data.personal_email !== undefined) {
+            updateData.personal_email = (data.personalEmail ?? data.personal_email) || null;
+        }
 
         const { data: updatedContact, error } = await supabase
             .from('student_basic_details')
