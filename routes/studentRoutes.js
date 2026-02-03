@@ -6,10 +6,25 @@ const { authenticateToken, authorizeRoles } = require('../middleware/authMiddlew
 
 // Metadata routes (public - no auth needed)
 router.get('/schools', studentProfileController.getSchools);
+router.post('/schools', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createSchool);
+router.put('/schools/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateSchool);
+router.delete('/schools/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteSchool);
 router.get('/programs', studentProfileController.getPrograms);
+router.post('/programs', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createProgram);
+router.put('/programs/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateProgram);
+router.delete('/programs/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteProgram);
 router.get('/majors', studentProfileController.getMajors);
+router.post('/majors', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createMajor);
+router.put('/majors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateMajor);
+router.delete('/majors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteMajor);
 router.get('/minors', studentProfileController.getMinors);
+router.post('/minors', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createMinor);
+router.put('/minors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateMinor);
+router.delete('/minors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteMinor);
 router.get('/specializations', studentProfileController.getSpecializations);
+router.post('/specializations', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createSpecialization);
+router.put('/specializations/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateSpecialization);
+router.delete('/specializations/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteSpecialization);
 
 // Academy overview (protected - admin/placement use)
 router.get('/academy/overview', authenticateToken, studentProfileController.getAcademyOverview);

@@ -63,6 +63,83 @@ exports.getSchools = async (req, res) => {
 };
 
 /**
+ * Create a school (admin). Body: { name, abbreviation? }
+ */
+exports.createSchool = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const name = (body.name || '').trim();
+        const abbreviation = (body.abbreviation || '').trim() || null;
+        if (!name) {
+            return sendValidationError(res, 'School name is required.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('schools')
+            .insert({ name, abbreviation })
+            .select()
+            .single();
+        if (error) throw error;
+        res.status(201).json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error creating school.');
+    }
+};
+
+/**
+ * Update a school (admin). Body: { name?, abbreviation? }
+ */
+exports.updateSchool = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid school id.');
+        const body = req.body || {};
+        const updates = {};
+        if (body.name !== undefined) updates.name = (body.name || '').trim() || null;
+        if (body.abbreviation !== undefined) updates.abbreviation = (body.abbreviation || '').trim() || null;
+        if (Object.keys(updates).length === 0) {
+            return sendValidationError(res, 'No fields to update.', {});
+        }
+        if (updates.name !== undefined && !updates.name) {
+            return sendValidationError(res, 'School name cannot be empty.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('schools')
+            .update(updates)
+            .eq('id', id)
+            .select()
+            .single();
+        if (error) throw error;
+        if (!data) return sendNotFound(res, 'School not found.');
+        res.json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error updating school.');
+    }
+};
+
+/**
+ * Delete a school (admin). Allowed only if no students are associated (student_basic_details.school_id).
+ */
+exports.deleteSchool = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid school id.');
+        const { count, error: countError } = await supabase
+            .from('student_basic_details')
+            .select('*', { count: 'exact', head: true })
+            .eq('school_id', id);
+        if (countError) throw countError;
+        if (count > 0) {
+            return sendConflict(res, 'Cannot delete school: it has students associated. Remove or reassign students first.');
+        }
+        const { error } = await supabase.from('schools').delete().eq('id', id);
+        if (error) throw error;
+        res.status(204).send();
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error deleting school.');
+    }
+};
+
+/**
  * Get all programs
  */
 exports.getPrograms = async (req, res) => {
@@ -76,6 +153,104 @@ exports.getPrograms = async (req, res) => {
         res.json(data);
     } catch (error) {
         return sendCaughtError(res, error, 'Server error fetching programs.');
+    }
+};
+
+/**
+ * Create a program (admin). Body: { school_id, name, graduation_level?, min_duration_years?, max_duration_years? }
+ */
+exports.createProgram = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const schoolId = body.school_id != null ? parseInt(body.school_id, 10) : null;
+        const name = (body.name || '').trim();
+        const graduationLevel = (body.graduation_level || '').trim() || null;
+        const minDuration = body.min_duration_years != null && body.min_duration_years !== '' ? parseInt(body.min_duration_years, 10) : null;
+        const maxDuration = body.max_duration_years != null && body.max_duration_years !== '' ? parseInt(body.max_duration_years, 10) : null;
+        if (!schoolId || Number.isNaN(schoolId)) {
+            return sendValidationError(res, 'School is required.', { school_id: 'Select a school.' });
+        }
+        if (!name) {
+            return sendValidationError(res, 'Program name is required.', { name: 'Name is required.' });
+        }
+        const { data: school } = await supabase.from('schools').select('id').eq('id', schoolId).maybeSingle();
+        if (!school) {
+            return sendValidationError(res, 'Invalid school selected.', { school_id: 'School does not exist.' });
+        }
+        const insertData = { school_id: schoolId, name, graduation_level: graduationLevel };
+        if (minDuration != null && !Number.isNaN(minDuration)) insertData.min_duration_years = minDuration;
+        if (maxDuration != null && !Number.isNaN(maxDuration)) insertData.max_duration_years = maxDuration;
+        const { data, error } = await supabase
+            .from('programs')
+            .insert(insertData)
+            .select()
+            .single();
+        if (error) throw error;
+        res.status(201).json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error creating program.');
+    }
+};
+
+/**
+ * Update a program (admin). Body: { name?, graduation_level?, min_duration_years?, max_duration_years? }
+ */
+exports.updateProgram = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid program id.');
+        const body = req.body || {};
+        const updates = {};
+        if (body.name !== undefined) updates.name = (body.name || '').trim() || null;
+        if (body.graduation_level !== undefined) updates.graduation_level = (body.graduation_level || '').trim() || null;
+        if (body.min_duration_years !== undefined) {
+            const v = body.min_duration_years;
+            updates.min_duration_years = (v === '' || v == null) ? null : (parseInt(v, 10) || null);
+        }
+        if (body.max_duration_years !== undefined) {
+            const v = body.max_duration_years;
+            updates.max_duration_years = (v === '' || v == null) ? null : (parseInt(v, 10) || null);
+        }
+        if (Object.keys(updates).length === 0) {
+            return sendValidationError(res, 'No fields to update.', {});
+        }
+        if (updates.name !== undefined && !updates.name) {
+            return sendValidationError(res, 'Program name cannot be empty.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('programs')
+            .update(updates)
+            .eq('id', id)
+            .select()
+            .single();
+        if (error) throw error;
+        if (!data) return sendNotFound(res, 'Program not found.');
+        res.json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error updating program.');
+    }
+};
+
+/**
+ * Delete a program (admin). Allowed only if no students have this program_id.
+ */
+exports.deleteProgram = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid program id.');
+        const { count, error: countError } = await supabase
+            .from('student_basic_details')
+            .select('*', { count: 'exact', head: true })
+            .eq('program_id', id);
+        if (countError) throw countError;
+        if (count > 0) {
+            return sendConflict(res, 'Cannot delete program: students are associated. Remove or reassign students first.');
+        }
+        const { error } = await supabase.from('programs').delete().eq('id', id);
+        if (error) throw error;
+        res.status(204).send();
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error deleting program.');
     }
 };
 
@@ -97,6 +272,85 @@ exports.getMajors = async (req, res) => {
 };
 
 /**
+ * Create a major (admin). Body: { program_id, name }
+ */
+exports.createMajor = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const programId = body.program_id != null ? parseInt(body.program_id, 10) : null;
+        const name = (body.name || '').trim();
+        if (!programId || Number.isNaN(programId)) {
+            return sendValidationError(res, 'Program is required.', { program_id: 'Select a program.' });
+        }
+        if (!name) {
+            return sendValidationError(res, 'Major name is required.', { name: 'Name is required.' });
+        }
+        const { data: program } = await supabase.from('programs').select('id').eq('id', programId).maybeSingle();
+        if (!program) {
+            return sendValidationError(res, 'Invalid program selected.', { program_id: 'Program does not exist.' });
+        }
+        const { data, error } = await supabase
+            .from('majors')
+            .insert({ program_id: programId, name })
+            .select()
+            .single();
+        if (error) throw error;
+        res.status(201).json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error creating major.');
+    }
+};
+
+/**
+ * Update a major (admin). Body: { name? }
+ */
+exports.updateMajor = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid major id.');
+        const body = req.body || {};
+        const name = (body.name || '').trim();
+        if (name === '') {
+            return sendValidationError(res, 'Major name is required.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('majors')
+            .update({ name })
+            .eq('id', id)
+            .select()
+            .single();
+        if (error) throw error;
+        if (!data) return sendNotFound(res, 'Major not found.');
+        res.json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error updating major.');
+    }
+};
+
+/**
+ * Delete a major (admin). Allowed only if no students have this major_id.
+ */
+exports.deleteMajor = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid major id.');
+        const { count, error: countError } = await supabase
+            .from('student_basic_details')
+            .select('*', { count: 'exact', head: true })
+            .eq('major_id', id);
+        if (countError) throw countError;
+        if (count > 0) {
+            return sendConflict(res, 'Cannot delete major: students are associated. Remove or reassign students first.');
+        }
+        const { error } = await supabase.from('majors').delete().eq('id', id);
+        if (error) throw error;
+        res.status(204).send();
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error deleting major.');
+    }
+};
+
+/**
  * Get all minors
  */
 exports.getMinors = async (req, res) => {
@@ -110,6 +364,85 @@ exports.getMinors = async (req, res) => {
         res.json(data);
     } catch (error) {
         return sendCaughtError(res, error, 'Server error fetching minors.');
+    }
+};
+
+/**
+ * Create a minor (admin). Body: { school_id, name }
+ */
+exports.createMinor = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const schoolId = body.school_id != null ? parseInt(body.school_id, 10) : null;
+        const name = (body.name || '').trim();
+        if (!schoolId || Number.isNaN(schoolId)) {
+            return sendValidationError(res, 'School is required.', { school_id: 'Select a school.' });
+        }
+        if (!name) {
+            return sendValidationError(res, 'Minor name is required.', { name: 'Name is required.' });
+        }
+        const { data: school } = await supabase.from('schools').select('id').eq('id', schoolId).maybeSingle();
+        if (!school) {
+            return sendValidationError(res, 'Invalid school selected.', { school_id: 'School does not exist.' });
+        }
+        const { data, error } = await supabase
+            .from('minors')
+            .insert({ school_id: schoolId, name })
+            .select()
+            .single();
+        if (error) throw error;
+        res.status(201).json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error creating minor.');
+    }
+};
+
+/**
+ * Update a minor (admin). Body: { name? }
+ */
+exports.updateMinor = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid minor id.');
+        const body = req.body || {};
+        const name = (body.name || '').trim();
+        if (name === '') {
+            return sendValidationError(res, 'Minor name is required.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('minors')
+            .update({ name })
+            .eq('id', id)
+            .select()
+            .single();
+        if (error) throw error;
+        if (!data) return sendNotFound(res, 'Minor not found.');
+        res.json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error updating minor.');
+    }
+};
+
+/**
+ * Delete a minor (admin). Allowed only if no students have this minor_id.
+ */
+exports.deleteMinor = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid minor id.');
+        const { count, error: countError } = await supabase
+            .from('student_basic_details')
+            .select('*', { count: 'exact', head: true })
+            .eq('minor_id', id);
+        if (countError) throw countError;
+        if (count > 0) {
+            return sendConflict(res, 'Cannot delete minor: students are associated. Remove or reassign students first.');
+        }
+        const { error } = await supabase.from('minors').delete().eq('id', id);
+        if (error) throw error;
+        res.status(204).send();
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error deleting minor.');
     }
 };
 
@@ -131,6 +464,85 @@ exports.getSpecializations = async (req, res) => {
 };
 
 /**
+ * Create a specialization (admin). Body: { program_id, name }
+ */
+exports.createSpecialization = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const programId = body.program_id != null ? parseInt(body.program_id, 10) : null;
+        const name = (body.name || '').trim();
+        if (!programId || Number.isNaN(programId)) {
+            return sendValidationError(res, 'Program is required.', { program_id: 'Select a program.' });
+        }
+        if (!name) {
+            return sendValidationError(res, 'Specialization name is required.', { name: 'Name is required.' });
+        }
+        const { data: program } = await supabase.from('programs').select('id').eq('id', programId).maybeSingle();
+        if (!program) {
+            return sendValidationError(res, 'Invalid program selected.', { program_id: 'Program does not exist.' });
+        }
+        const { data, error } = await supabase
+            .from('specializations')
+            .insert({ program_id: programId, name })
+            .select()
+            .single();
+        if (error) throw error;
+        res.status(201).json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error creating specialization.');
+    }
+};
+
+/**
+ * Update a specialization (admin). Body: { name? }
+ */
+exports.updateSpecialization = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid specialization id.');
+        const body = req.body || {};
+        const name = (body.name || '').trim();
+        if (name === '') {
+            return sendValidationError(res, 'Specialization name is required.', { name: 'Name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('specializations')
+            .update({ name })
+            .eq('id', id)
+            .select()
+            .single();
+        if (error) throw error;
+        if (!data) return sendNotFound(res, 'Specialization not found.');
+        res.json(data);
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error updating specialization.');
+    }
+};
+
+/**
+ * Delete a specialization (admin). Allowed only if no students have this specialization_id.
+ */
+exports.deleteSpecialization = async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return sendValidationError(res, 'Invalid specialization id.');
+        const { count, error: countError } = await supabase
+            .from('student_basic_details')
+            .select('*', { count: 'exact', head: true })
+            .eq('specialization_id', id);
+        if (countError) throw countError;
+        if (count > 0) {
+            return sendConflict(res, 'Cannot delete specialization: students are associated. Remove or reassign students first.');
+        }
+        const { error } = await supabase.from('specializations').delete().eq('id', id);
+        if (error) throw error;
+        res.status(204).send();
+    } catch (error) {
+        return sendCaughtError(res, error, 'Server error deleting specialization.');
+    }
+};
+
+/**
  * Get academy overview: schools with programs, majors, minors, specializations, and student counts
  */
 exports.getAcademyOverview = async (req, res) => {
@@ -144,7 +556,7 @@ exports.getAcademyOverview = async (req, res) => {
             { data: students, error: studentsErr }
         ] = await Promise.all([
             supabase.from('schools').select('id, name, abbreviation').order('name', { ascending: true }),
-            supabase.from('programs').select('id, school_id, name, graduation_level').order('name', { ascending: true }),
+            supabase.from('programs').select('id, school_id, name, graduation_level, min_duration_years, max_duration_years').order('name', { ascending: true }),
             supabase.from('majors').select('id, program_id, name').order('name', { ascending: true }),
             supabase.from('minors').select('id, school_id, name').order('name', { ascending: true }),
             supabase.from('specializations').select('id, program_id, name').order('name', { ascending: true }),
@@ -182,6 +594,8 @@ exports.getAcademyOverview = async (req, res) => {
                 id: p.id,
                 name: p.name,
                 graduation_level: p.graduation_level,
+                min_duration_years: p.min_duration_years ?? null,
+                max_duration_years: p.max_duration_years ?? null,
                 majors: (majorList.filter((m) => m.program_id === p.id)).map((m) => ({ id: m.id, name: m.name })),
                 specializations: (specList.filter((s) => s.program_id === p.id)).map((s) => ({ id: s.id, name: s.name })),
                 totalStudents: studentsByProgram[p.id] || 0
