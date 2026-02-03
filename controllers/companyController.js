@@ -229,7 +229,7 @@ exports.deleteContact = async (req, res) => {
 
 /**
  * GET /company/drives
- * Get all placement drives for my company
+ * Get all placement drives for my company (same shape as placement drives for table UI).
  */
 exports.getDrives = async (req, res) => {
   try {
@@ -244,13 +244,59 @@ exports.getDrives = async (req, res) => {
         id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
         ctc_structure, stipend_structure, process_rounds, number_of_openings,
         number_of_registrations, placement_status, last_date_to_registration,
-        event_datetime, onboarded_date, created_at
+        event_datetime, onboarded_date, tpo, company_remarks, created_at,
+        company:companies (company_name)
       `)
       .eq('company_id', companyId)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-    res.json({ data });
+
+    const rows = data || [];
+    const driveIds = rows.map((d) => d.id).filter(Boolean);
+
+    let eligibilityByDrive = {};
+    if (driveIds.length > 0) {
+      const { data: eligibilityRows } = await supabase
+        .from('placement_drive_eligibility')
+        .select('*')
+        .in('placement_drive_id', driveIds);
+      (eligibilityRows || []).forEach((e) => { eligibilityByDrive[e.placement_drive_id] = e; });
+    }
+    const schoolIds = new Set();
+    const programIds = new Set();
+    rows.forEach((d) => {
+      const elig = eligibilityByDrive[d.id];
+      if (elig && Array.isArray(elig.allowed_school_ids)) elig.allowed_school_ids.forEach((id) => schoolIds.add(id));
+      if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
+    });
+    let schoolMap = {};
+    let programMap = {};
+    if (schoolIds.size) {
+      const { data: schools } = await supabase.from('schools').select('id, name').in('id', [...schoolIds]);
+      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
+    }
+    if (programIds.size) {
+      const { data: programs } = await supabase.from('programs').select('id, name').in('id', [...programIds]);
+      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p.name; return acc; }, {});
+    }
+
+    const drives = rows.map((d) => {
+      const elig = eligibilityByDrive[d.id];
+      const sid = elig && Array.isArray(elig.allowed_school_ids) && elig.allowed_school_ids.length > 0
+        ? elig.allowed_school_ids[0] : null;
+      const pid = elig && Array.isArray(elig.allowed_program_ids) && elig.allowed_program_ids.length > 0
+        ? elig.allowed_program_ids[0] : null;
+      return {
+        ...d,
+        company_name: d.company?.company_name ?? null,
+        school: sid ? schoolMap[sid] ?? null : null,
+        program: pid ? programMap[pid] ?? null : null,
+        registered_count: d.number_of_registrations ?? 0,
+      };
+    });
+
+    res.json({ data: drives });
   } catch (err) {
     logger.error('getDrives error:', err);
     res.status(500).json({ error: 'Failed to fetch placement drives' });
@@ -259,7 +305,7 @@ exports.getDrives = async (req, res) => {
 
 /**
  * GET /company/drives/:id
- * Get single drive details
+ * Get single drive details (with company_name for process page UI)
  */
 exports.getDriveById = async (req, res) => {
   try {
@@ -272,7 +318,10 @@ exports.getDriveById = async (req, res) => {
 
     const { data, error } = await supabase
       .from('placements_drives')
-      .select('*')
+      .select(`
+        *,
+        company:companies (company_name)
+      `)
       .eq('id', id)
       .eq('company_id', companyId)
       .single();
@@ -281,7 +330,8 @@ exports.getDriveById = async (req, res) => {
       return res.status(404).json({ error: 'Drive not found' });
     }
 
-    res.json({ data });
+    const drive = { ...data, company_name: data.company?.company_name ?? null };
+    res.json({ data: drive });
   } catch (err) {
     logger.error('getDriveById error:', err);
     res.status(500).json({ error: 'Failed to fetch drive details' });
@@ -407,10 +457,10 @@ exports.updateCandidateStatus = async (req, res) => {
     }
 
     const { driveId, usn } = req.params;
-    const { 
-      oa_status, gd_status, technical_round_status, 
+    const {
+      oa_status, gd_status, technical_round_status,
       interview_status, hr_round_status, final_select_status,
-      remarks, attendance 
+      approved_status, malpractice, remarks, attendance
     } = req.body;
 
     // Verify the drive belongs to this company
@@ -432,6 +482,8 @@ exports.updateCandidateStatus = async (req, res) => {
     if (interview_status !== undefined) updateData.interview_status = interview_status;
     if (hr_round_status !== undefined) updateData.hr_round_status = hr_round_status;
     if (final_select_status !== undefined) updateData.final_select_status = final_select_status;
+    if (approved_status !== undefined) updateData.approved_status = approved_status;
+    if (malpractice !== undefined) updateData.malpractice = malpractice;
     if (remarks !== undefined) updateData.remarks = remarks;
     if (attendance !== undefined) updateData.attendance = attendance;
 
