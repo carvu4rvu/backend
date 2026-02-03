@@ -57,6 +57,7 @@ router.post('/alumni/hr-recommendations', authenticateToken, authorizeRoles('alu
 router.get('/alumni/hr-recommendations', authenticateToken, authorizeRoles('alumni'), placementController.getMyHrRecommendations);
 // Alumni: view student profile (limited access)
 router.get('/alumni/student/:usn', authenticateToken, authorizeRoles('alumni'), placementController.getStudentProfileForAlumni);
+router.post('/alumni/connect', authenticateToken, authorizeRoles('alumni'), placementController.createAlumniConnectionRequest);
 router.get('/alumni', authenticateToken, placementController.getAllAlumni);
 router.post('/alumni', authenticateToken, placementController.addAlumni);
 router.get('/alumni/codes', authenticateToken, placementController.getRegistrationCodes);

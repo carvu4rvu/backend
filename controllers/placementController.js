@@ -3128,3 +3128,63 @@ exports.getStudentProfileForAlumni = async (req, res) => {
   }
 };
 
+/**
+ * POST /placement/alumni/connect
+ * Create a connection request from alumni to student.
+ */
+exports.createAlumniConnectionRequest = async (req, res) => {
+  try {
+    const email = (req.user && req.user.email) ? String(req.user.email).trim().toLowerCase() : null;
+    if (!email) {
+      return res.status(403).json({ message: 'User context missing.' });
+    }
+
+    // Get Alumni ID
+    const { data: alumni, error: alumError } = await supabase
+      .from('alumni')
+      .select('id')
+      .ilike('personal_email', email)
+      .maybeSingle();
+
+    if (alumError || !alumni) {
+      return res.status(404).json({ message: 'Alumni profile not found.' });
+    }
+
+    const {
+      student_usn,
+      connection_purpose,
+      message_to_po,
+      preferred_contact_date,
+      preferred_time_slot,
+      contact_mode
+    } = req.body;
+
+    if (!student_usn || !connection_purpose || !message_to_po) {
+      return res.status(400).json({ message: 'Missing required fields.' });
+    }
+
+    const payload = {
+      alumni_id: alumni.id,
+      student_usn,
+      connection_purpose,
+      message_to_po,
+      preferred_contact_date: preferred_contact_date || null,
+      preferred_time_slot: preferred_time_slot || null,
+      contact_mode: contact_mode || null,
+      status: 'PENDING'
+    };
+
+    const { data, error } = await supabase
+      .from('alumni_connection_requests')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    logger.error('createAlumniConnectionRequest:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to create connection request') });
+  }
+};
+

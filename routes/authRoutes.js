@@ -20,6 +20,11 @@ router.get('/admin/students-without-login', authenticateToken, authorizeRoles('a
 router.patch('/admin/user-login/bulk', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.patchBulkUserLoginIsActive);
 router.patch('/admin/user-login/:id', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.patchUserLoginIsActive);
 
+// Admin: Company Login Management
+router.get('/admin/company-logins', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.getCompanyLogins);
+router.post('/admin/company-login', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.createCompanyLogin);
+router.delete('/admin/company-login/:id', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.deleteCompanyLogin);
+
 // Alumni registration (no auth required)
 router.post('/alumni/validate-code', authController.validateAlumniCode);
 router.post('/alumni/send-otp', authController.sendAlumniOtp);

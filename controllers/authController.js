@@ -791,3 +791,186 @@ exports.getStudentsWithoutLogin = async (req, res) => {
   }
 };
 
+// --- ADMIN: Company Login Management ---
+
+/**
+ * GET /api/auth/admin/company-logins
+ * List all company logins with company details
+ */
+exports.getCompanyLogins = async (req, res) => {
+  try {
+    const { search, page = 1, limit = 50 } = req.query;
+    const offset = Math.max(0, (Number(page) || 1) - 1) * Math.min(100, Math.max(1, Number(limit) || 50));
+    const limitVal = Math.min(100, Math.max(1, Number(limit) || 50));
+
+    // Get or create company role
+    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'company'");
+    if (roleRes.rows.length === 0) {
+      // Company role doesn't exist yet, return empty
+      const companiesResult = await pool.query('SELECT id, company_name FROM companies ORDER BY company_name');
+      return res.json({
+        logins: [],
+        companies: companiesResult.rows,
+        total: 0,
+        page: 1,
+        limit: limitVal,
+      });
+    }
+    const companyRoleId = roleRes.rows[0].id;
+
+    let where = [`ul.role_id = $1`];
+    let params = [companyRoleId];
+    let idx = 2;
+
+    if (search && search.trim()) {
+      where.push(`(ul.email_id ILIKE $${idx} OR c.company_name ILIKE $${idx})`);
+      params.push(`%${search.trim()}%`);
+      idx++;
+    }
+
+    const whereClause = `WHERE ${where.join(' AND ')}`;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM user_login ul
+      LEFT JOIN companies c ON c.id = ul.company_id
+      ${whereClause}
+    `;
+    const countResult = await pool.query(countQuery, params);
+    const total = countResult.rows[0]?.total ?? 0;
+
+    params.push(limitVal, offset);
+    const listQuery = `
+      SELECT ul.id, ul.email_id, ul.is_active, ul.last_login_at, ul.created_at, ul.company_id,
+             c.company_name, c.company_type, c.website
+      FROM user_login ul
+      LEFT JOIN companies c ON c.id = ul.company_id
+      ${whereClause}
+      ORDER BY ul.created_at DESC
+      LIMIT $${idx} OFFSET $${idx + 1}
+    `;
+    const listResult = await pool.query(listQuery, params);
+
+    // Get all companies for the dropdown
+    const companiesResult = await pool.query('SELECT id, company_name FROM companies ORDER BY company_name');
+
+    // Get companies that already have logins
+    const existingLoginsResult = await pool.query(
+      `SELECT DISTINCT company_id FROM user_login WHERE company_id IS NOT NULL AND role_id = $1`,
+      [companyRoleId]
+    );
+    const companiesWithLogins = existingLoginsResult.rows.map(r => r.company_id);
+
+    res.json({
+      logins: listResult.rows,
+      companies: companiesResult.rows,
+      companiesWithLogins,
+      total,
+      page: Number(page) || 1,
+      limit: limitVal,
+    });
+  } catch (err) {
+    console.error('getCompanyLogins:', err);
+    res.status(500).json({ message: 'Failed to fetch company logins' });
+  }
+};
+
+/**
+ * POST /api/auth/admin/company-login
+ * Create a new company login
+ * Body: { company_id, email, password }
+ */
+exports.createCompanyLogin = async (req, res) => {
+  const { company_id, email, password } = req.body;
+
+  if (!company_id || !email || !password) {
+    return res.status(400).json({ message: 'company_id, email and password are required' });
+  }
+
+  try {
+    // Verify company exists
+    const companyCheck = await pool.query('SELECT id, company_name FROM companies WHERE id = $1', [company_id]);
+    if (companyCheck.rows.length === 0) {
+      return res.status(400).json({ message: 'Company not found' });
+    }
+
+    // Get or create company role
+    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'company'");
+    let companyRoleId;
+    if (roleRes.rows.length === 0) {
+      const newRole = await pool.query("INSERT INTO roles (name) VALUES ('company') RETURNING id");
+      companyRoleId = newRole.rows[0].id;
+    } else {
+      companyRoleId = roleRes.rows[0].id;
+    }
+
+    // Check if email already exists
+    const emailCheck = await pool.query('SELECT id FROM user_login WHERE email_id = $1', [email.trim().toLowerCase()]);
+    if (emailCheck.rows.length > 0) {
+      return res.status(400).json({ message: 'A login with this email already exists' });
+    }
+
+    // Check if company already has a login
+    const companyLoginCheck = await pool.query(
+      'SELECT id FROM user_login WHERE company_id = $1 AND role_id = $2',
+      [company_id, companyRoleId]
+    );
+    if (companyLoginCheck.rows.length > 0) {
+      return res.status(400).json({ message: 'This company already has a login. Delete the existing one first.' });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create user login
+    const insertResult = await pool.query(
+      `INSERT INTO user_login (usn, role_id, password_hash, email_id, company_id, is_active)
+       VALUES (NULL, $1, $2, $3, $4, true)
+       RETURNING id, email_id, company_id, is_active, created_at`,
+      [companyRoleId, passwordHash, email.trim().toLowerCase(), company_id]
+    );
+
+    const newLogin = insertResult.rows[0];
+    newLogin.company_name = companyCheck.rows[0].company_name;
+
+    res.status(201).json({
+      message: 'Company login created successfully',
+      login: newLogin,
+    });
+  } catch (err) {
+    console.error('createCompanyLogin:', err);
+    if (err.code === '23505') {
+      return res.status(400).json({ message: 'This email is already registered' });
+    }
+    res.status(500).json({ message: 'Failed to create company login' });
+  }
+};
+
+/**
+ * DELETE /api/auth/admin/company-login/:id
+ * Delete a company login
+ */
+exports.deleteCompanyLogin = async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Verify it's a company login
+    const roleRes = await pool.query("SELECT id FROM roles WHERE name = 'company'");
+    if (roleRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Login not found' });
+    }
+    const companyRoleId = roleRes.rows[0].id;
+
+    const result = await pool.query(
+      'DELETE FROM user_login WHERE id = $1 AND role_id = $2 RETURNING id',
+      [id, companyRoleId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Company login not found' });
+    }
+    res.json({ message: 'Company login deleted successfully' });
+  } catch (err) {
+    console.error('deleteCompanyLogin:', err);
+    res.status(500).json({ message: 'Failed to delete company login' });
+  }
+};
+

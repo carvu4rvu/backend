@@ -6,6 +6,8 @@ const pool = require('./config/db');
 const supabase = require('./config/supabaseClient');
 const transporter = require('./config/smtp');
 
+// hello
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -49,6 +51,7 @@ const studentRoutes = require('./routes/studentRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
+const companyRoutes = require('./routes/companyRoutes');
 const ensureProfileImageColumn = require('./migrations/ensureProfileImage');
 const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
@@ -63,6 +66,7 @@ app.use('/api/student', studentRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
+app.use('/api/company', companyRoutes);
 
 app.get('/', (req, res) => {
   res.send('Hello from the Backend!');
