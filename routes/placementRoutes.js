@@ -41,6 +41,7 @@ router.post('/drives/:driveId/apply', authenticateToken, placementController.app
 
 router.get('/students', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getStudentsForPlacement);
 router.get('/students/overview', authenticateToken, placementController.getPlacementOverview);
+router.get('/students/overview-table', authenticateToken, authorizeRoles('admin'), placementController.getStudentsOverviewTable);
 router.get('/policies', authenticateToken, placementController.getAllPolicies);
 router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
 router.post('/policies', authenticateToken, placementController.upsertPolicy);
@@ -63,6 +64,9 @@ router.post('/alumni', authenticateToken, placementController.addAlumni);
 router.get('/alumni/codes', authenticateToken, placementController.getRegistrationCodes);
 router.post('/alumni/codes', authenticateToken, placementController.createRegistrationCode);
 router.delete('/alumni/codes/:id', authenticateToken, placementController.deleteRegistrationCode);
+router.get('/alumni/conversions', authenticateToken, placementController.getAlumniConversions);
+router.get('/alumni/conversion-logs', authenticateToken, authorizeRoles('admin'), placementController.getAlumniConversionLogs);
+router.post('/alumni/convert', authenticateToken, authorizeRoles('admin'), placementController.convertToAlumni);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
 

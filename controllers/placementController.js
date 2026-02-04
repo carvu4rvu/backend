@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const pool = require('../config/db');
 const logger = require('../utils/logger');
 
 /** Parse integer from string/number; return null if invalid or NaN */
@@ -1487,6 +1488,211 @@ exports.getStudentsForPlacement = async (req, res) => {
   }
 };
 
+/**
+ * GET /placement/students/overview-table
+ * Returns per-student placement overview (opted-in only): name, usn, email, school, program,
+ * drives eligible/applied, OA passed, round counts, offers, internship offers, accepted,
+ * max CTC, max stipend, absent, placement violations, disciplinary, admin hold, malpractice.
+ * Query: search, limit, school (comma-separated names), program (comma-separated names).
+ */
+exports.getStudentsOverviewTable = async (req, res) => {
+  try {
+    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 2000));
+    const search = (req.query.search || '').trim();
+    const schoolParam = (req.query.school || '').trim();
+    const programParam = (req.query.program || '').trim();
+
+    const { data: schoolsList } = await supabase.from('schools').select('id, name').order('name', { ascending: true });
+
+    let query = supabase
+      .from('student_basic_details')
+      .select('usn, full_name, college_email, profile_lock, school_id, program_id, schools(name), programs(name)')
+      .eq('is_active', true)
+      .eq('opt_in', true);
+
+    if (schoolParam) {
+      const schoolNames = schoolParam.split(',').map((s) => s.trim()).filter(Boolean);
+      if (schoolNames.length > 0) {
+        const { data: schoolRows } = await supabase.from('schools').select('id').in('name', schoolNames);
+        const schoolIds = (schoolRows || []).map((r) => r.id).filter(Boolean);
+        if (schoolIds.length > 0) query = query.in('school_id', schoolIds);
+      }
+    }
+    if (programParam) {
+      const programNames = programParam.split(',').map((p) => p.trim()).filter(Boolean);
+      if (programNames.length > 0) {
+        const { data: programRows } = await supabase.from('programs').select('id').in('name', programNames);
+        const programIds = (programRows || []).map((r) => r.id).filter(Boolean);
+        if (programIds.length > 0) query = query.in('program_id', programIds);
+      }
+    }
+
+    const { data: students, error: studentsErr } = await query
+      .order('usn', { ascending: true })
+      .limit(limit);
+
+    if (studentsErr) throw studentsErr;
+    const studentList = students || [];
+
+    const roundColumns = [
+      { id: 'oa_passed', label: 'OA passed' },
+      { id: 'gd_passed', label: 'GD passed' },
+      { id: 'technical_passed', label: 'Technical passed' },
+      { id: 'interview_passed', label: 'Interview passed' },
+      { id: 'hr_passed', label: 'HR passed' },
+      { id: 'final_select_passed', label: 'Final select passed' },
+    ];
+
+    if (studentList.length === 0) {
+      return res.json({ rows: [], roundColumns, schoolsList: schoolsList || [] });
+    }
+
+    const usns = studentList.map((s) => s.usn).filter(Boolean);
+    const usnSet = new Set(usns);
+
+    const [
+      { data: processRows },
+      { data: offersRows },
+      { data: placementRows },
+      { data: capstoneRows },
+      { data: violationRows },
+      { data: disciplinaryRows },
+    ] = await Promise.all([
+      supabase.from('student_placement_process').select('usn, placement_drive_id, is_eligible, registration_status, oa_status, gd_status, technical_round_status, interview_status, hr_round_status, final_select_status, attendance, malpractice').in('usn', usns),
+      supabase.from('offers').select('student_id, placement_id, capstone_id, job_type, is_accepted').in('student_id', usns),
+      supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa').in('student_id', usns),
+      supabase.from('capstone').select('usn, internship_stipend_min, internship_stipend_max').in('usn', usns),
+      supabase.from('student_placement_violations').select('usn').in('usn', usns).eq('is_active', true),
+      supabase.from('student_disciplinary_records').select('usn').in('usn', usns).eq('is_active', true),
+    ]);
+
+    const processList = processRows || [];
+    const offersList = offersRows || [];
+    const placementList = placementRows || [];
+    const capstoneList = capstoneRows || [];
+    const violationList = violationRows || [];
+    const disciplinaryList = disciplinaryRows || [];
+
+    const perUsn = {};
+    usns.forEach((u) => {
+      perUsn[u] = {
+        drives_eligible: 0,
+        drives_applied: 0,
+        oas_passed: 0,
+        gd_passed: 0,
+        technical_passed: 0,
+        interview_passed: 0,
+        hr_passed: 0,
+        final_select_passed: 0,
+        drives_absent: 0,
+        malpractice_count: 0,
+        placement_violations: 0,
+        disciplinary: 0,
+        offers_count: 0,
+        internship_offers: 0,
+        offer_accepted: false,
+        max_ctc_lpa: null,
+        max_stipend: null,
+      };
+    });
+
+    processList.forEach((p) => {
+      if (!usnSet.has(p.usn)) return;
+      const o = perUsn[p.usn];
+      if (p.is_eligible === true) o.drives_eligible += 1;
+      if (String(p.registration_status || '').toLowerCase() === 'registered') o.drives_applied += 1;
+      if (p.oa_status === true) o.oas_passed += 1;
+      if (p.gd_status === true) o.gd_passed += 1;
+      if (p.technical_round_status === true) o.technical_passed += 1;
+      if (p.interview_status === true) o.interview_passed += 1;
+      if (p.hr_round_status === true) o.hr_passed += 1;
+      if (p.final_select_status === true) o.final_select_passed += 1;
+      if (String(p.attendance || '').toLowerCase() === 'absent') o.drives_absent += 1;
+      if (p.malpractice === true) o.malpractice_count += 1;
+    });
+
+    violationList.forEach((v) => {
+      if (perUsn[v.usn]) perUsn[v.usn].placement_violations += 1;
+    });
+    disciplinaryList.forEach((d) => {
+      if (perUsn[d.usn]) perUsn[d.usn].disciplinary += 1;
+    });
+
+    const placementByStudent = {};
+    placementList.forEach((pl) => {
+      if (!placementByStudent[pl.student_id]) placementByStudent[pl.student_id] = [];
+      placementByStudent[pl.student_id].push(pl);
+    });
+    const capstoneByStudent = {};
+    capstoneList.forEach((c) => {
+      if (!capstoneByStudent[c.usn]) capstoneByStudent[c.usn] = [];
+      capstoneByStudent[c.usn].push(c);
+    });
+
+    offersList.forEach((off) => {
+      if (!perUsn[off.student_id]) return;
+      const o = perUsn[off.student_id];
+      o.offers_count += 1;
+      const jt = String(off.job_type || '').toLowerCase();
+      if (jt.includes('internship') || jt.includes('capstone') || off.capstone_id) o.internship_offers += 1;
+      if (off.is_accepted === true) o.offer_accepted = true;
+    });
+
+    Object.keys(placementByStudent).forEach((sid) => {
+      const o = perUsn[sid];
+      if (!o) return;
+      placementByStudent[sid].forEach((pl) => {
+        const ctc = pl.ctc_max_lpa != null ? pl.ctc_max_lpa : pl.ctc_min_lpa;
+        if (ctc != null && (o.max_ctc_lpa == null || ctc > o.max_ctc_lpa)) o.max_ctc_lpa = Number(ctc);
+      });
+    });
+    Object.keys(capstoneByStudent).forEach((sid) => {
+      const o = perUsn[sid];
+      if (!o) return;
+      capstoneByStudent[sid].forEach((cap) => {
+        const stip = cap.internship_stipend_max != null ? cap.internship_stipend_max : cap.internship_stipend_min;
+        if (stip != null && (o.max_stipend == null || stip > o.max_stipend)) o.max_stipend = Number(stip);
+      });
+    });
+
+    const rows = studentList
+      .filter((s) => !search || [s.usn, s.full_name, s.college_email].some((v) => (v || '').toLowerCase().includes(search.toLowerCase())))
+      .map((s) => {
+        const agg = perUsn[s.usn] || {};
+        return {
+          usn: s.usn,
+          full_name: s.full_name,
+          college_email: s.college_email,
+          school: (s.schools && s.schools.name) ? s.schools.name : null,
+          program: (s.programs && s.programs.name) ? s.programs.name : null,
+          drives_eligible: agg.drives_eligible ?? 0,
+          drives_applied: agg.drives_applied ?? 0,
+          oas_passed: agg.oas_passed ?? 0,
+          gd_passed: agg.gd_passed ?? 0,
+          technical_passed: agg.technical_passed ?? 0,
+          interview_passed: agg.interview_passed ?? 0,
+          hr_passed: agg.hr_passed ?? 0,
+          final_select_passed: agg.final_select_passed ?? 0,
+          offers_count: agg.offers_count ?? 0,
+          internship_offers: agg.internship_offers ?? 0,
+          offer_accepted: agg.offer_accepted === true,
+          max_ctc_lpa: agg.max_ctc_lpa != null ? agg.max_ctc_lpa : null,
+          max_stipend: agg.max_stipend != null ? agg.max_stipend : null,
+          drives_absent: agg.drives_absent ?? 0,
+          placement_violations: agg.placement_violations ?? 0,
+          disciplinary: agg.disciplinary ?? 0,
+          admin_hold: s.profile_lock === true,
+          malpractice: agg.malpractice_count ?? 0,
+        };
+      });
+
+    res.json({ rows, roundColumns, schoolsList: schoolsList || [] });
+  } catch (err) {
+    logger.error('getStudentsOverviewTable:', err);
+    res.status(500).json({ message: 'Server error fetching students overview table' });
+  }
+};
+
 exports.getAllCompanies = async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -2014,7 +2220,7 @@ exports.getPlacementOverview = async (req, res) => {
 };
 
 /**
- * GET /placement/policies - list batch_academic_policies with school/program names
+ * GET /placement/policies - list batch_academic_policies with school/program names and alumni_conversion_pct
  */
 exports.getAllPolicies = async (req, res) => {
   try {
@@ -2028,11 +2234,37 @@ exports.getAllPolicies = async (req, res) => {
       .order('joining_year', { ascending: false });
 
     if (error) throw error;
-    const list = (data || []).map((p) => ({
-      ...p,
-      school_name: p.schools?.name || null,
-      program_name: p.programs?.name || null
-    }));
+    const policies = data || [];
+
+    const { data: students } = await supabase
+      .from('student_basic_details')
+      .select('usn, school_id, program_id, year_of_joining')
+      .eq('is_active', true);
+    const batchToUsns = {};
+    (students || []).forEach((s) => {
+      const key = `${s.school_id}|${s.program_id}|${s.year_of_joining}`;
+      if (!batchToUsns[key]) batchToUsns[key] = [];
+      batchToUsns[key].push(s.usn);
+    });
+
+    const { data: alumniRows } = await supabase.from('alumni').select('student_id').not('student_id', 'is', null);
+    const alumniUsnSet = new Set((alumniRows || []).map((a) => a.student_id).filter(Boolean));
+
+    const list = policies.map((p) => {
+      const key = `${p.school_id}|${p.program_id}|${p.joining_year}`;
+      const batchUsns = batchToUsns[key] || [];
+      const studentCount = batchUsns.length;
+      const alumniCount = batchUsns.filter((usn) => alumniUsnSet.has(usn)).length;
+      const alumni_conversion_pct = studentCount > 0 ? Math.round((alumniCount / studentCount) * 1000) / 10 : 0;
+      return {
+        ...p,
+        school_name: p.schools?.name || null,
+        program_name: p.programs?.name || null,
+        alumni_conversion_pct,
+        alumni_count: alumniCount,
+        student_count: studentCount
+      };
+    });
     res.json(list);
   } catch (err) {
     logger.error('getAllPolicies:', err);
@@ -2042,6 +2274,7 @@ exports.getAllPolicies = async (req, res) => {
 
 /**
  * POST /placement/policies - upsert one batch_academic_policy
+ * Also updates all matching students' eligibility columns in student_basic_details
  */
 exports.upsertPolicy = async (req, res) => {
   try {
@@ -2058,14 +2291,47 @@ exports.upsertPolicy = async (req, res) => {
       alumni: body.alumni === true,
       remarks: body.remarks || null
     };
+
+    let policyData;
     if (id && !Number.isNaN(id)) {
       const { data, error } = await supabase.from('batch_academic_policies').update(payload).eq('id', id).select().single();
       if (error) throw error;
-      return res.json(data);
+      policyData = data;
+    } else {
+      const { data, error } = await supabase.from('batch_academic_policies').insert(payload).select().single();
+      if (error) throw error;
+      policyData = data;
     }
-    const { data, error } = await supabase.from('batch_academic_policies').insert(payload).select().single();
-    if (error) throw error;
-    res.status(201).json(data);
+
+    // Update all matching students' eligibility columns in student_basic_details
+    const studentEligibilityPayload = {
+      is_summer_immersion_eligible: payload.summer_immersion,
+      is_summer_internship_eligible: payload.summer_internship,
+      is_capstone_eligible: payload.capstone,
+      is_placement_eligible: payload.placement,
+      updated_at: new Date().toISOString()
+    };
+
+    const { error: studentUpdateError, count } = await supabase
+      .from('student_basic_details')
+      .update(studentEligibilityPayload, { count: 'exact' })
+      .eq('school_id', payload.school_id)
+      .eq('program_id', payload.program_id)
+      .eq('year_of_joining', payload.joining_year);
+
+    let studentsUpdated = 0;
+    if (studentUpdateError) {
+      logger.warn('Failed to update student eligibility columns:', studentUpdateError);
+    } else {
+      studentsUpdated = count || 0;
+      logger.info(`Updated eligibility for ${studentsUpdated} students (school_id=${payload.school_id}, program_id=${payload.program_id}, year=${payload.joining_year})`);
+    }
+
+    // Return policy data along with student update count
+    res.status(id ? 200 : 201).json({
+      ...policyData,
+      students_updated: studentsUpdated
+    });
   } catch (err) {
     logger.error('upsertPolicy:', err);
     res.status(500).json({ message: err.message || 'Failed to upsert policy' });
@@ -2074,6 +2340,7 @@ exports.upsertPolicy = async (req, res) => {
 
 /**
  * GET /placement/policies/me - get batch academic policy for the logged-in student (by usn -> school_id, program_id, year_of_joining)
+ * Returns both the batch policy flags and the student's individual eligibility columns
  */
 exports.getMyPolicy = async (req, res) => {
   try {
@@ -2082,7 +2349,7 @@ exports.getMyPolicy = async (req, res) => {
 
     const { data: student, error: studentError } = await supabase
       .from('student_basic_details')
-      .select('school_id, program_id, year_of_joining, opt_in')
+      .select('school_id, program_id, year_of_joining, opt_in, is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible')
       .eq('usn', usn)
       .maybeSingle();
 
@@ -2092,7 +2359,12 @@ exports.getMyPolicy = async (req, res) => {
         summer_internship: false,
         capstone: false,
         placement: false,
-        opt_in: !!student?.opt_in
+        opt_in: !!student?.opt_in,
+        // Student's individual eligibility flags
+        is_summer_immersion_eligible: !!student?.is_summer_immersion_eligible,
+        is_summer_internship_eligible: !!student?.is_summer_internship_eligible,
+        is_capstone_eligible: !!student?.is_capstone_eligible,
+        is_placement_eligible: !!student?.is_placement_eligible
       });
     }
 
@@ -2110,7 +2382,12 @@ exports.getMyPolicy = async (req, res) => {
         summer_internship: false,
         capstone: false,
         placement: false,
-        opt_in: !!student.opt_in
+        opt_in: !!student.opt_in,
+        // Student's individual eligibility flags
+        is_summer_immersion_eligible: !!student.is_summer_immersion_eligible,
+        is_summer_internship_eligible: !!student.is_summer_internship_eligible,
+        is_capstone_eligible: !!student.is_capstone_eligible,
+        is_placement_eligible: !!student.is_placement_eligible
       });
     }
 
@@ -2119,7 +2396,12 @@ exports.getMyPolicy = async (req, res) => {
       summer_internship: !!policy.summer_internship,
       capstone: !!policy.capstone,
       placement: !!policy.placement,
-      opt_in: !!student.opt_in
+      opt_in: !!student.opt_in,
+      // Student's individual eligibility flags (these are set when admin saves policy)
+      is_summer_immersion_eligible: !!student.is_summer_immersion_eligible,
+      is_summer_internship_eligible: !!student.is_summer_internship_eligible,
+      is_capstone_eligible: !!student.is_capstone_eligible,
+      is_placement_eligible: !!student.is_placement_eligible
     });
   } catch (err) {
     logger.error('getMyPolicy:', err);
@@ -2156,6 +2438,292 @@ exports.syncPolicies = async (req, res) => {
   }
 };
 
+/**
+ * GET /placement/alumni/conversions
+ * Query: school_id, program_id (optional for meta).
+ * With both: returns rows of students (usn, name, emails, program, year_of_joining, course_year [min-max], is_placed).
+ * Without both: returns schools and programs for dropdowns.
+ */
+exports.getAlumniConversions = async (req, res) => {
+  try {
+    const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
+    const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
+
+    const { data: schoolsList } = await supabase.from('schools').select('id, name').order('name', { ascending: true });
+    const { data: programsList } = await supabase.from('programs').select('id, name, school_id, min_duration_years, max_duration_years').order('name', { ascending: true });
+
+    if (schoolId == null || programId == null || Number.isNaN(schoolId) || Number.isNaN(programId)) {
+      return res.json({
+        schools: schoolsList || [],
+        programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })),
+        rows: []
+      });
+    }
+
+    const { data: students, error: studentsErr } = await supabase
+      .from('student_basic_details')
+      .select('usn, full_name, college_email, personal_email, school_id, program_id, year_of_joining, opt_in')
+      .eq('is_active', true)
+      .eq('school_id', schoolId)
+      .eq('program_id', programId)
+      .order('usn', { ascending: true });
+
+    if (studentsErr) throw studentsErr;
+    const studentList = students || [];
+    if (studentList.length === 0) {
+      return res.json({ schools: schoolsList || [], programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })), rows: [] });
+    }
+
+    const usns = studentList.map((s) => s.usn).filter(Boolean);
+    const { data: existingAlumni } = await supabase.from('alumni').select('student_id').in('student_id', usns);
+    const convertedUsns = new Set((existingAlumni || []).map((a) => a.student_id).filter(Boolean));
+    const studentListNotConverted = studentList.filter((s) => !convertedUsns.has(s.usn));
+
+    const program = (programsList || []).find((p) => p.id === programId);
+    const minY = program?.min_duration_years ?? 3;
+    const maxY = program?.max_duration_years ?? 4;
+    const programName = program?.name ?? null;
+
+    const { data: offersRows } = await supabase
+      .from('offers')
+      .select('student_id')
+      .in('student_id', usns)
+      .eq('is_accepted', true);
+    const placedUsns = new Set((offersRows || []).map((o) => o.student_id).filter(Boolean));
+
+    const rows = studentListNotConverted.map((s) => ({
+      usn: s.usn,
+      full_name: s.full_name,
+      college_email: s.college_email,
+      personal_email: s.personal_email,
+      program: programName,
+      year_of_joining: s.year_of_joining,
+      course_year_min: minY,
+      course_year_max: maxY,
+      is_placed: placedUsns.has(s.usn),
+      opt_in: !!s.opt_in
+    }));
+
+    res.json({
+      schools: schoolsList || [],
+      programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })),
+      rows
+    });
+  } catch (err) {
+    logger.error('getAlumniConversions:', err);
+    res.status(500).json({ message: err.message || 'Server error fetching alumni conversions' });
+  }
+};
+
+/**
+ * POST /placement/alumni/convert
+ * Body: { usns: string[] }. Converts student → alumni: update user_login role (RVU email only, no new login row),
+ * insert into alumni table. Logs to alumni_conversion_log and admin_audit_logs. Reverts failed at end.
+ */
+exports.convertToAlumni = async (req, res) => {
+  const usns = Array.isArray(req.body.usns) ? req.body.usns.filter((u) => u != null && String(u).trim()) : [];
+  if (usns.length === 0) {
+    return res.status(400).json({ message: 'usns array is required and must not be empty' });
+  }
+
+  const adminUserId = req.user && req.user.id != null ? req.user.id : null;
+  let studentRoleId;
+  let alumniRoleId;
+  const batchId = require('crypto').randomUUID();
+  const results = [];
+
+  try {
+    const roleRes = await pool.query("SELECT id, name FROM roles WHERE name IN ('student', 'alumni')");
+    const roleMap = {};
+    roleRes.rows.forEach((r) => { roleMap[r.name] = r.id; });
+    studentRoleId = roleMap.student;
+    alumniRoleId = roleMap.alumni;
+    if (!studentRoleId || !alumniRoleId) {
+      return res.status(500).json({ message: 'Student or alumni role not found in roles table' });
+    }
+
+    const studentRes = await pool.query(
+      `SELECT s.usn, s.college_email, s.personal_email, s.full_name, s.year_of_joining, s.phone_number, sc.name AS school_name
+       FROM student_basic_details s
+       LEFT JOIN schools sc ON sc.id = s.school_id
+       WHERE s.usn = ANY($1) AND s.is_active = true`,
+      [usns]
+    );
+    const studentMap = new Map();
+    studentRes.rows.forEach((r) => {
+      const pe = (r.personal_email && String(r.personal_email).trim()) || null;
+      const ce = (r.college_email && String(r.college_email).trim()) || null;
+      if (ce && pe) {
+        studentMap.set(r.usn, {
+          college_email: ce.toLowerCase(),
+          personal_email: pe.toLowerCase(),
+          full_name: (r.full_name && String(r.full_name).trim()) || null,
+          graduation_year: r.year_of_joining != null ? parseInt(r.year_of_joining, 10) : null,
+          institution_name: (r.school_name && String(r.school_name).trim()) || 'RV University',
+          phone_number: (r.phone_number && String(r.phone_number).trim()) || null
+        });
+      }
+    });
+
+    for (const usn of usns) {
+      const student = studentMap.get(usn);
+      if (!student) {
+        results.push({ usn, success: false, error_message: 'Missing or invalid college/personal email' });
+        continue;
+      }
+
+      const rvuEmail = student.college_email;
+      const personalEmail = student.personal_email;
+      let logId;
+
+      try {
+        const logIns = await pool.query(
+          `INSERT INTO alumni_conversion_log (batch_id, usn, rvu_email, personal_email, status)
+           VALUES ($1, $2, $3, $4, 'pending')
+           RETURNING id`,
+          [batchId, usn, rvuEmail, personalEmail]
+        );
+        logId = logIns.rows[0].id;
+
+        const loginRow = await pool.query(
+          'SELECT id FROM user_login WHERE email_id = $1 AND role_id = $2 AND is_active = true',
+          [rvuEmail, studentRoleId]
+        );
+        if (loginRow.rows.length === 0) {
+          await pool.query(
+            'UPDATE alumni_conversion_log SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3',
+            ['failed', 'No active student login found for this college email', logId]
+          );
+          results.push({ usn, success: false, error_message: 'No active student login found for college email' });
+          continue;
+        }
+
+        const collegeLoginId = loginRow.rows[0].id;
+
+        await pool.query(
+          'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE id = $2',
+          [alumniRoleId, collegeLoginId]
+        );
+
+        const alumniCheck = await pool.query('SELECT id FROM alumni WHERE student_id = $1', [usn]);
+        if (alumniCheck.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO alumni (student_id, full_name, graduation_year, institution_name, personal_email, phone_number, is_verified)
+             VALUES ($1, $2, $3, $4, $5, $6, true)`,
+            [
+              usn,
+              student.full_name || usn,
+              student.graduation_year,
+              student.institution_name,
+              personalEmail,
+              student.phone_number
+            ]
+          );
+        }
+
+        await pool.query(
+          `UPDATE alumni_conversion_log SET role_converted = true, personal_mail_row_created = false, status = 'success', updated_at = NOW() WHERE id = $1`,
+          [logId]
+        );
+
+        if (adminUserId != null) {
+          await pool.query(
+            `INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, metadata)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              adminUserId,
+              'alumni_conversion',
+              'alumni',
+              usn,
+              JSON.stringify({ batch_id: batchId, rvu_email: rvuEmail, personal_email: personalEmail, role_converted: true })
+            ]
+          );
+        }
+
+        results.push({ usn, success: true });
+      } catch (err) {
+        logger.error('convertToAlumni single:', usn, err);
+        const errMsg = err.message || 'Conversion failed';
+        if (logId) {
+          await pool.query(
+            'UPDATE alumni_conversion_log SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3',
+            ['failed', errMsg.substring(0, 500), logId]
+          );
+        }
+        results.push({ usn, success: false, error_message: errMsg });
+      }
+    }
+
+    const failed = results.filter((r) => !r.success);
+    for (const f of failed) {
+      const student = studentMap.get(f.usn);
+      if (!student) continue;
+      const rvuEmail = student.college_email;
+      try {
+        await pool.query(
+          'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE email_id = $2 AND role_id = $3',
+          [studentRoleId, rvuEmail, alumniRoleId]
+        );
+      } catch (_) { /* ignore */ }
+      try {
+        await pool.query('DELETE FROM alumni WHERE student_id = $1', [f.usn]);
+      } catch (_) { /* ignore */ }
+      await pool.query(
+        "UPDATE alumni_conversion_log SET status = 'reverted', updated_at = NOW() WHERE usn = $1 AND batch_id = $2 AND status = 'failed'",
+        [f.usn, batchId]
+      );
+    }
+
+    const converted = results.filter((r) => r.success).length;
+    const total = results.length;
+    res.json({
+      total,
+      converted,
+      failed: failed.length,
+      success_rate_pct: total ? Math.round((converted / total) * 1000) / 10 : 0,
+      results,
+      failed_list: failed.map((r) => ({ usn: r.usn, error_message: r.error_message })),
+    });
+  } catch (err) {
+    logger.error('convertToAlumni:', err);
+    res.status(500).json({ message: err.message || 'Server error during conversion' });
+  }
+};
+
+/**
+ * GET /placement/alumni/conversion-logs
+ * Returns alumni_conversion_log rows for the Conversion logs tab.
+ */
+exports.getAlumniConversionLogs = async (req, res) => {
+  try {
+    const { batch_id, status, limit = 200 } = req.query;
+    let query = 'SELECT id, batch_id, usn, rvu_email, personal_email, role_converted, personal_mail_row_created, status, error_message, created_at, updated_at FROM alumni_conversion_log';
+    const params = [];
+    const conditions = [];
+    let idx = 1;
+    if (batch_id) {
+      conditions.push(`batch_id = $${idx}`);
+      params.push(batch_id);
+      idx++;
+    }
+    if (status) {
+      conditions.push(`status = $${idx}`);
+      params.push(status);
+      idx++;
+    }
+    if (conditions.length) query += ' WHERE ' + conditions.join(' AND ');
+    query += ' ORDER BY created_at DESC';
+    const limitVal = Math.min(500, Math.max(1, parseInt(limit, 10) || 200));
+    query += ` LIMIT ${limitVal}`;
+
+    const result = await pool.query(query, params);
+    res.json({ logs: result.rows || [] });
+  } catch (err) {
+    logger.error('getAlumniConversionLogs:', err);
+    res.status(500).json({ message: err.message || 'Server error fetching conversion logs' });
+  }
+};
+
 // --- Alumni ---
 
 /**
@@ -2169,9 +2737,16 @@ exports.getAllAlumni = async (req, res) => {
       .order('full_name', { ascending: true });
 
     if (error) throw error;
+    const hasProfileData = (a) => {
+      const hasEmail = !!(a.personal_email && String(a.personal_email).trim());
+      const hasCareer = !!(a.current_company && String(a.current_company).trim()) || !!(a.current_designation && String(a.current_designation).trim());
+      const hasPhone = !!(a.phone_number && String(a.phone_number).trim());
+      return hasEmail && (hasCareer || hasPhone);
+    };
     const list = (data || []).map((a) => ({
       ...a,
-      usn: a.student_id
+      usn: a.student_id,
+      profile_data_added: hasProfileData(a)
     }));
     res.json(list);
   } catch (err) {
