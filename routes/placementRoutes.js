@@ -13,20 +13,20 @@ if (typeof authorizeRoles !== 'function') throw new Error('authMiddleware.author
 router.get('/student/:usn/applications', authenticateToken, placementController.getStudentApplications);
 router.get('/offers/:usn', authenticateToken, placementController.getStudentOffers);
 router.patch('/offers/decision', authenticateToken, placementController.submitOfferDecision);
-router.get('/process/list', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getAllProcessList);
-router.patch('/process/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.updateProcessStatus);
+router.get('/process/list', authenticateToken, authorizeRoles('admin'), placementController.getAllProcessList);
+router.patch('/process/:id', authenticateToken, authorizeRoles('admin'), placementController.updateProcessStatus);
 router.get('/drives', authenticateToken, placementController.getAllDrives);
-router.post('/drives/sync-status', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.syncDriveStatuses);
-router.get('/drives/:driveId/registrations', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getDriveRegistrations);
-router.get('/drives/:driveId/export', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getDriveExportData);
-router.delete('/drives/:driveId/registrations/:usn', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.removeFromProcess);
+router.post('/drives/sync-status', authenticateToken, authorizeRoles('admin'), placementController.syncDriveStatuses);
+router.get('/drives/:driveId/registrations', authenticateToken, authorizeRoles('admin'), placementController.getDriveRegistrations);
+router.get('/drives/:driveId/export', authenticateToken, authorizeRoles('admin'), placementController.getDriveExportData);
+router.delete('/drives/:driveId/registrations/:usn', authenticateToken, authorizeRoles('admin'), placementController.removeFromProcess);
 router.get('/drives/:driveId/eligibility', authenticateToken, placementController.getDriveEligibility);
-router.put('/drives/:driveId/eligibility', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.upsertDriveEligibility);
+router.put('/drives/:driveId/eligibility', authenticateToken, authorizeRoles('admin'), placementController.upsertDriveEligibility);
 router.get('/drives/:id', authenticateToken, placementController.getDriveById);
-router.post('/drives', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.addPlacementDrive);
-router.put('/drives/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.updatePlacementDrive);
-router.patch('/drives/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.patchPlacementDrive);
-router.patch('/drives/:id/status', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.updatePlacementDriveStatusOnly);
+router.post('/drives', authenticateToken, authorizeRoles('admin'), placementController.addPlacementDrive);
+router.put('/drives/:id', authenticateToken, authorizeRoles('admin'), placementController.updatePlacementDrive);
+router.patch('/drives/:id', authenticateToken, authorizeRoles('admin'), placementController.patchPlacementDrive);
+router.patch('/drives/:id/status', authenticateToken, authorizeRoles('admin'), placementController.updatePlacementDriveStatusOnly);
 router.get('/companies', placementController.getAllCompanies);
 router.post('/companies', placementController.addCompany);
 router.get('/companies/:id', placementController.getCompanyById);
@@ -39,7 +39,7 @@ router.get('/companies/:id/drives', placementController.getCompanyDrives);
 router.get('/companies/:id/offers', placementController.getCompanyOffers);
 router.post('/drives/:driveId/apply', authenticateToken, placementController.applyToDrive);
 
-router.get('/students', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getStudentsForPlacement);
+router.get('/students', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getStudentsForPlacement);
 router.get('/students/overview', authenticateToken, placementController.getPlacementOverview);
 router.get('/policies', authenticateToken, placementController.getAllPolicies);
 router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
@@ -68,8 +68,8 @@ router.put('/alumni/:identifier', authenticateToken, placementController.updateA
 
 // Student projects: admin list/update; public showcase
 router.get('/projects/public', projectController.getPublicProjects);
-router.get('/projects', authenticateToken, authorizeRoles('admin', 'superadmin'), projectController.getAllProjects);
-router.patch('/projects/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), projectController.updateProject);
+router.get('/projects', authenticateToken, authorizeRoles('admin'), projectController.getAllProjects);
+router.patch('/projects/:id', authenticateToken, authorizeRoles('admin'), projectController.updateProject);
 
 // Alumni projects: view and like
 router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), projectController.getAlumniProjects);
@@ -77,11 +77,11 @@ router.post('/projects/:id/like', authenticateToken, authorizeRoles('alumni'), p
 router.post('/projects/:id/view', projectController.incrementProjectView);
 
 // Violations: eligibility logs, placement violations, disciplinary records
-router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.getEligibilityDecisionLogs);
-router.get('/violations/placement-violations', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.getPlacementViolations);
-router.get('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.getDisciplinaryRecords);
-router.post('/violations/placement-violations', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.createPlacementViolation);
-router.post('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin', 'superadmin'), violationsController.createDisciplinaryRecord);
+router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);
+router.get('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.getPlacementViolations);
+router.get('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.getDisciplinaryRecords);
+router.post('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.createPlacementViolation);
+router.post('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.createDisciplinaryRecord);
 
 // Job Offers - ensure handlers exist before registering (avoids "argument handler must be a function" crash)
 const getAllJobOffersHandler = placementController.getAllJobOffers;
@@ -92,14 +92,14 @@ if (typeof getAllJobOffersHandler !== 'function') {
 if (typeof addJobOfferHandler !== 'function') {
   throw new Error(`placementController.addJobOffer is not a function (got ${typeof addJobOfferHandler})`);
 }
-router.get('/job-offers', authenticateToken, authorizeRoles('admin', 'superadmin'), getAllJobOffersHandler);
-router.post('/job-offers', authenticateToken, authorizeRoles('admin', 'superadmin'), addJobOfferHandler);
-router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.updateJobOffer);
+router.get('/job-offers', authenticateToken, authorizeRoles('admin', 'vc'), getAllJobOffersHandler);
+router.post('/job-offers', authenticateToken, authorizeRoles('admin'), addJobOfferHandler);
+router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin'), placementController.updateJobOffer);
 
-// Dashboard Stats
-router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getDashboardStats);
+// Dashboard Stats (admin and VC - VC can only view dashboard)
+router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardStats);
 
 // HR Recommendations (admin)
-router.get('/hr-recommendations', authenticateToken, authorizeRoles('admin', 'superadmin'), placementController.getAllHrRecommendations);
+router.get('/hr-recommendations', authenticateToken, authorizeRoles('admin'), placementController.getAllHrRecommendations);
 
 module.exports = router;

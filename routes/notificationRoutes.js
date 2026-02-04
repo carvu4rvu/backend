@@ -7,13 +7,13 @@ const { authenticateToken, authorizeRoles } = require('../middleware/authMiddlew
 router.post(
   '/',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.create
 );
 router.get(
   '/',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.list
 );
 
@@ -54,25 +54,25 @@ router.patch(
 router.get(
   '/:id/recipients',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.getRecipients
 );
 router.get(
   '/:id',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.getById
 );
 router.post(
   '/:id/send',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.send
 );
 router.post(
   '/:id/resend',
   authenticateToken,
-  authorizeRoles('admin', 'superadmin'),
+  authorizeRoles('admin'),
   notificationController.resend
 );
 

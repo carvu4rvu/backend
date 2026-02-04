@@ -177,7 +177,7 @@ exports.applyToDrive = async (req, res) => {
         graduation_year: gradYear,
       };
       const role = (req.user?.role || '').toString().toLowerCase();
-      const isAdmin = role === 'admin' || role === 'superadmin';
+      const isAdmin = role === 'admin';
       const { isEligible: eligible, rejectionReasons } = evaluateEligibility(studentForEval, eligibility, {
         adminOverride: isAdmin && adminOverride && eligibility.admin_override_allowed === true,
       });

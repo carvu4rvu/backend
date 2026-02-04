@@ -15,15 +15,22 @@ router.post('/forgot-password/verify', authController.forgotPasswordVerify);
 router.get('/verify', authenticateToken, authController.verifyToken);
 
 // Admin: User Login Management (admin/superadmin/placement)
-router.get('/admin/user-login', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.getAdminUserLoginList);
-router.get('/admin/students-without-login', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.getStudentsWithoutLogin);
-router.patch('/admin/user-login/bulk', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.patchBulkUserLoginIsActive);
-router.patch('/admin/user-login/:id', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.patchUserLoginIsActive);
+router.get('/admin/user-login', authenticateToken, authorizeRoles('admin'), authController.getAdminUserLoginList);
+router.get('/admin/students-without-login', authenticateToken, authorizeRoles('admin'), authController.getStudentsWithoutLogin);
+router.patch('/admin/user-login/bulk', authenticateToken, authorizeRoles('admin'), authController.patchBulkUserLoginIsActive);
+router.patch('/admin/user-login/:id', authenticateToken, authorizeRoles('admin'), authController.patchUserLoginIsActive);
 
 // Admin: Company Login Management
-router.get('/admin/company-logins', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.getCompanyLogins);
-router.post('/admin/company-login', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.createCompanyLogin);
-router.delete('/admin/company-login/:id', authenticateToken, authorizeRoles('admin', 'superadmin', 'placement'), authController.deleteCompanyLogin);
+router.get('/admin/company-logins', authenticateToken, authorizeRoles('admin'), authController.getCompanyLogins);
+router.post('/admin/company-login', authenticateToken, authorizeRoles('admin'), authController.createCompanyLogin);
+router.patch('/admin/company-login/:id', authenticateToken, authorizeRoles('admin'), authController.patchCompanyLoginPassword);
+router.delete('/admin/company-login/:id', authenticateToken, authorizeRoles('admin'), authController.deleteCompanyLogin);
+
+// Admin: VC Login Management
+router.get('/admin/vc-logins', authenticateToken, authorizeRoles('admin'), authController.getVcLogins);
+router.post('/admin/vc-login', authenticateToken, authorizeRoles('admin'), authController.createVcLogin);
+router.patch('/admin/vc-login/:id', authenticateToken, authorizeRoles('admin'), authController.patchVcLoginPassword);
+router.delete('/admin/vc-login/:id', authenticateToken, authorizeRoles('admin'), authController.deleteVcLogin);
 
 // Alumni registration (no auth required)
 router.post('/alumni/validate-code', authController.validateAlumniCode);

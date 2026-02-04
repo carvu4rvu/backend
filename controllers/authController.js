@@ -947,6 +947,37 @@ exports.createCompanyLogin = async (req, res) => {
 };
 
 /**
+ * PATCH /api/auth/admin/company-login/:id
+ * Update company login password. Body: { password }
+ */
+exports.patchCompanyLoginPassword = async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  if (!password || typeof password !== 'string' || password.length < 6) {
+    return res.status(400).json({ message: 'Password is required and must be at least 6 characters' });
+  }
+  try {
+    const roleRes = await pool.query("SELECT id FROM roles WHERE name = 'company'");
+    if (roleRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Login not found' });
+    }
+    const companyRoleId = roleRes.rows[0].id;
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'UPDATE user_login SET password_hash = $1, updated_at = NOW() WHERE id = $2 AND role_id = $3 RETURNING id',
+      [passwordHash, id, companyRoleId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Company login not found' });
+    }
+    res.json({ message: 'Company login password updated successfully' });
+  } catch (err) {
+    console.error('patchCompanyLoginPassword:', err);
+    res.status(500).json({ message: 'Failed to update password' });
+  }
+};
+
+/**
  * DELETE /api/auth/admin/company-login/:id
  * Delete a company login
  */
@@ -971,6 +1002,168 @@ exports.deleteCompanyLogin = async (req, res) => {
   } catch (err) {
     console.error('deleteCompanyLogin:', err);
     res.status(500).json({ message: 'Failed to delete company login' });
+  }
+};
+
+// --- ADMIN: VC Login Management ---
+
+/**
+ * GET /api/auth/admin/vc-logins
+ * List all VC logins
+ */
+exports.getVcLogins = async (req, res) => {
+  try {
+    const { search, page = 1, limit = 50 } = req.query;
+    const offset = Math.max(0, (Number(page) || 1) - 1) * Math.min(100, Math.max(1, Number(limit) || 50));
+    const limitVal = Math.min(100, Math.max(1, Number(limit) || 50));
+
+    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'vc'");
+    if (roleRes.rows.length === 0) {
+      return res.json({ logins: [], total: 0, page: 1, limit: limitVal });
+    }
+    const vcRoleId = roleRes.rows[0].id;
+
+    let where = ['ul.role_id = $1'];
+    let params = [vcRoleId];
+    let idx = 2;
+    if (search && search.trim()) {
+      where.push(`ul.email_id ILIKE $${idx}`);
+      params.push(`%${search.trim()}%`);
+      idx++;
+    }
+    const whereClause = `WHERE ${where.join(' AND ')}`;
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM user_login ul ${whereClause}`,
+      params
+    );
+    const total = countResult.rows[0]?.total ?? 0;
+
+    params.push(limitVal, offset);
+    const listResult = await pool.query(
+      `SELECT ul.id, ul.email_id, ul.is_active, ul.last_login_at, ul.created_at
+       FROM user_login ul
+       ${whereClause}
+       ORDER BY ul.created_at DESC
+       LIMIT $${idx} OFFSET $${idx + 1}`,
+      params
+    );
+
+    res.json({
+      logins: listResult.rows,
+      total,
+      page: Number(page) || 1,
+      limit: limitVal,
+    });
+  } catch (err) {
+    console.error('getVcLogins:', err);
+    res.status(500).json({ message: 'Failed to fetch VC logins' });
+  }
+};
+
+/**
+ * POST /api/auth/admin/vc-login
+ * Create a new VC login. Body: { email, password }
+ */
+exports.createVcLogin = async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'email and password are required' });
+  }
+
+  try {
+    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'vc'");
+    let vcRoleId;
+    if (roleRes.rows.length === 0) {
+      const newRole = await pool.query("INSERT INTO roles (name) VALUES ('vc') RETURNING id");
+      vcRoleId = newRole.rows[0].id;
+    } else {
+      vcRoleId = roleRes.rows[0].id;
+    }
+
+    const emailNorm = email.trim().toLowerCase();
+    const emailCheck = await pool.query('SELECT id FROM user_login WHERE email_id = $1', [emailNorm]);
+    if (emailCheck.rows.length > 0) {
+      return res.status(400).json({ message: 'A login with this email already exists' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const insertResult = await pool.query(
+      `INSERT INTO user_login (usn, role_id, password_hash, email_id, is_active)
+       VALUES (NULL, $1, $2, $3, true)
+       RETURNING id, email_id, is_active, created_at`,
+      [vcRoleId, passwordHash, emailNorm]
+    );
+
+    res.status(201).json({
+      message: 'VC login created successfully',
+      login: insertResult.rows[0],
+    });
+  } catch (err) {
+    console.error('createVcLogin:', err);
+    if (err.code === '23505') {
+      return res.status(400).json({ message: 'This email is already registered' });
+    }
+    res.status(500).json({ message: 'Failed to create VC login' });
+  }
+};
+
+/**
+ * DELETE /api/auth/admin/vc-login/:id
+ * Delete a VC login
+ */
+/**
+ * PATCH /api/auth/admin/vc-login/:id
+ * Update VC login password. Body: { password }
+ */
+exports.patchVcLoginPassword = async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  if (!password || typeof password !== 'string' || password.length < 6) {
+    return res.status(400).json({ message: 'Password is required and must be at least 6 characters' });
+  }
+  try {
+    const roleRes = await pool.query("SELECT id FROM roles WHERE name = 'vc'");
+    if (roleRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Login not found' });
+    }
+    const vcRoleId = roleRes.rows[0].id;
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'UPDATE user_login SET password_hash = $1, updated_at = NOW() WHERE id = $2 AND role_id = $3 RETURNING id',
+      [passwordHash, id, vcRoleId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'VC login not found' });
+    }
+    res.json({ message: 'VC login password updated successfully' });
+  } catch (err) {
+    console.error('patchVcLoginPassword:', err);
+    res.status(500).json({ message: 'Failed to update password' });
+  }
+};
+
+exports.deleteVcLogin = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const roleRes = await pool.query("SELECT id FROM roles WHERE name = 'vc'");
+    if (roleRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Login not found' });
+    }
+    const vcRoleId = roleRes.rows[0].id;
+
+    const result = await pool.query(
+      'DELETE FROM user_login WHERE id = $1 AND role_id = $2 RETURNING id',
+      [id, vcRoleId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'VC login not found' });
+    }
+    res.json({ message: 'VC login deleted successfully' });
+  } catch (err) {
+    console.error('deleteVcLogin:', err);
+    res.status(500).json({ message: 'Failed to delete VC login' });
   }
 };
 

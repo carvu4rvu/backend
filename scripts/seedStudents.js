@@ -15,13 +15,9 @@ async function seed() {
   const roles = [
     { name: 'student' },
     { name: 'admin' },
-    { name: 'superadmin' },
-    { name: 'placement' },
     { name: 'alumni' },
     { name: 'company' },
-    { name: 'dean' },
-    { name: 'parent' },
-    { name: 'management' },
+    { name: 'vc' },
   ];
   const { data: existingRoles } = await supabase.from('roles').select('id', 'name');
   const existingRoleNames = (existingRoles || []).map((r) => r.name);

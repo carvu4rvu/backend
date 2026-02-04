@@ -6,25 +6,25 @@ const { authenticateToken, authorizeRoles } = require('../middleware/authMiddlew
 
 // Metadata routes (public - no auth needed)
 router.get('/schools', studentProfileController.getSchools);
-router.post('/schools', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createSchool);
-router.put('/schools/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateSchool);
-router.delete('/schools/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteSchool);
+router.post('/schools', authenticateToken, authorizeRoles('admin'), studentProfileController.createSchool);
+router.put('/schools/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.updateSchool);
+router.delete('/schools/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteSchool);
 router.get('/programs', studentProfileController.getPrograms);
-router.post('/programs', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createProgram);
-router.put('/programs/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateProgram);
-router.delete('/programs/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteProgram);
+router.post('/programs', authenticateToken, authorizeRoles('admin'), studentProfileController.createProgram);
+router.put('/programs/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.updateProgram);
+router.delete('/programs/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteProgram);
 router.get('/majors', studentProfileController.getMajors);
-router.post('/majors', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createMajor);
-router.put('/majors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateMajor);
-router.delete('/majors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteMajor);
+router.post('/majors', authenticateToken, authorizeRoles('admin'), studentProfileController.createMajor);
+router.put('/majors/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.updateMajor);
+router.delete('/majors/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteMajor);
 router.get('/minors', studentProfileController.getMinors);
-router.post('/minors', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createMinor);
-router.put('/minors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateMinor);
-router.delete('/minors/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteMinor);
+router.post('/minors', authenticateToken, authorizeRoles('admin'), studentProfileController.createMinor);
+router.put('/minors/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.updateMinor);
+router.delete('/minors/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteMinor);
 router.get('/specializations', studentProfileController.getSpecializations);
-router.post('/specializations', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.createSpecialization);
-router.put('/specializations/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.updateSpecialization);
-router.delete('/specializations/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.deleteSpecialization);
+router.post('/specializations', authenticateToken, authorizeRoles('admin'), studentProfileController.createSpecialization);
+router.put('/specializations/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.updateSpecialization);
+router.delete('/specializations/:id', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteSpecialization);
 
 // Academy overview (protected - admin/placement use)
 router.get('/academy/overview', authenticateToken, studentProfileController.getAcademyOverview);
@@ -33,11 +33,11 @@ router.get('/academy/overview', authenticateToken, studentProfileController.getA
 router.get('/students', authenticateToken, studentProfileController.getStudentsList);
 
 // Add student (single) - admin only
-router.post('/students', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.addStudent);
+router.post('/students', authenticateToken, authorizeRoles('admin'), studentProfileController.addStudent);
 // Bulk: check duplicates - admin only
-router.post('/students/bulk/check-duplicates', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.checkBulkDuplicates);
+router.post('/students/bulk/check-duplicates', authenticateToken, authorizeRoles('admin'), studentProfileController.checkBulkDuplicates);
 // Bulk: insert - admin only
-router.post('/students/bulk', authenticateToken, authorizeRoles('admin', 'superadmin'), studentProfileController.bulkInsertStudents);
+router.post('/students/bulk', authenticateToken, authorizeRoles('admin'), studentProfileController.bulkInsertStudents);
 
 // Personal Profile specific routes (protected)
 router.get('/profile/:usn/personal', authenticateToken, studentProfileController.getPersonalProfile);

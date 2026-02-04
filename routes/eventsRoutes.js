@@ -9,8 +9,8 @@ router.get('/notification-stats', eventsController.getNotificationStats);
 router.get('/:id', eventsController.getById);
 
 // Admin only
-router.post('/', authenticateToken, authorizeRoles('admin', 'superadmin'), eventsController.create);
-router.put('/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), eventsController.update);
-router.delete('/:id', authenticateToken, authorizeRoles('admin', 'superadmin'), eventsController.remove);
+router.post('/', authenticateToken, authorizeRoles('admin'), eventsController.create);
+router.put('/:id', authenticateToken, authorizeRoles('admin'), eventsController.update);
+router.delete('/:id', authenticateToken, authorizeRoles('admin'), eventsController.remove);
 
 module.exports = router;
