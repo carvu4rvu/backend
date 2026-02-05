@@ -52,14 +52,12 @@ const uploadRoutes = require('./routes/uploadRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
 const companyRoutes = require('./routes/companyRoutes');
-const jobRoutes = require('./routes/jobRoutes');
 const ensureProfileImageColumn = require('./migrations/ensureProfileImage');
 const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
 const ensureEventsStatusColumn = require('./migrations/ensureEventsStatusColumn');
 const ensureNotificationsEventIdColumn = require('./migrations/ensureNotificationsEventIdColumn');
 const ensureNotificationsDriveIdColumn = require('./migrations/ensureNotificationsDriveIdColumn');
-const { initializeScheduler } = require('./jobs/scheduler');
 
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
@@ -69,7 +67,6 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/company', companyRoutes);
-app.use('/api/jobs', jobRoutes);
 
 app.get('/', (req, res) => {
   res.send('Hello from the Backend!');
@@ -132,11 +129,4 @@ app.listen(PORT, async () => {
     await transporter.verify();
   });
 
-  // Initialize scheduled jobs (eligibility sync runs every 10 minutes)
-  try {
-    initializeScheduler();
-    console.log('Job scheduler initialized ✅');
-  } catch (err) {
-    console.error('Job scheduler initialization failed ❌', err.message);
-  }
 });

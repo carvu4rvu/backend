@@ -42,6 +42,9 @@ router.post('/drives/:driveId/apply', authenticateToken, placementController.app
 router.get('/students', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getStudentsForPlacement);
 router.get('/students/overview', authenticateToken, placementController.getPlacementOverview);
 router.get('/students/overview-table', authenticateToken, authorizeRoles('admin'), placementController.getStudentsOverviewTable);
+router.get('/students/eligibility', authenticateToken, authorizeRoles('admin'), placementController.getStudentsEligibility);
+router.put('/students/eligibility/bulk', authenticateToken, authorizeRoles('admin'), placementController.bulkUpdateStudentEligibility);
+router.put('/students/:usn/eligibility', authenticateToken, authorizeRoles('admin'), placementController.updateStudentEligibility);
 router.get('/policies', authenticateToken, placementController.getAllPolicies);
 router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
 router.post('/policies', authenticateToken, placementController.upsertPolicy);
@@ -84,6 +87,7 @@ router.post('/projects/:id/view', projectController.incrementProjectView);
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);
 router.get('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.getPlacementViolations);
 router.get('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.getDisciplinaryRecords);
+router.post('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.createEligibilityDecisionLog);
 router.post('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.createPlacementViolation);
 router.post('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.createDisciplinaryRecord);
 

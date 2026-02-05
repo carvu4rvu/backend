@@ -128,6 +128,38 @@ exports.createPlacementViolation = async (req, res) => {
   }
 };
 
+/** POST eligibility_decision_logs */
+exports.createEligibilityDecisionLog = async (req, res) => {
+  try {
+    const { usn, placement_drive_id, is_eligible, rejection_reasons, evaluated_by } = req.body;
+    if (!usn || !placement_drive_id || is_eligible === undefined) {
+      return res.status(400).json({ message: 'usn, placement_drive_id, and is_eligible are required' });
+    }
+    const payload = {
+      usn: String(usn).trim(),
+      placement_drive_id: parseInt(placement_drive_id, 10),
+      is_eligible: Boolean(is_eligible),
+      rejection_reasons: Array.isArray(rejection_reasons) ? rejection_reasons : (rejection_reasons ? [rejection_reasons] : null),
+      evaluated_by: evaluated_by ? String(evaluated_by).trim() : (req.user?.email || 'ADMIN'),
+      evaluated_at: new Date().toISOString(),
+    };
+    const { data, error } = await supabase
+      .from('eligibility_decision_logs')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Create eligibility decision log:', apiMessage(error));
+      return res.status(400).json({ message: apiMessage(error, 'Failed to create eligibility log') });
+    }
+    res.status(201).json(data);
+  } catch (err) {
+    logger.error('createEligibilityDecisionLog:', err);
+    res.status(500).json({ message: apiMessage(err, 'Server error') });
+  }
+};
+
 /** POST student_disciplinary_records */
 exports.createDisciplinaryRecord = async (req, res) => {
   try {

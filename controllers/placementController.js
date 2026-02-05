@@ -2339,6 +2339,153 @@ exports.upsertPolicy = async (req, res) => {
 };
 
 /**
+ * GET /placement/students/eligibility - get students with their eligibility flags
+ * Query: school_id, program_id, search, limit
+ */
+exports.getStudentsEligibility = async (req, res) => {
+  try {
+    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 500));
+    const search = (req.query.search || '').trim();
+    const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
+    const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
+
+    let query = supabase
+      .from('student_basic_details')
+      .select(`
+        usn, full_name, college_email, school_id, program_id, year_of_joining,
+        is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible,
+        schools ( id, name, abbreviation ),
+        programs ( id, name )
+      `)
+      .eq('is_active', true)
+      .order('full_name', { ascending: true })
+      .limit(limit);
+
+    if (schoolId != null && !Number.isNaN(schoolId)) {
+      query = query.eq('school_id', schoolId);
+    }
+    if (programId != null && !Number.isNaN(programId)) {
+      query = query.eq('program_id', programId);
+    }
+    if (search) {
+      query = query.or(`usn.ilike.%${search}%,full_name.ilike.%${search}%,college_email.ilike.%${search}%`);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const students = (data || []).map((s) => ({
+      usn: s.usn,
+      full_name: s.full_name,
+      college_email: s.college_email,
+      school_id: s.school_id,
+      program_id: s.program_id,
+      year_of_joining: s.year_of_joining,
+      school_name: s.schools?.name || s.schools?.abbreviation || '',
+      program_name: s.programs?.name || '',
+      is_summer_immersion_eligible: !!s.is_summer_immersion_eligible,
+      is_summer_internship_eligible: !!s.is_summer_internship_eligible,
+      is_capstone_eligible: !!s.is_capstone_eligible,
+      is_placement_eligible: !!s.is_placement_eligible
+    }));
+
+    res.json({ students, total: students.length });
+  } catch (err) {
+    logger.error('getStudentsEligibility:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch students' });
+  }
+};
+
+/**
+ * PUT /placement/students/:usn/eligibility - update individual student eligibility
+ */
+exports.updateStudentEligibility = async (req, res) => {
+  try {
+    const { usn } = req.params;
+    if (!usn) {
+      return res.status(400).json({ message: 'USN is required' });
+    }
+
+    const body = req.body;
+    const payload = {
+      updated_at: new Date().toISOString()
+    };
+
+    // Only update fields that are explicitly provided
+    if (typeof body.is_summer_immersion_eligible === 'boolean') {
+      payload.is_summer_immersion_eligible = body.is_summer_immersion_eligible;
+    }
+    if (typeof body.is_summer_internship_eligible === 'boolean') {
+      payload.is_summer_internship_eligible = body.is_summer_internship_eligible;
+    }
+    if (typeof body.is_capstone_eligible === 'boolean') {
+      payload.is_capstone_eligible = body.is_capstone_eligible;
+    }
+    if (typeof body.is_placement_eligible === 'boolean') {
+      payload.is_placement_eligible = body.is_placement_eligible;
+    }
+
+    const { data, error } = await supabase
+      .from('student_basic_details')
+      .update(payload)
+      .eq('usn', usn)
+      .select('usn, full_name, is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible')
+      .single();
+
+    if (error) throw error;
+
+    logger.info(`Updated eligibility for student ${usn}`);
+    res.json(data);
+  } catch (err) {
+    logger.error('updateStudentEligibility:', err);
+    res.status(500).json({ message: err.message || 'Failed to update student eligibility' });
+  }
+};
+
+/**
+ * PUT /placement/students/eligibility/bulk - bulk update student eligibility
+ */
+exports.bulkUpdateStudentEligibility = async (req, res) => {
+  try {
+    const { usns, eligibility } = req.body;
+    
+    if (!usns || !Array.isArray(usns) || usns.length === 0) {
+      return res.status(400).json({ message: 'USNs array is required' });
+    }
+
+    const payload = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (typeof eligibility.is_summer_immersion_eligible === 'boolean') {
+      payload.is_summer_immersion_eligible = eligibility.is_summer_immersion_eligible;
+    }
+    if (typeof eligibility.is_summer_internship_eligible === 'boolean') {
+      payload.is_summer_internship_eligible = eligibility.is_summer_internship_eligible;
+    }
+    if (typeof eligibility.is_capstone_eligible === 'boolean') {
+      payload.is_capstone_eligible = eligibility.is_capstone_eligible;
+    }
+    if (typeof eligibility.is_placement_eligible === 'boolean') {
+      payload.is_placement_eligible = eligibility.is_placement_eligible;
+    }
+
+    const { error, count } = await supabase
+      .from('student_basic_details')
+      .update(payload, { count: 'exact' })
+      .in('usn', usns);
+
+    if (error) throw error;
+
+    logger.info(`Bulk updated eligibility for ${count} students`);
+    res.json({ success: true, updated: count || usns.length });
+  } catch (err) {
+    logger.error('bulkUpdateStudentEligibility:', err);
+    res.status(500).json({ message: err.message || 'Failed to bulk update student eligibility' });
+  }
+};
+
+/**
  * GET /placement/policies/me - get batch academic policy for the logged-in student (by usn -> school_id, program_id, year_of_joining)
  * Returns both the batch policy flags and the student's individual eligibility columns
  */
