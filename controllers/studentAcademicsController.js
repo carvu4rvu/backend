@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { sendLocked } = require('../utils/apiErrorResponse');
 
 // Grade → grade_points mapping based on 10-point scale
 const GRADE_POINTS_MAP = {
@@ -177,6 +178,20 @@ exports.upsertAcademicSemester = async (req, res) => {
     }
     if (!sem || !Number.isFinite(sem) || sem < 1 || sem > 8) {
       return res.status(400).json({ error: 'Valid semester (1-8) is required.' });
+    }
+
+    // Enforce semester-wise lock (view-only when locked)
+    try {
+      const field = `is_sem${sem}_locked`;
+      const lockCheck = await client.query(
+        `SELECT ${field} AS locked FROM public.student_edit_control WHERE usn = $1`,
+        [usn.toUpperCase()]
+      );
+      if (lockCheck?.rows?.[0]?.locked === true) {
+        return sendLocked(res, `Semester ${sem} is locked. You have view-only access.`);
+      }
+    } catch {
+      // If control table row doesn't exist yet, don't block.
     }
     if (!Array.isArray(courses) || courses.length === 0) {
       return res

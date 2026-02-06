@@ -4,6 +4,7 @@ const placementController = require('../controllers/placementController');
 const projectController = require('../controllers/projectController');
 const emailRecipientsController = require('../controllers/emailRecipientsController');
 const violationsController = require('../controllers/violationsController');
+const studentEditControlController = require('../controllers/studentEditControlController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 
 // Validate critical middleware/handlers (avoids cryptic "argument handler must be a function" crash)
@@ -45,6 +46,26 @@ router.get('/students/overview-table', authenticateToken, authorizeRoles('admin'
 router.get('/students/eligibility', authenticateToken, authorizeRoles('admin'), placementController.getStudentsEligibility);
 router.put('/students/eligibility/bulk', authenticateToken, authorizeRoles('admin'), placementController.bulkUpdateStudentEligibility);
 router.put('/students/:usn/eligibility', authenticateToken, authorizeRoles('admin'), placementController.updateStudentEligibility);
+
+// Student edit control (profile locks) - admin only
+router.get(
+  '/students/profile-locks',
+  authenticateToken,
+  authorizeRoles('admin'),
+  studentEditControlController.getProfileLocks
+);
+router.post(
+  '/students/profile-locks/sync',
+  authenticateToken,
+  authorizeRoles('admin'),
+  studentEditControlController.syncProfileLocks
+);
+router.put(
+  '/students/profile-locks/:usn',
+  authenticateToken,
+  authorizeRoles('admin'),
+  studentEditControlController.updateProfileLocks
+);
 router.get('/policies', authenticateToken, placementController.getAllPolicies);
 router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
 router.post('/policies', authenticateToken, placementController.upsertPolicy);

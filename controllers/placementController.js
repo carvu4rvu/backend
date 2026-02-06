@@ -1506,7 +1506,7 @@ exports.getStudentsOverviewTable = async (req, res) => {
 
     let query = supabase
       .from('student_basic_details')
-      .select('usn, full_name, college_email, profile_lock, school_id, program_id, schools(name), programs(name)')
+      .select('usn, full_name, college_email, school_id, program_id, schools(name), programs(name)')
       .eq('is_active', true)
       .eq('opt_in', true);
 
@@ -1681,7 +1681,7 @@ exports.getStudentsOverviewTable = async (req, res) => {
           drives_absent: agg.drives_absent ?? 0,
           placement_violations: agg.placement_violations ?? 0,
           disciplinary: agg.disciplinary ?? 0,
-          admin_hold: s.profile_lock === true,
+          admin_hold: false,
           malpractice: agg.malpractice_count ?? 0,
         };
       });
