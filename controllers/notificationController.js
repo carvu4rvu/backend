@@ -209,12 +209,13 @@ exports.getRecipients = async (req, res) => {
         s.full_name,
         s.college_email,
         s.year_of_joining,
-        s.is_active,
+        ul.is_active AS login_is_active,
         sch.name AS school_name,
         sch.abbreviation AS school_abbreviation,
         p.name AS program_name
       FROM student_notifications sn
       LEFT JOIN student_basic_details s ON s.usn = sn.usn
+      LEFT JOIN user_login ul ON ul.usn = s.usn
       LEFT JOIN schools sch ON sch.id = s.school_id
       LEFT JOIN programs p ON p.id = s.program_id
       WHERE sn.notification_id = $1
@@ -230,7 +231,7 @@ exports.getRecipients = async (req, res) => {
       schoolName: r.school_name || r.school_abbreviation || '—',
       programName: r.program_name || '—',
       yearOfJoining: r.year_of_joining,
-      isActive: r.is_active,
+      isActive: r.login_is_active !== false,
       isRead: !!r.is_read,
       deliveredAt: r.delivered_at,
       readAt: r.read_at,

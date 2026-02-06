@@ -68,7 +68,6 @@ exports.verifyUSN = async (req, res) => {
         s.current_year,
         s.current_semester,
         s.is_registered, 
-        s.is_active,
         sc.name as school_name, 
         p.name as program_name
       FROM student_basic_details s
@@ -83,8 +82,20 @@ exports.verifyUSN = async (req, res) => {
     }
 
     const student = result.rows[0];
-    if (!student.is_active) {
-      return res.status(403).json({ message: "Student account is inactive." });
+
+    // If a login row exists and is marked inactive, block registration.
+    try {
+      const loginRes = await pool.query(
+        `SELECT is_active FROM user_login WHERE usn = $1 LIMIT 1`,
+        [usn]
+      );
+      const loginRow = loginRes.rows[0];
+      if (loginRow && loginRow.is_active === false) {
+        return res.status(403).json({ message: "Student account is inactive." });
+      }
+    } catch (checkErr) {
+      // Log but don't block registration if check fails
+      console.error('verifyUSN login is_active check failed:', checkErr);
     }
 
     res.json({

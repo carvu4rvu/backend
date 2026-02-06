@@ -1274,18 +1274,35 @@ exports.upsertDriveEligibility = async (req, res) => {
       const schoolIds = result.allowed_school_ids && result.allowed_school_ids.length ? result.allowed_school_ids : null;
       const programIds = result.allowed_program_ids && result.allowed_program_ids.length ? result.allowed_program_ids : null;
 
-      let eligibleQuery = supabase
-        .from('student_basic_details')
-        .select('usn')
-        .eq('is_active', true)
-        .eq('opt_in', true)
-        .order('usn', { ascending: true })
-        .limit(10000);
-      if (schoolIds && schoolIds.length) eligibleQuery = eligibleQuery.in('school_id', schoolIds);
-      if (programIds && programIds.length) eligibleQuery = eligibleQuery.in('program_id', programIds);
-      const { data: eligibleRows, error: eligibleErr } = await eligibleQuery;
-      if (eligibleErr) throw eligibleErr;
-      const eligibleUsns = (eligibleRows || []).map((r) => r.usn).filter(Boolean);
+      const where = ['s.opt_in = true'];
+      const params = [];
+      let idx = 1;
+      if (schoolIds && schoolIds.length) {
+        where.push(`s.school_id = ANY($${idx})`);
+        params.push(schoolIds);
+        idx += 1;
+      }
+      if (programIds && programIds.length) {
+        where.push(`s.program_id = ANY($${idx})`);
+        params.push(programIds);
+        idx += 1;
+      }
+      const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+      const eligibleRes = await pool.query(
+        `
+          SELECT s.usn
+          FROM student_basic_details s
+          JOIN user_login ul
+            ON ul.usn = s.usn
+          ${whereClause}
+            AND ul.is_active = true
+          ORDER BY s.usn ASC
+          LIMIT 10000
+        `,
+        params
+      );
+      const eligibleUsns = (eligibleRes.rows || []).map((r) => r.usn).filter(Boolean);
       if (eligibleUsns.length === 0) {
         return res.json({ ...result, addedToProcess: 0, notified: 0 });
       }

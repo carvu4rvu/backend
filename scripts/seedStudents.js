@@ -164,7 +164,6 @@ async function seed() {
       current_semester: Math.min(6, Math.floor((i % 6) + 1)),
       section: ['A', 'B', 'C'][i % 3],
       is_registered: i % 2 === 0,
-      is_active: true,
     });
   }
 

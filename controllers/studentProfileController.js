@@ -642,7 +642,7 @@ exports.getStudentsList = async (req, res) => {
 
         const selectFields = `
             usn, full_name, college_email, school_id, program_id, major_id, minor_id, specialization_id,
-            year_of_joining, current_year, current_semester, section, is_registered, is_active,
+            year_of_joining, current_year, current_semester, section, is_registered,
             profile_image, created_at,
             schools ( id, name, abbreviation ),
             programs ( id, name, graduation_level ),
@@ -664,10 +664,6 @@ exports.getStudentsList = async (req, res) => {
         if (yearOfJoining != null && !Number.isNaN(yearOfJoining)) {
             query = query.eq('year_of_joining', yearOfJoining);
         }
-        if (isActive !== undefined && isActive !== '') {
-            const active = isActive === 'true' || isActive === '1';
-            query = query.eq('is_active', active);
-        }
         if (search) {
             query = query.or(`usn.ilike.%${search}%,full_name.ilike.%${search}%,college_email.ilike.%${search}%`);
         }
@@ -681,9 +677,46 @@ exports.getStudentsList = async (req, res) => {
 
         if (error) throw error;
 
-        const total = count != null ? count : (rows || []).length;
+        let resultRows = rows || [];
+
+        // Apply is_active filter using user_login.is_active
+        if (isActive !== undefined && isActive !== '') {
+            const wantActive = isActive === 'true' || isActive === '1';
+            const usns = resultRows.map((r) => r.usn).filter(Boolean);
+            if (usns.length > 0) {
+                const loginRes = await pool.query(
+                    `SELECT usn, is_active FROM user_login WHERE usn = ANY($1)`,
+                    [usns]
+                );
+                const activeMap = new Map(loginRes.rows.map((r) => [r.usn, r.is_active]));
+                resultRows = resultRows.map((r) => ({
+                    ...r,
+                    is_active: activeMap.has(r.usn) ? activeMap.get(r.usn) : true,
+                })).filter((r) => (wantActive ? r.is_active !== false : r.is_active === false));
+            } else {
+                resultRows = [];
+            }
+        } else {
+            // Populate is_active from user_login for informational purposes
+            const usns = resultRows.map((r) => r.usn).filter(Boolean);
+            if (usns.length > 0) {
+                const loginRes = await pool.query(
+                    `SELECT usn, is_active FROM user_login WHERE usn = ANY($1)`,
+                    [usns]
+                );
+                const activeMap = new Map(loginRes.rows.map((r) => [r.usn, r.is_active]));
+                resultRows = resultRows.map((r) => ({
+                    ...r,
+                    is_active: activeMap.has(r.usn) ? activeMap.get(r.usn) : true,
+                }));
+            }
+        }
+
+        const total = count != null && (isActive === undefined || isActive === '')
+            ? count
+            : resultRows.length;
         res.json({
-            students: rows || [],
+            students: resultRows,
             total,
             page,
             limit,
@@ -3496,7 +3529,6 @@ exports.addStudent = async (req, res) => {
             current_year,
             current_semester,
             is_registered: body.is_registered === true,
-            is_active: body.is_active !== false,
         };
         if (row.full_name === '' || row.college_email === '') {
             return sendValidationError(res, 'full_name and college_email are required.');
@@ -3612,7 +3644,6 @@ exports.bulkInsertStudents = async (req, res) => {
                 current_year,
                 current_semester,
                 is_registered: s.is_registered === true,
-                is_active: s.is_active !== false,
             };
             const optional = ['major_id', 'minor_id', 'specialization_id', 'section', 'personal_email', 'gender', 'date_of_birth', 'blood_group', 'languages', 'specially_abled'];
             optional.forEach((key) => {

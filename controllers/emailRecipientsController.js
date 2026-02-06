@@ -51,7 +51,7 @@ exports.getEmailRecipients = async (req, res) => {
       const isActive = req.query.is_active;
       const isRegistered = req.query.is_registered;
 
-      const selectFields = `usn, full_name, college_email, personal_email, school_id, program_id, major_id, minor_id, specialization_id, year_of_joining, current_year, current_semester, section, gender, is_active, is_registered, schools ( id, name, abbreviation ), programs ( id, name ), majors ( id, name ), minors ( id, name ), specializations ( id, name )`;
+      const selectFields = `usn, full_name, college_email, personal_email, school_id, program_id, major_id, minor_id, specialization_id, year_of_joining, current_year, current_semester, section, gender, is_registered, schools ( id, name, abbreviation ), programs ( id, name ), majors ( id, name ), minors ( id, name ), specializations ( id, name )`;
       let query = supabase
         .from('student_basic_details')
         .select(selectFields, { count: 'exact' });
@@ -66,7 +66,6 @@ exports.getEmailRecipients = async (req, res) => {
       if (currentSemester != null && !Number.isNaN(currentSemester)) query = query.eq('current_semester', currentSemester);
       if (section) query = query.eq('section', section);
       if (gender) query = query.eq('gender', gender);
-      if (isActive !== undefined && isActive !== '') query = query.eq('is_active', isActive === 'true' || isActive === '1');
       if (isRegistered !== undefined && isRegistered !== '') query = query.eq('is_registered', isRegistered === 'true' || isRegistered === '1');
       if (search) query = query.or(`usn.ilike.%${search}%,full_name.ilike.%${search}%,college_email.ilike.%${search}%,personal_email.ilike.%${search}%`);
 
@@ -74,8 +73,29 @@ exports.getEmailRecipients = async (req, res) => {
       const { data: rows, error, count } = await query;
       if (error) throw error;
 
-      const recipients = (rows || []).map((r) => toRecipient(r, 'students')).filter((r) => r.email);
-      const total = count != null ? count : recipients.length;
+      let baseRows = rows || [];
+
+      // Apply is_active filter using user_login.is_active instead of student_basic_details.is_active
+      if (isActive !== undefined && isActive !== '') {
+        const wantActive = isActive === 'true' || isActive === '1';
+        const usns = baseRows.map((r) => r.usn).filter(Boolean);
+        if (usns.length > 0) {
+          const loginRes = await pool.query(
+            `SELECT usn, is_active FROM user_login WHERE usn = ANY($1)`,
+            [usns]
+          );
+          const activeMap = new Map(loginRes.rows.map((r) => [r.usn, r.is_active]));
+          baseRows = baseRows.filter((r) => {
+            const flag = activeMap.has(r.usn) ? activeMap.get(r.usn) : true;
+            return wantActive ? flag !== false : flag === false;
+          });
+        } else {
+          baseRows = [];
+        }
+      }
+
+      const recipients = baseRows.map((r) => toRecipient(r, 'students')).filter((r) => r.email);
+      const total = isActive !== undefined && isActive !== '' ? recipients.length : (count != null ? count : recipients.length);
       return res.json({ recipients, total, page, limit, totalPages: Math.ceil((total || 0) / limit) });
     }
 
