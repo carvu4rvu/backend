@@ -3,6 +3,7 @@ const router = express.Router();
 const studentController = require('../controllers/studentController');
 const studentProfileController = require('../controllers/studentProfileController');
 const studentAcademicsController = require('../controllers/studentAcademicsController');
+const studentEditControlController = require('../controllers/studentEditControlController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 
 // Metadata routes (public - no auth needed)
@@ -106,6 +107,9 @@ router.post(
   authenticateToken,
   studentAcademicsController.upsertAcademicSemester
 );
+
+// Edit control (lock flags) for current student — must be before /profile/:usn
+router.get('/profile/edit-control', authenticateToken, studentEditControlController.getOwnEditControl);
 
 // General routes (protected) — /:section catches any remaining path
 router.get('/profile/:usn', authenticateToken, studentController.getProfile);

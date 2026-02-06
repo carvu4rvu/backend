@@ -10,6 +10,7 @@ const {
   sendAccessDenied,
   sendConflict,
   sendCaughtError,
+  sendLocked,
   ERROR_CODES,
 } = require('../utils/apiErrorResponse');
 const {
@@ -2201,6 +2202,21 @@ exports.updateProjects = async (req, res) => {
     try {
         const { usn } = req.params;
         let data = req.body;
+
+        // Enforce projects section lock (student_edit_control.is_projects_locked)
+        const client = await pool.connect();
+        try {
+            const { rows } = await client.query(
+                'SELECT is_projects_locked FROM public.student_edit_control WHERE usn = $1',
+                [String(usn || '').toUpperCase()]
+            );
+            if (rows && rows.length > 0 && rows[0].is_projects_locked === true) {
+                sendLocked(res, 'This section is locked by the administrator. You have view-only access.');
+                return;
+            }
+        } finally {
+            client.release();
+        }
 
         // --- 1. Input shape ---
         if (!Array.isArray(data)) {

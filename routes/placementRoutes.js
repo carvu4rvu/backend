@@ -66,6 +66,12 @@ router.put(
   authorizeRoles('admin'),
   studentEditControlController.updateProfileLocks
 );
+router.get(
+  '/students/:usn/edit-control',
+  authenticateToken,
+  authorizeRoles('admin', 'vc'),
+  studentEditControlController.getEditControlByUsn
+);
 router.get('/policies', authenticateToken, placementController.getAllPolicies);
 router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
 router.post('/policies', authenticateToken, placementController.upsertPolicy);

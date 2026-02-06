@@ -216,6 +216,97 @@ exports.updateProfileLocks = async (req, res) => {
 };
 
 /**
+ * GET /placement/students/:usn/edit-control (admin)
+ * Returns edit control (lock flags) for one student.
+ */
+exports.getEditControlByUsn = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const usn = (req.params.usn || '').toString().trim().toUpperCase();
+    if (!usn) return sendValidationError(res, 'USN is required.');
+
+    const { rows } = await client.query(
+      `
+        SELECT
+          c.usn,
+          u.is_active AS login_is_active,
+          c.is_basic_info_locked,
+          c.is_contacts_locked,
+          c.is_profile_details_locked,
+          c.is_social_links_locked,
+          c.is_parent_details_locked,
+          c.is_education_history_locked,
+          c.is_education_gaps_locked,
+          c.is_course_academics_locked,
+          c.is_extra_curricular_locked,
+          c.is_projects_locked,
+          c.is_certifications_locked,
+          c.is_internships_locked,
+          c.is_trainings_locked,
+          c.is_other_experiences_locked,
+          c.is_publications_locked,
+          c.is_placements_locked,
+          c.is_sem1_locked, c.is_sem2_locked, c.is_sem3_locked, c.is_sem4_locked,
+          c.is_sem5_locked, c.is_sem6_locked, c.is_sem7_locked, c.is_sem8_locked,
+          c.lock_reason
+        FROM public.student_edit_control c
+        LEFT JOIN public.user_login u ON u.usn = c.usn
+        WHERE c.usn = $1
+      `,
+      [usn]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.json({
+        usn,
+        login_is_active: true,
+        is_basic_info_locked: false,
+        is_contacts_locked: false,
+        is_profile_details_locked: false,
+        is_social_links_locked: false,
+        is_parent_details_locked: false,
+        is_education_history_locked: false,
+        is_education_gaps_locked: false,
+        is_course_academics_locked: false,
+        is_extra_curricular_locked: false,
+        is_projects_locked: false,
+        is_certifications_locked: false,
+        is_internships_locked: false,
+        is_trainings_locked: false,
+        is_other_experiences_locked: false,
+        is_publications_locked: false,
+        is_placements_locked: false,
+        is_sem1_locked: false,
+        is_sem2_locked: false,
+        is_sem3_locked: false,
+        is_sem4_locked: false,
+        is_sem5_locked: false,
+        is_sem6_locked: false,
+        is_sem7_locked: false,
+        is_sem8_locked: false,
+        lock_reason: null,
+      });
+    }
+    return res.json(rows[0]);
+  } catch (err) {
+    return sendCaughtError(res, err, 'Failed to fetch edit control.');
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * GET /student/profile/edit-control (student own)
+ * Returns edit control for the authenticated student (req.user.usn).
+ */
+exports.getOwnEditControl = async (req, res) => {
+  const usn = (req.user?.usn || '').toString().trim().toUpperCase();
+  if (!usn) return res.status(401).json({ message: 'Unauthorized.' });
+  req.params = { ...(req.params || {}), usn };
+  return exports.getEditControlByUsn(req, res);
+};
+
+/**
  * Guard helper for student-side edits.
  * Used by other controllers to block edits when a semester is locked.
  */
