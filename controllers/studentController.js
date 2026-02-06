@@ -1,8 +1,61 @@
 const supabase = require('../config/supabaseClient');
+const pool = require('../config/db');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
+const { sendLocked } = require('../utils/apiErrorResponse');
 
 const PHONE_VALIDATION_MSG = 'Please enter a valid phone number (e.g. 1234567890). Use 10 digits only.';
+
+// Map profile sections → student_edit_control lock fields
+// Note: projects are controlled only by is_projects_locked (not by any generic profile lock).
+const SECTION_LOCK_MAP = {
+  personal: ['is_basic_info_locked'],
+  contact: ['is_contacts_locked'],
+  education: ['is_education_history_locked', 'is_education_gaps_locked'],
+  academic_performance: ['is_course_academics_locked'],
+  projects: ['is_projects_locked'],
+  internships: ['is_internships_locked'],
+  trainings: ['is_trainings_locked'],
+  certifications: ['is_certifications_locked'],
+  publications: ['is_publications_locked'],
+  extra_curricular: ['is_extra_curricular_locked'],
+  other_experiences: ['is_other_experiences_locked'],
+  parent_details: ['is_parent_details_locked'],
+  summer_internship: ['is_internships_locked'],
+  career_overview: ['is_profile_details_locked'],
+  resume: ['is_profile_details_locked'],
+};
+
+async function assertSectionNotLocked(usn, sectionKey, res) {
+  const fields = SECTION_LOCK_MAP[sectionKey];
+  if (!fields || !fields.length) return true;
+  const upperUsn = String(usn || '').toUpperCase();
+  if (!upperUsn) return true;
+
+  const client = await pool.connect();
+  try {
+    const selectCols = fields.join(', ');
+    const { rows } = await client.query(
+      `SELECT ${selectCols} FROM public.student_edit_control WHERE usn = $1`,
+      [upperUsn]
+    );
+    if (!rows || !rows.length) return true;
+    const row = rows[0] || {};
+    const locked = fields.some((f) => row[f] === true);
+    if (locked) {
+      sendLocked(res, 'This section is locked by the administrator. You have view-only access.');
+      return false;
+    }
+    return true;
+  } catch (err) {
+    // If lock check fails for any reason, do not block the user – just log.
+    // eslint-disable-next-line no-console
+    console.error('assertSectionNotLocked error:', err.message || err);
+    return true;
+  } finally {
+    client.release();
+  }
+}
 
 /** Parse provisional_result_upload_links from DB (text) to array for API/frontend */
 function parseProvisionalLinks(val) {
@@ -353,6 +406,10 @@ exports.updateProfileSection = async (req, res) => {
         'career': 'career_overview'
     };
     if (sectionMap[section]) effectiveSection = sectionMap[section];
+
+    // Enforce admin locks per section (except where no lock is defined)
+    const lockOk = await assertSectionNotLocked(usn, effectiveSection, res);
+    if (!lockOk) return;
 
     switch (effectiveSection) {
         case 'personal': {

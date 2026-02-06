@@ -89,7 +89,6 @@ exports.getProfileLocks = async (req, res) => {
           ON c.usn = s.usn
         LEFT JOIN public.user_login u
           ON u.usn = s.usn
-        WHERE s.is_active = true
         ORDER BY s.usn ASC
       `
     );
@@ -113,10 +112,9 @@ exports.syncProfileLocks = async (req, res) => {
         INSERT INTO public.student_edit_control (usn)
         SELECT s.usn
         FROM public.student_basic_details s
-        WHERE s.is_active = true
-          AND NOT EXISTS (
-            SELECT 1 FROM public.student_edit_control c WHERE c.usn = s.usn
-          )
+        WHERE NOT EXISTS (
+          SELECT 1 FROM public.student_edit_control c WHERE c.usn = s.usn
+        )
       `
     );
     return res.json({ inserted: result.rowCount || 0 });

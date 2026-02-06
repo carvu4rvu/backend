@@ -404,6 +404,31 @@ exports.upsertAcademicSemester = async (req, res) => {
 
     const cgpa = await recomputeCgpaForStudent(client, usn.toUpperCase());
 
+    // After successful save, automatically lock this semester for the student.
+    try {
+      const upperUsn = usn.toUpperCase();
+      const field = `is_sem${sem}_locked`;
+      await client.query(
+        `
+          INSERT INTO public.student_edit_control (usn)
+          VALUES ($1)
+          ON CONFLICT (usn) DO NOTHING
+        `,
+        [upperUsn]
+      );
+      await client.query(
+        `
+          UPDATE public.student_edit_control
+          SET ${field} = true, last_updated_at = now()
+          WHERE usn = $1
+        `,
+        [upperUsn]
+      );
+    } catch (lockErr) {
+      // eslint-disable-next-line no-console
+      console.error('auto-lock semester failed:', lockErr);
+    }
+
     await client.query('COMMIT');
 
     return res.status(200).json({

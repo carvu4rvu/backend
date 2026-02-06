@@ -1402,13 +1402,12 @@ exports.getStudentsForPlacement = async (req, res) => {
       .from('student_basic_details')
       .select(`
         usn, full_name, college_email, personal_email, school_id, program_id, major_id, specialization_id,
-        year_of_joining, current_year, current_semester, section, is_active,
+        year_of_joining, current_year, current_semester, section,
         schools ( id, name, abbreviation ),
         programs ( id, name, min_duration_years, max_duration_years ),
         majors ( id, name ),
         specializations ( id, name )
       `)
-      .eq('is_active', true)
       .order('usn', { ascending: true })
       .limit(limit);
 
@@ -1447,7 +1446,6 @@ exports.getStudentsForPlacement = async (req, res) => {
         current_year: s.current_year,
         current_semester: s.current_semester,
         section: s.section,
-        is_active: s.is_active,
       };
     });
 
@@ -1507,7 +1505,6 @@ exports.getStudentsOverviewTable = async (req, res) => {
     let query = supabase
       .from('student_basic_details')
       .select('usn, full_name, college_email, school_id, program_id, schools(name), programs(name)')
-      .eq('is_active', true)
       .eq('opt_in', true);
 
     if (schoolParam) {
@@ -2099,7 +2096,7 @@ exports.getPlacementOverview = async (req, res) => {
       { data: snapshotRows },
       { data: placementRows }
     ] = await Promise.all([
-      supabase.from('student_basic_details').select('usn, school_id, program_id, year_of_joining, current_year').eq('is_active', true),
+      supabase.from('student_basic_details').select('usn, school_id, program_id, year_of_joining, current_year'),
       supabase.from('schools').select('id, name'),
       supabase.from('programs').select('id, school_id, name, graduation_level'),
       supabase.from('batch_academic_policies').select('school_id, program_id, joining_year, summer_immersion, summer_internship, capstone, placement'),
@@ -2238,8 +2235,7 @@ exports.getAllPolicies = async (req, res) => {
 
     const { data: students } = await supabase
       .from('student_basic_details')
-      .select('usn, school_id, program_id, year_of_joining')
-      .eq('is_active', true);
+      .select('usn, school_id, program_id, year_of_joining');
     const batchToUsns = {};
     (students || []).forEach((s) => {
       const key = `${s.school_id}|${s.program_id}|${s.year_of_joining}`;
@@ -2357,7 +2353,6 @@ exports.getStudentsEligibility = async (req, res) => {
         schools ( id, name, abbreviation ),
         programs ( id, name )
       `)
-      .eq('is_active', true)
       .order('full_name', { ascending: true })
       .limit(limit);
 
@@ -2610,7 +2605,6 @@ exports.getAlumniConversions = async (req, res) => {
     const { data: students, error: studentsErr } = await supabase
       .from('student_basic_details')
       .select('usn, full_name, college_email, personal_email, school_id, program_id, year_of_joining, opt_in')
-      .eq('is_active', true)
       .eq('school_id', schoolId)
       .eq('program_id', programId)
       .order('usn', { ascending: true });
@@ -2693,7 +2687,7 @@ exports.convertToAlumni = async (req, res) => {
       `SELECT s.usn, s.college_email, s.personal_email, s.full_name, s.year_of_joining, s.phone_number, sc.name AS school_name
        FROM student_basic_details s
        LEFT JOIN schools sc ON sc.id = s.school_id
-       WHERE s.usn = ANY($1) AND s.is_active = true`,
+       WHERE s.usn = ANY($1)`,
       [usns]
     );
     const studentMap = new Map();
