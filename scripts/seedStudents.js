@@ -20,8 +20,8 @@ async function seed() {
     { name: 'vc' },
   ];
   const { data: existingRoles } = await supabase.from('roles').select('id', 'name');
-  const existingRoleNames = (existingRoles || []).map((r) => r.name);
-  const rolesToInsert = roles.filter((r) => !existingRoleNames.includes(r.name));
+  const existingRoleNamesLower = new Set((existingRoles || []).map((r) => String(r.name || '').toLowerCase()));
+  const rolesToInsert = roles.filter((r) => !existingRoleNamesLower.has(String(r.name || '').toLowerCase()));
   if (rolesToInsert.length > 0) {
     const { error: rolesErr } = await supabase.from('roles').insert(rolesToInsert);
     if (rolesErr) console.warn('Roles insert:', rolesErr.message);

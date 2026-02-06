@@ -590,7 +590,7 @@ exports.getStudentProfile = async (req, res) => {
       .from('student_education_history')
       .select('*')
       .eq('usn', usn)
-      .order('year_of_passing', { ascending: false });
+      .order('end_year', { ascending: false });
 
     // Certifications
     const { data: certifications } = await supabase

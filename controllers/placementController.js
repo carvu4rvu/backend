@@ -798,13 +798,13 @@ exports.getDriveExportData = async (req, res) => {
     // Fetch education (10th, 12th, graduation)
     const { data: education } = await supabase
       .from('student_education_history')
-      .select('usn, education_level, institute_name, year_of_passing, result, result_type')
+      .select('usn, education_level, institute_name, end_year, result, result_type')
       .in('usn', usns);
 
     const eduByUsn = {};
     (education || []).forEach((e) => {
       if (!eduByUsn[e.usn]) eduByUsn[e.usn] = [];
-      eduByUsn[e.usn].push(`${e.education_level}: ${e.institute_name || ''} (${e.year_of_passing || ''})`);
+      eduByUsn[e.usn].push(`${e.education_level}: ${e.institute_name || ''} (${e.end_year || ''})`);
     });
 
     // Fetch academics (CGPA, backlogs)
@@ -3781,7 +3781,7 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       .from('student_education_history')
       .select('*')
       .eq('usn', usn)
-      .order('year_of_passing', { ascending: false });
+      .order('end_year', { ascending: false });
 
     // Get internships
     const { data: internships } = await supabase

@@ -16,15 +16,19 @@ async function seed() {
 
   try {
     // 1. Ensure "vc" role exists
-    let roleRes = await pool.query("SELECT id FROM roles WHERE name = $1", [ROLE_NAME]);
+    let roleRes = await pool.query("SELECT id FROM roles WHERE lower(name) = lower($1) ORDER BY id LIMIT 1", [ROLE_NAME]);
     let vcRoleId;
     if (roleRes.rows.length === 0) {
       const insertRole = await pool.query(
-        "INSERT INTO roles (name) VALUES ($1) RETURNING id",
+        "INSERT INTO roles (name) VALUES (lower($1)) ON CONFLICT ((lower(name))) DO NOTHING RETURNING id",
         [ROLE_NAME]
       );
-      vcRoleId = insertRole.rows[0].id;
-      console.log('Inserted role:', ROLE_NAME);
+      vcRoleId = insertRole.rows[0]?.id;
+      if (!vcRoleId) {
+        const again = await pool.query("SELECT id FROM roles WHERE lower(name) = lower($1) ORDER BY id LIMIT 1", [ROLE_NAME]);
+        vcRoleId = again.rows[0]?.id;
+      }
+      console.log('Ensured role:', ROLE_NAME);
     } else {
       vcRoleId = roleRes.rows[0].id;
       console.log('Role "vc" already exists.');

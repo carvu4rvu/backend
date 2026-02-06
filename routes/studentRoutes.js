@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const studentController = require('../controllers/studentController');
 const studentProfileController = require('../controllers/studentProfileController');
+const studentAcademicsController = require('../controllers/studentAcademicsController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 
 // Metadata routes (public - no auth needed)
@@ -50,8 +51,7 @@ router.put('/profile/:usn/contact', authenticateToken, studentProfileController.
 // Education Profile specific routes (protected)
 router.put('/profile/:usn/education', authenticateToken, studentProfileController.updateEducation);
 
-// Academics Profile specific routes (protected)
-router.put('/profile/:usn/academics', authenticateToken, studentProfileController.updateAcademics);
+// Academics Profile routes have been deprecated/removed; handled via OCR pipeline and semester records APIs instead.
 
 // Projects Profile specific routes (protected)
 router.get('/profile/:usn/projects', authenticateToken, studentProfileController.getProjects);
@@ -95,7 +95,19 @@ router.put('/profile/:usn/summer-immersion', authenticateToken, studentProfileCo
 router.get('/profile/:usn/summer_immersion', authenticateToken, studentProfileController.getSummerImmersion);
 router.put('/profile/:usn/summer_immersion', authenticateToken, studentProfileController.updateSummerImmersion);
 
-// General routes (protected)
+// Manual Academic Semesters + Courses (no OCR) — must be before generic /:section
+router.get(
+  '/profile/:usn/academic-semesters',
+  authenticateToken,
+  studentAcademicsController.getAcademicSemesters
+);
+router.post(
+  '/profile/:usn/academic-semesters',
+  authenticateToken,
+  studentAcademicsController.upsertAcademicSemester
+);
+
+// General routes (protected) — /:section catches any remaining path
 router.get('/profile/:usn', authenticateToken, studentController.getProfile);
 router.get('/profile/:usn/:section', authenticateToken, studentController.getProfileSection);
 router.put('/profile/:usn/:section', authenticateToken, studentController.updateProfileSection);

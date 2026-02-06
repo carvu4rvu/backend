@@ -18,7 +18,15 @@ app.use(cors({
   credentials: true
 }));
 app.use(morgan('dev')); // Log requests
-app.use(express.json());
+
+// Use JSON body parser for non-multipart requests only (so file uploads work)
+app.use((req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.startsWith('multipart/form-data')) {
+    return next();
+  }
+  return express.json()(req, res, next);
+});
 
 // Serve static files from public directory
 const path = require('path');

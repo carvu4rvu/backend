@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const pool = require('../config/db');
 const { computeCurrentYearSemester } = require('../utils/studentAcademic');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
@@ -1607,45 +1608,62 @@ exports.updatePublications = async (req, res) => {
 exports.updateEducation = async (req, res) => {
     try {
         const { usn } = req.params;
-        let data = req.body;
+        let payload = req.body;
 
-        // --- 1. Input shape: accept array or wrapped payloads ---
-        if (!Array.isArray(data)) {
-            if (data && data.education && Array.isArray(data.education)) {
-                data = data.education;
-            } else if (data && data.data && Array.isArray(data.data)) {
-                data = data.data;
-            } else {
-                return sendValidationError(res, 'Invalid data format. Expected an array of education entries.', {
-                    payload: 'Expected array or { education: [...] } or { data: [...] }.'
-                });
-            }
+        // Accept:
+        // - legacy: array or { education: [...] } -> education_history
+        // - new: { education_history: [...], education_gaps: [...] }
+        // - wrapped: { education: { education_history, education_gaps } }
+        let educationHistory = [];
+        let educationGaps = [];
+
+        if (Array.isArray(payload)) {
+            educationHistory = payload;
+        } else if (payload && Array.isArray(payload.education)) {
+            educationHistory = payload.education;
+        } else if (payload && payload.education && typeof payload.education === 'object') {
+            educationHistory = Array.isArray(payload.education.education_history) ? payload.education.education_history : [];
+            educationGaps = Array.isArray(payload.education.education_gaps) ? payload.education.education_gaps : [];
+        } else if (payload && (payload.education_history || payload.education_gaps)) {
+            educationHistory = Array.isArray(payload.education_history) ? payload.education_history : [];
+            educationGaps = Array.isArray(payload.education_gaps) ? payload.education_gaps : [];
+        } else if (payload && Array.isArray(payload.data)) {
+            educationHistory = payload.data;
+        } else {
+            return sendValidationError(res, 'Invalid data format. Expected education_history and/or education_gaps.', {
+                payload: 'Expected array, { education: [...] }, { education_history: [...], education_gaps: [...] }, or { education: { education_history, education_gaps } }.'
+            });
         }
 
-        if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_education_history').delete().eq('usn', usn);
-            if (delError) return sendCaughtError(res, delError, 'Failed to update education.');
-            return res.json([]);
+        // If both empty, clear both tables
+        if (educationHistory.length === 0 && educationGaps.length === 0) {
+            const [delHist, delGaps] = await Promise.all([
+                supabase.from('student_education_history').delete().eq('usn', usn),
+                supabase.from('student_education_gaps').delete().eq('usn', usn)
+            ]);
+            if (delHist.error) return sendCaughtError(res, delHist.error, 'Failed to update education history.');
+            if (delGaps.error) return sendCaughtError(res, delGaps.error, 'Failed to update education gaps.');
+            return res.json({ education_history: [], education_gaps: [] });
         }
 
         // --- 3. Validate each item, collect fieldErrors ---
         const fieldErrors = {};
-        const itemsToInsert = [];
-        const isItemEmpty = (item) => {
+        const historyToInsert = [];
+        const gapsToInsert = [];
+
+        const isHistoryItemEmpty = (item) => {
             const v = (x) => x != null && String(x).trim() !== '';
             return !v(item.educationLevel) && !v(item.education_level) && !v(item.instituteName) && !v(item.institute_name) &&
                 !v(item.city) && !v(item.board) && !v(item.boardOrUniversity) && !v(item.yearOfPassing) && !v(item.year_of_passing) &&
                 !v(item.result) && !v(item.result_value) && !v(item.resultType) && !v(item.result_type) && !v(item.subjects) &&
-                !v(item.proofFile) && !v(item.marksheet_file) && !v(item.gapType) && !v(item.gap_type) &&
-                (item.gapDurationMonths == null || item.gapDurationMonths === '') && (item.gap_duration_months == null || item.gap_duration_months === '') &&
-                !v(item.gapReason) && !v(item.gap_reason);
+                !v(item.proofFile) && !v(item.marksheet_file);
         };
 
-        for (let i = 0; i < data.length; i++) {
-            const item = data[i] || {};
-            const key = (f) => `education[${i}].${f}`;
+        for (let i = 0; i < educationHistory.length; i++) {
+            const item = educationHistory[i] || {};
+            const key = (f) => `education_history[${i}].${f}`;
 
-            if (isItemEmpty(item)) continue;
+            if (isHistoryItemEmpty(item)) continue;
 
             const educationLevel = item.educationLevel ?? item.education_level;
             const rRequired = validateRequiredString(educationLevel, 'Education level', 1);
@@ -1656,7 +1674,7 @@ exports.updateEducation = async (req, res) => {
                 if (!rLevel.valid) fieldErrors[key('education_level')] = rLevel.message;
             }
 
-            const yearOfPassing = item.yearOfPassing ?? item.year_of_passing;
+            const yearOfPassing = item.yearOfPassing ?? item.year_of_passing ?? item.end_year;
             if (yearOfPassing != null && yearOfPassing !== '') {
                 const rYear = validateYear(yearOfPassing, { allowEmpty: true, max: new Date().getFullYear() });
                 if (!rYear.valid) fieldErrors[key('year_of_passing')] = rYear.message;
@@ -1693,36 +1711,7 @@ exports.updateEducation = async (req, res) => {
                     }
                 }
             }
-
-            const levelNorm = (educationLevel ?? '').toString().toUpperCase().trim();
-            const gapType = item.gapType ?? item.gap_type;
-            const gapDuration = item.gapDurationMonths ?? item.gap_duration_months;
-
-            if (levelNorm === 'EDUCATION_GAP') {
-                const rGapType = validateEnum(gapType, GAP_TYPES, 'gap type');
-                if (!rGapType.valid) {
-                    fieldErrors[key('gap_type')] = rGapType.message || 'Gap type is required when education level is EDUCATION_GAP.';
-                } else if (gapType == null || String(gapType).trim() === '') {
-                    fieldErrors[key('gap_type')] = 'Gap type is required when education level is EDUCATION_GAP.';
-                }
-                const rGapDur = validateGapDuration(gapDuration, 'Gap duration');
-                if (!rGapDur.valid) {
-                    fieldErrors[key('gap_duration_months')] = rGapDur.message;
-                } else if (gapDuration == null || gapDuration === '') {
-                    fieldErrors[key('gap_duration_months')] = 'Gap duration is required when education level is EDUCATION_GAP.';
-                }
-            } else {
-                if (gapType != null && gapType !== '') {
-                    const rGapType = validateEnum(gapType, GAP_TYPES, 'gap type');
-                    if (!rGapType.valid) fieldErrors[key('gap_type')] = rGapType.message;
-                }
-                if (gapDuration != null && gapDuration !== '') {
-                    const rGapDur = validateGapDuration(gapDuration, 'Gap duration');
-                    if (!rGapDur.valid) fieldErrors[key('gap_duration_months')] = rGapDur.message;
-                }
-            }
-
-            if (Object.keys(fieldErrors).some((k) => k.startsWith(`education[${i}].`))) continue;
+            if (Object.keys(fieldErrors).some((k) => k.startsWith(`education_history[${i}].`))) continue;
 
             const mappedItem = {
                 usn,
@@ -1730,20 +1719,63 @@ exports.updateEducation = async (req, res) => {
                 institute_name: (item.instituteName ?? item.institute_name ?? '') || null,
                 city: (item.city ?? '') || null,
                 board: (item.board ?? item.boardOrUniversity ?? '') || null,
-                year_of_passing: yearOfPassing != null && yearOfPassing !== '' ? parseInt(String(yearOfPassing), 10) : null,
+                // DB schema uses start_year/end_year (not year_of_passing). Treat "Year of Passing" as end_year.
+                end_year: yearOfPassing != null && yearOfPassing !== '' ? parseInt(String(yearOfPassing), 10) : null,
                 result: resultVal != null && resultVal !== '' ? parseFloat(resultVal) : null,
                 result_type: resultTypeRaw === 'PERCENTAGE' || resultTypeRaw === 'CGPA' ? resultTypeRaw : null,
                 subjects: (item.subjects ?? '') || null,
-                marksheet_file: (item.proofFile ?? item.marksheet_file ?? '') || null,
-                gap_type: (gapType ?? '') || null,
-                gap_duration_months: gapDuration != null && gapDuration !== '' ? parseInt(String(gapDuration), 10) : null,
-                gap_reason: (item.gapReason ?? item.gap_reason ?? '') || null
+                marksheet_file: (item.proofFile ?? item.marksheet_file ?? '') || null
             };
             Object.keys(mappedItem).forEach((k) => {
                 if (mappedItem[k] === null && k !== 'usn' && k !== 'education_level') delete mappedItem[k];
                 if (mappedItem[k] === '') mappedItem[k] = null;
             });
-            if (mappedItem.education_level) itemsToInsert.push(mappedItem);
+            if (mappedItem.education_level) historyToInsert.push(mappedItem);
+        }
+
+        // Validate gaps (separate table)
+        const isGapEmpty = (item) => {
+            const v = (x) => x != null && String(x).trim() !== '';
+            return !v(item.gap_start_date) && !v(item.gapStartDate) && !v(item.gap_end_date) && !v(item.gapEndDate) &&
+                !v(item.gap_reason) && !v(item.gapReason) && !v(item.remarks);
+        };
+        const normDate = (val) => {
+            if (val == null || val === '') return '';
+            const s = String(val).trim().split('T')[0];
+            return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '';
+        };
+        for (let i = 0; i < educationGaps.length; i++) {
+            const item = educationGaps[i] || {};
+            const key = (f) => `education_gaps[${i}].${f}`;
+            if (isGapEmpty(item)) continue;
+
+            const start = normDate(item.gap_start_date ?? item.gapStartDate);
+            const end = normDate(item.gap_end_date ?? item.gapEndDate);
+            const reason = (item.gap_reason ?? item.gapReason ?? '').toString().trim();
+            const remarks = (item.remarks ?? '').toString().trim();
+
+            if (!start) fieldErrors[key('gap_start_date')] = 'Start date is required (YYYY-MM-DD).';
+            if (!end) fieldErrors[key('gap_end_date')] = 'End date is required (YYYY-MM-DD).';
+            if (!reason) fieldErrors[key('gap_reason')] = 'Reason is required.';
+            if (start && end) {
+                const sd = new Date(start);
+                const ed = new Date(end);
+                if (Number.isNaN(sd.getTime())) fieldErrors[key('gap_start_date')] = 'Invalid start date.';
+                if (Number.isNaN(ed.getTime())) fieldErrors[key('gap_end_date')] = 'Invalid end date.';
+                if (!Number.isNaN(sd.getTime()) && !Number.isNaN(ed.getTime()) && ed < sd) {
+                    fieldErrors[key('gap_end_date')] = 'End date cannot be earlier than start date.';
+                }
+            }
+
+            if (Object.keys(fieldErrors).some((k) => k.startsWith(`education_gaps[${i}].`))) continue;
+
+            gapsToInsert.push({
+                usn,
+                gap_start_date: start,
+                gap_end_date: end,
+                gap_reason: reason,
+                ...(remarks ? { remarks } : {})
+            });
         }
 
         if (Object.keys(fieldErrors).length > 0) {
@@ -1751,19 +1783,26 @@ exports.updateEducation = async (req, res) => {
         }
 
         // --- 4. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_education_history').delete().eq('usn', usn);
-        if (delError) return sendCaughtError(res, delError, 'Failed to update education.');
+        const [delHist, delGaps] = await Promise.all([
+            supabase.from('student_education_history').delete().eq('usn', usn),
+            supabase.from('student_education_gaps').delete().eq('usn', usn)
+        ]);
+        if (delHist.error) return sendCaughtError(res, delHist.error, 'Failed to update education history.');
+        if (delGaps.error) return sendCaughtError(res, delGaps.error, 'Failed to update education gaps.');
 
-        if (itemsToInsert.length === 0) return res.json([]);
+        const [insHist, insGaps] = await Promise.all([
+            historyToInsert.length > 0
+                ? supabase.from('student_education_history').insert(historyToInsert).select()
+                : Promise.resolve({ data: [], error: null }),
+            gapsToInsert.length > 0
+                ? supabase.from('student_education_gaps').insert(gapsToInsert).select()
+                : Promise.resolve({ data: [], error: null })
+        ]);
 
-        const { data: inserted, error: insError } = await supabase
-            .from('student_education_history')
-            .insert(itemsToInsert)
-            .select();
+        if (insHist.error) return sendCaughtError(res, insHist.error, 'Failed to save education history.');
+        if (insGaps.error) return sendCaughtError(res, insGaps.error, 'Failed to save education gaps.');
 
-        if (insError) return sendCaughtError(res, insError, 'Failed to save education history.');
-
-        res.json(inserted || []);
+        res.json({ education_history: insHist.data || [], education_gaps: insGaps.data || [] });
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to update education.');
     }
@@ -1797,6 +1836,25 @@ exports.updateAcademics = async (req, res) => {
         if (data.length === 0) {
             const { error: delError } = await supabase.from('student_semester_academics').delete().eq('usn', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update academics.');
+
+            // Also clear new Postgres-backed semester tables for this student
+            try {
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+                    await client.query('DELETE FROM public.student_course_wise_academics WHERE usn = $1', [usn]);
+                    await client.query('DELETE FROM public.student_semester_records WHERE usn = $1', [usn]);
+                    await client.query('COMMIT');
+                } catch (err) {
+                    await client.query('ROLLBACK').catch(() => {});
+                    console.error('Failed to clear semester records in Postgres:', err.message);
+                } finally {
+                    client.release();
+                }
+            } catch (err) {
+                console.error('Postgres connection error while clearing semester records:', err.message);
+            }
+
             return res.json([]);
         }
 
@@ -1814,13 +1872,12 @@ exports.updateAcademics = async (req, res) => {
         const hasValidMarksheetUrl = (url) => {
             if (!url || typeof url !== 'string') return false;
             const s = url.trim();
-            if (s.length < 10) return false;
-            try {
-                new URL(s);
-                return s.startsWith('http://') || s.startsWith('https://');
-            } catch {
-                return false;
-            }
+            if (!s) return false;
+            // Accept both absolute URLs and API-relative paths such as "/uploads/academics/..."
+            if (s.startsWith('http://') || s.startsWith('https://')) return true;
+            if (s.startsWith('/')) return true;
+            // Fallback: basic length check so clearly broken values are rejected
+            return s.length >= 5;
         };
 
         const isRowEmpty = (item) => {

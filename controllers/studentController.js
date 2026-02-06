@@ -34,6 +34,7 @@ exports.getProfile = async (req, res) => {
     // Fetch all other sections in parallel
     const [
         { data: education },
+        { data: educationGaps },
         { data: academics },
         { data: projects },
         { data: internships },
@@ -49,6 +50,7 @@ exports.getProfile = async (req, res) => {
         { data: capstone }
     ] = await Promise.all([
         supabase.from('student_education_history').select('*').eq('usn', usn),
+        supabase.from('student_education_gaps').select('*').eq('usn', usn),
         supabase.from('student_semester_academics').select('*').eq('usn', usn).order('semester', { ascending: true }),
         supabase.from('student_projects').select('*').eq('usn', usn),
         supabase.from('student_internships').select('*').eq('usn', usn),
@@ -87,7 +89,11 @@ exports.getProfile = async (req, res) => {
             phoneCountryCode: basicDetails.phone_country_code,
             phoneNumber: basicDetails.phone_number
         },
-        education: education || [],
+        education: {
+          education_history: education || [],
+          education_gaps: educationGaps || []
+        },
+        // Academics page is deprecated; keep academics array for dashboard calculations only.
         academics: (academics || []).map(row => ({
           ...row,
           provisional_result_upload_links: parseProvisionalLinks(row.provisional_result_upload_links)
@@ -171,30 +177,43 @@ exports.getProfileSection = async (req, res) => {
             break;
 
         case 'education':
-            const { data: edu, error: eError } = await supabase
-                .from('student_education_history')
-                .select('*')
-                .eq('usn', usn);
-            if (eError) {
-                console.log("[Education-Backend] getProfileSection education ERROR", { usn, error: eError.message });
-                throw eError;
+            const [eduRes, gapsRes] = await Promise.all([
+              supabase.from('student_education_history').select('*').eq('usn', usn),
+              supabase.from('student_education_gaps').select('*').eq('usn', usn)
+            ]);
+            if (eduRes.error) {
+                console.log("[Education-Backend] getProfileSection education_history ERROR", { usn, error: eduRes.error.message });
+                throw eduRes.error;
             }
-            result = edu || [];
-            console.log("[Education-Backend] getProfileSection education", { usn, count: (result || []).length, result });
+            if (gapsRes.error) {
+                console.log("[Education-Backend] getProfileSection education_gaps ERROR", { usn, error: gapsRes.error.message });
+                throw gapsRes.error;
+            }
+            result = { education_history: eduRes.data || [], education_gaps: gapsRes.data || [] };
+            console.log("[Education-Backend] getProfileSection education", { usn, historyCount: (result.education_history || []).length, gapCount: (result.education_gaps || []).length });
             break;
 
-        case 'academic_performance':
-            const { data: acad, error: aError } = await supabase
-                .from('student_semester_academics')
+        case 'academic_performance': {
+            // Use new Postgres-backed table student_semester_records instead of legacy student_semester_academics
+            const { data: semRows, error: aError } = await supabase
+                .from('student_semester_records')
                 .select('*')
                 .eq('usn', usn)
                 .order('semester', { ascending: true });
             if (aError) throw aError;
-            result = (acad || []).map(row => ({
-              ...row,
-              provisional_result_upload_links: parseProvisionalLinks(row.provisional_result_upload_links)
+
+            // Map to shape expected by existing frontend (and older APIs)
+            result = (semRows || []).map(row => ({
+                usn: row.usn,
+                academic_year: row.academic_year,
+                semester: row.semester,
+                result_in_sgpa: row.sgpa,
+                closed_backlogs: row.cleared_backlogs ?? 0,
+                live_backlogs: row.active_backlogs ?? 0,
+                provisional_result_upload_links: row.result_file || null
             }));
             break;
+        }
 
         case 'projects':
             const { data: proj, error: prError } = await supabase
@@ -591,8 +610,18 @@ exports.updateProfileSection = async (req, res) => {
                          if (newItem.result_type !== undefined && (newItem.result_type === '' || newItem.result_type === null)) {
                              newItem.result_type = null;
                          }
-                         if (newItem.year_of_passing !== undefined && (newItem.year_of_passing === '' || newItem.year_of_passing === null)) {
-                             newItem.year_of_passing = null;
+                         // DB schema uses start_year/end_year; accept frontend year_of_passing and map to end_year
+                         if (newItem.year_of_passing !== undefined) {
+                             if (newItem.year_of_passing === '' || newItem.year_of_passing === null) {
+                                 newItem.end_year = null;
+                             } else if (newItem.end_year === undefined) {
+                                 const n = parseInt(String(newItem.year_of_passing), 10);
+                                 newItem.end_year = Number.isFinite(n) ? n : null;
+                             }
+                             delete newItem.year_of_passing;
+                         }
+                         if (newItem.end_year !== undefined && (newItem.end_year === '' || newItem.end_year === null)) {
+                             newItem.end_year = null;
                          }
                          if (newItem.result !== undefined && (newItem.result === '' || newItem.result === null)) {
                              newItem.result = null;
@@ -680,7 +709,8 @@ exports.updateProfileSection = async (req, res) => {
 
                      // Remove any keys not in DB to avoid Supabase errors
                      const allowedKeys = {
-                         student_education_history: ['usn', 'education_level', 'institute_name', 'city', 'board', 'year_of_passing', 'result', 'result_type', 'subjects', 'marksheet_file', 'gap_type', 'gap_duration_months', 'gap_reason'],
+                         // DB schema: start_year, end_year
+                         student_education_history: ['usn', 'education_level', 'institute_name', 'city', 'board', 'start_year', 'end_year', 'result', 'result_type', 'subjects', 'marksheet_file'],
                          student_semester_academics: ['usn', 'academic_year', 'semester', 'result_in_sgpa', 'closed_backlogs', 'live_backlogs', 'provisional_result_upload_links'],
                          student_projects: ['usn', 'title', 'one_line_description', 'full_description', 'genre', 'visibility', 'self_rating', 'admin_rating', 'priority', 'project_snaps', 'hosted_link', 'github_repo', 'mentor_name', 'technologies', 'is_approved', 'updated_at'],
                          student_internships: ['usn', 'job_role', 'organization', 'organization_details', 'duration_months', 'start_date', 'end_date', 'location', 'stipend', 'skills', 'description', 'mentor_name', 'proof_document', 'academic_year', 'updated_at'],

@@ -5,6 +5,35 @@ const generateToken = require('../utils/jwtGenerator');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
 const { validatePhoneNumber, validateOccupation } = require('../utils/profileValidators');
 
+// Role helper: case-insensitive lookup + lowercase-safe insert (DB enforces too).
+async function getOrCreateRoleId(db, roleName) {
+  const role = String(roleName || '').trim().toLowerCase();
+  if (!role) throw new Error('Invalid role name');
+
+  const existing = await db.query(
+    `SELECT id FROM roles WHERE lower(name) = $1 ORDER BY id LIMIT 1`,
+    [role]
+  );
+  if (existing.rows.length > 0) return existing.rows[0].id;
+
+  // Uses expression inference; works with the expression unique index on lower(name).
+  const inserted = await db.query(
+    `INSERT INTO roles (name)
+     VALUES ($1)
+     ON CONFLICT ((lower(name))) DO NOTHING
+     RETURNING id`,
+    [role]
+  );
+  if (inserted.rows.length > 0) return inserted.rows[0].id;
+
+  const after = await db.query(
+    `SELECT id FROM roles WHERE lower(name) = $1 ORDER BY id LIMIT 1`,
+    [role]
+  );
+  if (after.rows.length === 0) throw new Error(`Failed to create role: ${role}`);
+  return after.rows[0].id;
+}
+
 // Helper to send email
 const sendOTPEmail = async (email, otp, purpose) => {
   const mailOptions = {
@@ -214,12 +243,7 @@ exports.registerStudent = async (req, res) => {
     `, [personalEmail, personalPhoneNumber, gender, dob, usn]);
 
     // Create User Login
-    let roleRes = await client.query(`SELECT id FROM roles WHERE name = 'student'`);
-    let roleId = roleRes.rows[0]?.id;
-    if (!roleId) {
-        const newRole = await client.query(`INSERT INTO roles (name) VALUES ('student') RETURNING id`);
-        roleId = newRole.rows[0].id;
-    }
+    const roleId = await getOrCreateRoleId(client, 'student');
 
     const studentRes = await client.query(`SELECT college_email FROM student_basic_details WHERE usn = $1`, [usn]);
     const collegeEmailRaw = studentRes.rows[0]?.college_email || null;
@@ -546,11 +570,7 @@ exports.registerAlumni = async (req, res) => {
       return res.status(400).json({ error: 'Invalid registration code.' });
     }
     const code = codeRow.rows[0];
-    const roleRes = await client.query("SELECT id FROM roles WHERE name = 'alumni'");
-    if (roleRes.rows.length === 0) {
-      return res.status(500).json({ error: 'Alumni role is not configured. Contact admin.' });
-    }
-    const roleId = roleRes.rows[0].id;
+    const roleId = await getOrCreateRoleId(client, 'alumni');
     const passwordHash = await bcrypt.hash(password, 10);
     const emailNorm = email.trim().toLowerCase();
     const userIns = await client.query(
@@ -895,14 +915,7 @@ exports.createCompanyLogin = async (req, res) => {
     }
 
     // Get or create company role
-    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'company'");
-    let companyRoleId;
-    if (roleRes.rows.length === 0) {
-      const newRole = await pool.query("INSERT INTO roles (name) VALUES ('company') RETURNING id");
-      companyRoleId = newRole.rows[0].id;
-    } else {
-      companyRoleId = roleRes.rows[0].id;
-    }
+    const companyRoleId = await getOrCreateRoleId(pool, 'company');
 
     // Check if email already exists
     const emailCheck = await pool.query('SELECT id FROM user_login WHERE email_id = $1', [email.trim().toLowerCase()]);
@@ -1073,14 +1086,7 @@ exports.createVcLogin = async (req, res) => {
   }
 
   try {
-    let roleRes = await pool.query("SELECT id FROM roles WHERE name = 'vc'");
-    let vcRoleId;
-    if (roleRes.rows.length === 0) {
-      const newRole = await pool.query("INSERT INTO roles (name) VALUES ('vc') RETURNING id");
-      vcRoleId = newRole.rows[0].id;
-    } else {
-      vcRoleId = roleRes.rows[0].id;
-    }
+    const vcRoleId = await getOrCreateRoleId(pool, 'vc');
 
     const emailNorm = email.trim().toLowerCase();
     const emailCheck = await pool.query('SELECT id FROM user_login WHERE email_id = $1', [emailNorm]);
