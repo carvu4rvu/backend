@@ -1,39 +1,4 @@
 const supabase = require('../config/supabaseClient');
-const pool = require('../config/db');
-
-/**
- * GET /api/events/notification-stats
- * Returns event_id -> { read, sent, notificationId } for notifications linked to events
- */
-exports.getNotificationStats = async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT n.event_id, n.id AS notification_id,
-        COUNT(sn.id) AS sent,
-        COALESCE(SUM(CASE WHEN sn.is_read = true THEN 1 ELSE 0 END), 0) AS read_count
-      FROM notifications n
-      LEFT JOIN student_notifications sn ON sn.notification_id = n.id
-      WHERE n.event_id IS NOT NULL
-      GROUP BY n.event_id, n.id, n.created_at
-      ORDER BY n.created_at DESC
-    `);
-    const byEvent = {};
-    (rows || []).forEach((r) => {
-      const eventId = r.event_id;
-      if (!byEvent[eventId]) {
-        byEvent[eventId] = {
-          read: parseInt(r.read_count, 10) || 0,
-          sent: parseInt(r.sent, 10) || 0,
-          notificationId: r.notification_id,
-        };
-      }
-    });
-    res.json(byEvent);
-  } catch (err) {
-    console.error('Events notification stats error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch notification stats' });
-  }
-};
 
 /**
  * List events. Optional ?status=scheduled|ongoing|completed|failed

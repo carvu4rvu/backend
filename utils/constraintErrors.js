@@ -52,10 +52,6 @@ const CONSTRAINT_MESSAGES = {
   student_placement_violations_penalty_type_check:
     'Penalty type must be WARNING, TEMP_BAN, or PERMANENT_BAN.',
 
-  // notifications
-  notifications_type_check:
-    'Notification type must be SYSTEM, ACADEMIC, PLACEMENT, ALERT, or GENERAL.',
-
   // programs
   programs_graduation_level_check:
     'Graduation level must be UG or PG.',

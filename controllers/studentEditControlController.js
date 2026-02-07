@@ -83,12 +83,17 @@ exports.getProfileLocks = async (req, res) => {
           c.is_sem7_locked,
           c.is_sem8_locked,
           c.locked_by,
+          COALESCE(ap.full_name, ul.email_id::text) AS locked_by_name,
           c.lock_reason
         FROM public.student_basic_details s
         LEFT JOIN public.student_edit_control c
           ON c.usn = s.usn
         LEFT JOIN public.user_login u
           ON u.usn = s.usn
+        LEFT JOIN public.user_login ul
+          ON ul.id = c.locked_by
+        LEFT JOIN public.admin_profiles ap
+          ON ap.user_login_id = ul.id
         ORDER BY s.usn ASC
       `
     );

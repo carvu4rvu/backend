@@ -692,43 +692,6 @@ exports.getOffers = async (req, res) => {
   }
 };
 
-// ============== NOTIFICATIONS ==============
-
-/**
- * GET /company/notifications
- * Get company-relevant notifications
- */
-exports.getNotifications = async (req, res) => {
-  try {
-    const companyId = await getCompanyIdFromUser(req);
-    if (!companyId) {
-      return res.status(403).json({ error: 'Company not linked to this account' });
-    }
-
-    // Get drives for this company to filter notifications
-    const { data: drives } = await supabase
-      .from('placements_drives')
-      .select('id')
-      .eq('company_id', companyId);
-
-    const driveIds = (drives || []).map(d => d.id);
-
-    // Get notifications related to company's drives or general placement notifications
-    const { data, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .or(`drive_id.in.(${driveIds.join(',')}),type.eq.PLACEMENT,type.eq.SYSTEM`)
-      .order('created_at', { ascending: false })
-      .limit(50);
-
-    if (error) throw error;
-    res.json({ data });
-  } catch (err) {
-    logger.error('getNotifications error:', err);
-    res.status(500).json({ error: 'Failed to fetch notifications' });
-  }
-};
-
 // ============== EVENTS ==============
 
 /**

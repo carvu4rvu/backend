@@ -1269,7 +1269,7 @@ exports.upsertDriveEligibility = async (req, res) => {
       result = inserted;
     }
 
-    // Add all eligible students to this drive's process and auto-send notification
+    // Add all eligible students to this drive's process
     try {
       const schoolIds = result.allowed_school_ids && result.allowed_school_ids.length ? result.allowed_school_ids : null;
       const programIds = result.allowed_program_ids && result.allowed_program_ids.length ? result.allowed_program_ids : null;
@@ -1304,7 +1304,7 @@ exports.upsertDriveEligibility = async (req, res) => {
       );
       const eligibleUsns = (eligibleRes.rows || []).map((r) => r.usn).filter(Boolean);
       if (eligibleUsns.length === 0) {
-        return res.json({ ...result, addedToProcess: 0, notified: 0 });
+        return res.json({ ...result, addedToProcess: 0 });
       }
 
       const { data: existingProcess } = await supabase
@@ -1329,67 +1329,12 @@ exports.upsertDriveEligibility = async (req, res) => {
         }
       }
 
-      const { data: driveRow, error: driveErr } = await supabase
-        .from('placements_drives')
-        .select('id, job_type, job_location, type_of_hiring, event_datetime, last_date_to_registration, job_description, company:companies(company_name)')
-        .eq('id', driveId)
-        .single();
-      if (driveErr || !driveRow) {
-        logger.warn('Eligibility: drive fetch failed for notification', driveErr?.message);
-        return res.json({ ...result, addedToProcess: processRows.length, notified: 0 });
-      }
-
-      const companyName = driveRow.company?.company_name || 'Company';
-      const eventDate = driveRow.event_datetime ? new Date(driveRow.event_datetime).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—';
-      const regDate = driveRow.last_date_to_registration ? new Date(driveRow.last_date_to_registration).toLocaleDateString() : '—';
-      const title = `Placement drive: ${companyName}`;
-      const message = [
-        `${companyName} – ${driveRow.job_type || '—'}`,
-        driveRow.job_location ? `Location: ${driveRow.job_location}` : null,
-        driveRow.type_of_hiring ? `Hiring: ${driveRow.type_of_hiring}` : null,
-        `Event date: ${eventDate}`,
-        `Last date to register: ${regDate}`,
-        driveRow.job_description ? driveRow.job_description.slice(0, 200) + (driveRow.job_description.length > 200 ? '…' : '') : '',
-      ].filter(Boolean).join('\n');
-      const link = `/placement/events/${driveId}`;
-      const createdBy = req.user?.id != null ? String(req.user.id) : null;
-
-      const { data: notification, error: notifErr } = await supabase
-        .from('notifications')
-        .insert({
-          title,
-          message,
-          type: 'PLACEMENT',
-          link,
-          drive_id: driveId,
-          created_by: createdBy,
-        })
-        .select()
-        .single();
-      if (notifErr || !notification) {
-        logger.warn('Eligibility: create notification failed', notifErr?.message);
-        return res.json({ ...result, addedToProcess: processRows.length, notified: 0 });
-      }
-
-      const snRows = eligibleUsns.map((usn) => ({
-        usn,
-        notification_id: notification.id,
-        is_read: false,
-      }));
-      const SN_BATCH = 200;
-      for (let i = 0; i < snRows.length; i += SN_BATCH) {
-        const chunk = snRows.slice(i, i + SN_BATCH);
-        const { error: snErr } = await supabase.from('student_notifications').insert(chunk);
-        if (snErr) logger.warn('Eligibility: send notification batch error', snErr.message);
-      }
-
       return res.json({
         ...result,
         addedToProcess: processRows.length,
-        notified: eligibleUsns.length,
       });
     } catch (postErr) {
-      logger.warn('Eligibility: add students / notify failed', postErr?.message);
+      logger.warn('Eligibility: add students failed', postErr?.message);
       res.json(result);
     }
   } catch (err) {

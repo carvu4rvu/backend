@@ -29,9 +29,6 @@ router.get('/students/:usn', ...companyAuth, companyController.getStudentProfile
 // Offers
 router.get('/offers', ...companyAuth, companyController.getOffers);
 
-// Notifications
-router.get('/notifications', ...companyAuth, companyController.getNotifications);
-
 // Events
 router.get('/events', ...companyAuth, companyController.getEvents);
 
