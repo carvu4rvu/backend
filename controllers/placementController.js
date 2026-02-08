@@ -1,6 +1,42 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
 const logger = require('../utils/logger');
+const { createAndSendToUsns } = require('../utils/notificationHelper');
+
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+/** Fetch drive details for notifications: company_name, job_description, last_date_to_registration, event_datetime */
+async function getDriveForNotification(driveId) {
+  const { data, error } = await supabase
+    .from('placements_drives')
+    .select('job_description, last_date_to_registration, event_datetime, company:companies(company_name)')
+    .eq('id', driveId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return {
+    company_name: data.company?.company_name || 'Company',
+    job_description: data.job_description || '',
+    last_date_to_registration: data.last_date_to_registration,
+    event_datetime: data.event_datetime,
+  };
+}
+
+/** Format date for notification message */
+function formatNotificationDate(iso) {
+  if (!iso) return 'TBD';
+  const d = new Date(iso);
+  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/** Round field key to display label */
+const ROUND_LABELS = {
+  oa_status: 'OA',
+  gd_status: 'GD',
+  technical_round_status: 'Technical',
+  interview_status: 'Interview',
+  hr_round_status: 'HR',
+  final_select_status: 'Final Select',
+};
 
 /** Parse integer from string/number; return null if invalid or NaN */
 function toInt(v) {
@@ -204,6 +240,25 @@ exports.applyToDrive = async (req, res) => {
       logger.error('Apply to drive:', apiMessage(error, 'Apply failed'));
       return res.status(400).json({ message: apiMessage(error, 'Apply failed') });
     }
+    const driveRegistrationLink = `${FRONTEND_URL}/student/placements/drive/${driveIdNum}`;
+    getDriveForNotification(driveIdNum).then((driveInfo) => {
+      const title = (driveInfo && driveInfo.company_name) || 'Placement drive';
+      const desc = (driveInfo && driveInfo.job_description) || 'You have been added to a placement drive.';
+      const deadlineStr = driveInfo && driveInfo.last_date_to_registration
+        ? formatNotificationDate(driveInfo.last_date_to_registration)
+        : 'TBD';
+      const message = `${desc}\n\nRegistration deadline: ${deadlineStr}`;
+      return createAndSendToUsns(
+        {
+          title,
+          message,
+          link: driveRegistrationLink,
+          notification_type: 'PLACEMENT',
+          created_by: req.user?.id || null,
+        },
+        [usn]
+      );
+    }).catch((notifErr) => logger.warn('Drive registration notification failed', notifErr?.message));
     res.status(201).json(inserted);
   } catch (err) {
     logger.error('Apply to drive:', err);
@@ -972,6 +1027,40 @@ exports.updateProcessStatus = async (req, res) => {
 
     if (error) return res.status(400).json({ message: apiMessage(error, 'Update failed') });
     if (!data) return res.status(404).json({ message: 'Process record not found' });
+
+    const driveId = data.placement_drive_id;
+    const usn = data.usn;
+    if (usn && driveId) {
+      const processUpdateLink = `${FRONTEND_URL}/student/placements/drive/${driveId}`;
+      const roundKey = Object.keys(payload).find((k) => ROUND_LABELS[k]);
+      const roundLabel = roundKey ? ROUND_LABELS[roundKey] : 'Process';
+      const status = (roundKey && data[roundKey] != null && data[roundKey] !== '') ? String(data[roundKey]) : 'Updated';
+      getDriveForNotification(driveId).then((driveInfo) => {
+        const companyName = (driveInfo && driveInfo.company_name) || 'Company';
+        const eventDateStr = driveInfo && driveInfo.event_datetime
+          ? formatNotificationDate(driveInfo.event_datetime)
+          : 'TBD';
+        const title = `${companyName} - ${roundLabel}`;
+        const message = [
+          `You are ${status} in the ${roundLabel}, held on ${eventDateStr}`,
+          '',
+          'Summary below:',
+          `Round: ${roundLabel}`,
+          `Status: ${status}`,
+          `Event Date: ${eventDateStr}`,
+        ].join('\n');
+        return createAndSendToUsns(
+          {
+            title,
+            message,
+            link: processUpdateLink,
+            notification_type: 'PLACEMENT',
+            created_by: req.user?.id || null,
+          },
+          [usn]
+        );
+      }).catch((notifErr) => logger.warn('Process update notification failed', notifErr?.message));
+    }
     res.json(data);
   } catch (err) {
     logger.error('updateProcessStatus:', err);
@@ -1327,6 +1416,25 @@ exports.upsertDriveEligibility = async (req, res) => {
           const { error: procErr } = await supabase.from('student_placement_process').insert(chunk);
           if (procErr) logger.warn('Eligibility: add to process batch error', procErr.message);
         }
+        const driveRegistrationLink = `${FRONTEND_URL}/student/placements/drive/${driveId}`;
+        getDriveForNotification(driveId).then((driveInfo) => {
+          const title = (driveInfo && driveInfo.company_name) || 'Placement drive';
+          const desc = (driveInfo && driveInfo.job_description) || 'You have been added to a placement drive.';
+          const deadlineStr = driveInfo && driveInfo.last_date_to_registration
+            ? formatNotificationDate(driveInfo.last_date_to_registration)
+            : 'TBD';
+          const message = `${desc}\n\nRegistration deadline: ${deadlineStr}`;
+          return createAndSendToUsns(
+            {
+              title,
+              message,
+              link: driveRegistrationLink,
+              notification_type: 'PLACEMENT',
+              created_by: req.user?.id || null,
+            },
+            toAdd
+          );
+        }).catch((notifErr) => logger.warn('Eligibility: drive registration notification failed', notifErr?.message));
       }
 
       return res.json({

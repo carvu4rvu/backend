@@ -19,6 +19,7 @@ router.post('/', authenticateToken, authorizeRoles('admin'), notificationControl
 // Get one, update, send, recipients, resend, duplicate
 router.get('/:id', authenticateToken, authorizeRoles('admin'), notificationController.getById);
 router.patch('/:id', authenticateToken, authorizeRoles('admin'), notificationController.update);
+router.delete('/:id', authenticateToken, authorizeRoles('admin'), notificationController.delete);
 router.post('/:id/send', authenticateToken, authorizeRoles('admin'), notificationController.send);
 router.get('/:id/recipients', authenticateToken, authorizeRoles('admin'), notificationController.getRecipients);
 router.post('/:id/resend', authenticateToken, authorizeRoles('admin'), notificationController.resend);

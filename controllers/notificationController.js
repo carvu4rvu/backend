@@ -7,11 +7,11 @@ const TARGET_CUSTOM = 'CUSTOM';
 
 /**
  * GET /api/notifications
- * List notifications with optional filters: notification_type (or omit for all), page, limit.
+ * List notifications with optional filters: notification_type, search (universal: title, message, type), page, limit.
  */
 exports.list = async (req, res) => {
   try {
-    const { notification_type, page = 1, limit = 20 } = req.query;
+    const { notification_type, search, page = 1, limit = 20 } = req.query;
     const offset = (Math.max(1, parseInt(page, 10)) - 1) * Math.min(100, Math.max(1, parseInt(limit, 10)));
     const limitVal = Math.min(100, Math.max(1, parseInt(limit, 10)));
 
@@ -21,6 +21,16 @@ exports.list = async (req, res) => {
     if (notification_type !== undefined && notification_type !== '' && notification_type !== 'all') {
       conditions.push(`n.notification_type = $${idx}`);
       params.push(String(notification_type).trim().toUpperCase());
+      idx++;
+    }
+    const searchTerm = typeof search === 'string' && search.trim() ? search.trim() : null;
+    if (searchTerm) {
+      conditions.push(`(
+        n.title ILIKE $${idx} OR
+        n.message ILIKE $${idx} OR
+        n.notification_type ILIKE $${idx}
+      )`);
+      params.push(`%${searchTerm}%`);
       idx++;
     }
 
@@ -367,6 +377,27 @@ exports.update = async (req, res) => {
   } catch (err) {
     console.error('notificationController.update:', err);
     res.status(500).json({ message: 'Failed to update notification' });
+  }
+};
+
+/**
+ * DELETE /api/notifications/:id
+ * Soft-delete: set is_active = false.
+ */
+exports.delete = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'UPDATE notifications SET is_active = false WHERE id = $1 AND is_active = true RETURNING id',
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Notification not found' });
+    }
+    res.status(200).json({ message: 'Notification deleted', id: result.rows[0].id });
+  } catch (err) {
+    console.error('notificationController.delete:', err);
+    res.status(500).json({ message: 'Failed to delete notification' });
   }
 };
 
