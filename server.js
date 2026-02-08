@@ -59,10 +59,12 @@ const studentRoutes = require('./routes/studentRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
 const companyRoutes = require('./routes/companyRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
 const ensureProfileImageColumn = require('./migrations/ensureProfileImage');
 const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
 const ensureEventsStatusColumn = require('./migrations/ensureEventsStatusColumn');
+const ensureNotificationNodesRecipientEntityId = require('./migrations/ensureNotificationNodesRecipientEntityId');
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/placement', placementRoutes);
@@ -70,6 +72,7 @@ app.use('/api/student', studentRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/company', companyRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.get('/', (req, res) => {
   res.send('Hello from the Backend!');
@@ -118,6 +121,7 @@ app.listen(PORT, async () => {
   await ensureResumeFileColumn();
   await ensureIsApprovedColumn();
   await ensureEventsStatusColumn();
+  await ensureNotificationNodesRecipientEntityId();
   // Supabase Storage Connection Check
   await connectWithRetry('supabase storage', async () => {
     const { data, error } = await supabase.storage.listBuckets();
