@@ -383,11 +383,13 @@ exports.login = async (req, res) => {
     }
     
     const token = generateToken(user.id, user.usn, user.role_name);
+    // Primary identity is user_id (user_login.id). Use for ownership and all "who did this" checks. USN is for display/profile URLs only.
     res.json({
       token,
       user: {
+        user_id: user.id,
         id: user.id,
-        usn: user.usn,
+        usn: user.usn ?? null,
         role: user.role_name,
         email: user.email_id || null
       }

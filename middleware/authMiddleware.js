@@ -36,15 +36,16 @@ const authenticateToken = async (req, res, next) => {
       return res.status(403).json({ message: 'Account is inactive' });
     }
 
-    // Attach user info to request (email needed for alumni/me resolution)
+    // Attach user info. Primary identity is user_id (id). Use req.user.id for ownership and engagement checks; usn is for display/profile URLs only.
     req.user = {
       id: user.id,
+      user_id: user.id,
       usn: user.usn,
       role: user.role_name,
       email: user.email_id || null
     };
 
-    // For student routes, verify the USN matches (students can only access their own data)
+    // For student routes, verify the USN matches (students can only access their own profile by USN)
     if (req.params.usn && user.usn && req.params.usn !== user.usn && user.role_name === 'student') {
       return res.status(403).json({ message: 'Access denied. You can only access your own profile.' });
     }
