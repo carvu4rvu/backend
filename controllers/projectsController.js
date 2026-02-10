@@ -104,7 +104,7 @@ exports.feed = async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const sort = (req.query.sort || 'score').toLowerCase();
 
-    const baseWhere = `WHERE p.visibility = 'PUBLIC' AND p.published_at IS NOT NULL`;
+    const baseWhere = `WHERE p.visibility IN ('PUBLIC', 'LINK_ONLY') AND p.published_at IS NOT NULL`;
 
     // Score expression matching blueprint: (views*0.2) + (likes*1.5) + (favorites*2) + (avg_rating*3) - age_days*0.1 + priority_boost + verified_boost
     const scoreExpr = `
@@ -205,9 +205,14 @@ exports.getOne = async (req, res) => {
     if (!proj.rows.length) return sendError(res, 404, 'Project not found');
     const project = proj.rows[0];
 
+    // Visibility rules:
+    // - PRIVATE: only owner (or admin/vc) via this endpoint
+    // - PUBLIC / LINK_ONLY: world-visible
     if (project.visibility === 'PRIVATE') {
       const userId = req.user?.id ?? req.user?.user_id;
-      if (!userId || project.owner_user_id !== userId) {
+      const isOwner = userId && project.owner_user_id === userId;
+      const isAdmin = req.user?.role === 'admin' || req.user?.role === 'vc';
+      if (!isOwner && !isAdmin) {
         return sendError(res, 403, 'Access denied');
       }
     } else if (project.visibility !== 'PUBLIC') {
@@ -589,10 +594,16 @@ exports.createShareLink = async (req, res) => {
     const userId = req.user?.id ?? req.user?.user_id;
     if (!userId) return sendError(res, 401, 'Authentication required');
 
-    const proj = await pool.query('SELECT id, owner_user_id FROM projects WHERE id = $1', [projectId]);
+    const proj = await pool.query('SELECT id, owner_user_id, visibility FROM projects WHERE id = $1', [projectId]);
     if (!proj.rows.length) return sendError(res, 404, 'Project not found');
-    if (proj.rows[0].owner_user_id !== userId && req.user?.role !== 'admin' && req.user?.role !== 'vc') {
+    const project = proj.rows[0];
+    if (project.owner_user_id !== userId && req.user?.role !== 'admin' && req.user?.role !== 'vc') {
       return sendError(res, 403, 'Access denied');
+    }
+
+    // Only LINK_ONLY projects should use share links (not general PUBLIC feed items)
+    if (project.visibility !== 'LINK_ONLY') {
+      return sendError(res, 400, 'Share links can only be created for LINK_ONLY projects.');
     }
 
     const crypto = require('crypto');

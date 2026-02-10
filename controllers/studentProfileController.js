@@ -2185,18 +2185,30 @@ exports.getProjects = async (req, res) => {
         const client = await pool.connect();
         try {
             const projRows = await client.query(
-                'SELECT id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
+                'SELECT id, owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
                 [usnNorm]
             );
             const rows = projRows.rows || [];
             const projectIds = rows.map((p) => p.id);
             let assets = [];
+            let selfRatings = {};
             if (projectIds.length > 0) {
                 const assetRows = await client.query(
                     'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
                     [projectIds]
                 );
                 assets = assetRows.rows || [];
+
+                // Load self ratings (owner's rating) from project_ratings
+                const ratingRows = await client.query(
+                    `SELECT pr.project_id, pr.rating
+                     FROM public.project_ratings pr
+                     WHERE pr.project_id = ANY($1::bigint[])`,
+                    [projectIds]
+                );
+                (ratingRows.rows || []).forEach((r) => {
+                    selfRatings[r.project_id] = r.rating;
+                });
             }
             const byProject = {};
             assets.forEach((a) => {
@@ -2211,7 +2223,7 @@ exports.getProjects = async (req, res) => {
                 full_description: p.description,
                 genre: p.category,
                 visibility: p.visibility || 'PRIVATE',
-                self_rating: null,
+                self_rating: selfRatings[p.id] ?? null,
                 admin_rating: null,
                 priority: p.priority,
                 project_snaps: byProject[p.id] || [],
@@ -2243,12 +2255,23 @@ exports.updateProjects = async (req, res) => {
         const { usn } = req.params;
         let data = req.body;
 
+        // Resolve authenticated user + canonical USN (identity: user_id primary, USN secondary)
+        const userId = req.user?.id ?? req.user?.user_id;
+        if (!userId) {
+            return sendError(res, 401, 'Authentication required');
+        }
+        const usnRow = await pool.query('SELECT usn FROM public.user_login WHERE id = $1', [userId]);
+        const ownerUsn = usnRow.rows.length && usnRow.rows[0].usn ? usnRow.rows[0].usn : null;
+        if (!ownerUsn) {
+            return sendError(res, 403, 'Only students with USN can update projects');
+        }
+
         // Enforce projects section lock (student_edit_control.is_projects_locked)
         const client = await pool.connect();
         try {
             const { rows } = await client.query(
                 'SELECT is_projects_locked FROM public.student_edit_control WHERE usn = $1',
-                [String(usn || '').toUpperCase()]
+                [String(ownerUsn || '').toUpperCase()]
             );
             if (rows && rows.length > 0 && rows[0].is_projects_locked === true) {
                 sendLocked(res, 'This section is locked by the administrator. You have view-only access.');
@@ -2272,11 +2295,26 @@ exports.updateProjects = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const usnNormEmpty = String(usn || '').trim().toUpperCase();
+            const usnNormEmpty = String(ownerUsn || '').trim().toUpperCase();
             const clientEmpty = await pool.connect();
             try {
-                await clientEmpty.query('DELETE FROM public.project_assets WHERE project_id IN (SELECT id FROM public.projects WHERE owner_usn = $1)', [usnNormEmpty]);
-                await clientEmpty.query('DELETE FROM public.projects WHERE owner_usn = $1', [usnNormEmpty]);
+                const idsResult = await clientEmpty.query('SELECT id FROM public.projects WHERE owner_usn = $1', [usnNormEmpty]);
+                const projectIds = idsResult.rows.map((r) => r.id);
+                if (projectIds.length > 0) {
+                    await clientEmpty.query(
+                        'DELETE FROM public.project_asset_variants WHERE asset_id IN (SELECT id FROM public.project_assets WHERE project_id = ANY($1::bigint[]))',
+                        [projectIds]
+                    );
+                    await clientEmpty.query('DELETE FROM public.project_assets WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_favorites WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_likes WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_ratings WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_reviews WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_share_links WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_views WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.project_metrics WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                    await clientEmpty.query('DELETE FROM public.projects WHERE id = ANY($1::bigint[])', [projectIds]);
+                }
                 return res.json([]);
             } finally {
                 clientEmpty.release();
@@ -2412,12 +2450,17 @@ exports.updateProjects = async (req, res) => {
 
         // Build itemsToInsert with raw priorities (null allowed) — legacy shape for mapping to projects
         const itemsToInsert = rowData.map((r) => ({
-            usn,
+            usn: ownerUsn,
             title: String(r.title).trim(),
             one_line_description: String(r.oneLineDesc).trim(),
             full_description: (r.item.full_description ?? r.item.fullDescription ?? '') || null,
             genre: String(r.genre).trim(),
-            visibility: r.visibility === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE',
+            visibility:
+                r.visibility === 'PUBLIC'
+                    ? 'PUBLIC'
+                    : r.visibility === 'LINK_ONLY'
+                        ? 'LINK_ONLY'
+                        : 'PRIVATE',
             self_rating: r.selfRating != null && r.selfRating !== '' ? parseInt(String(r.selfRating), 10) : 5,
             admin_rating: r.item.admin_rating ?? r.item.adminRating ?? null,
             priority: r.priority, // null or number; will normalize next
@@ -2440,14 +2483,29 @@ exports.updateProjects = async (req, res) => {
         });
 
         // --- 4. Bulk replace: write to public.projects + project_assets (not student_projects) ---
-        const usnNorm = String(usn || '').trim().toUpperCase();
-        const ownerUserId = req.user?.id ?? req.user?.user_id ?? null;
+        const usnNorm = String(ownerUsn || '').trim().toUpperCase();
+        const ownerUserId = userId ?? null;
 
         const dbClient = await pool.connect();
         try {
-            // Delete existing projects for this USN (project_assets deleted via FK or explicitly)
-            await dbClient.query('DELETE FROM public.project_assets WHERE project_id IN (SELECT id FROM public.projects WHERE owner_usn = $1)', [usnNorm]);
-            await dbClient.query('DELETE FROM public.projects WHERE owner_usn = $1', [usnNorm]);
+            // Delete existing projects for this USN + all dependent rows to avoid FK violations
+            const idsResult = await dbClient.query('SELECT id FROM public.projects WHERE owner_usn = $1', [usnNorm]);
+            const projectIds = idsResult.rows.map((r) => r.id);
+            if (projectIds.length > 0) {
+                await dbClient.query(
+                    'DELETE FROM public.project_asset_variants WHERE asset_id IN (SELECT id FROM public.project_assets WHERE project_id = ANY($1::bigint[]))',
+                    [projectIds]
+                );
+                await dbClient.query('DELETE FROM public.project_assets WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_favorites WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_likes WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_ratings WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_reviews WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_share_links WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_views WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.project_metrics WHERE project_id = ANY($1::bigint[])', [projectIds]);
+                await dbClient.query('DELETE FROM public.projects WHERE id = ANY($1::bigint[])', [projectIds]);
+            }
 
             if (itemsToInsert.length === 0) {
                 return res.json([]);
@@ -2477,6 +2535,17 @@ exports.updateProjects = async (req, res) => {
                 );
                 const proj = projResult.rows[0];
                 if (!proj) continue;
+
+                // Upsert self-rating into project_ratings as the owner's rating
+                if (row.self_rating != null && !Number.isNaN(Number(row.self_rating))) {
+                    const selfRatingValue = Math.max(1, Math.min(10, parseInt(String(row.self_rating), 10)));
+                    await dbClient.query(
+                        `INSERT INTO public.project_ratings (project_id, user_id, rating)
+                         VALUES ($1, $2, $3)
+                         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
+                        [proj.id, ownerUserId, selfRatingValue]
+                    );
+                }
 
                 for (let pos = 0; pos < (row.project_snaps || []).length; pos++) {
                     const url = row.project_snaps[pos];

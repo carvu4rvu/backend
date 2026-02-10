@@ -36,11 +36,11 @@ exports.uploadFile = async (req, res) => {
       fs.mkdirSync(usnDir, { recursive: true });
     }
 
-    // Sanitize filename and add timestamp
+    // Generate a server-side filename (no user-provided name)
     const timestamp = Date.now();
-    const fileExtension = path.extname(file.originalname);
-    const baseName = path.basename(file.originalname, fileExtension).replace(/[^a-zA-Z0-9]/g, '_');
-    const fileName = `${timestamp}_${baseName}${fileExtension}`;
+    const fileExtension = path.extname(file.originalname) || '';
+    const randomPart = Math.random().toString(36).slice(2, 10);
+    const fileName = `${timestamp}_${randomPart}${fileExtension}`;
     const filePath = path.join(usnDir, fileName);
 
     // Write file to disk
