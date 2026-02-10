@@ -2175,17 +2175,57 @@ exports.updateExtraCurricular = async (req, res) => {
 /**
  * Get Projects
  * GET /profile/:usn/projects
+ * Reads from public.projects + project_assets (legacy student_projects table removed).
+ * Returns legacy shape for profile UI: one_line_description, full_description, genre, project_snaps, etc.
  * Access: Student (own usn only), Admin/Placement (any usn). Ownership enforced by authMiddleware.
  */
 exports.getProjects = async (req, res) => {
     try {
-        const { usn } = req.params;
-        const { data: projects, error } = await supabase
-            .from('student_projects')
-            .select('*')
-            .eq('usn', usn);
-        if (error) return sendCaughtError(res, error, 'Failed to load projects.');
-        res.json(projects || []);
+        const usnNorm = String(req.params.usn || '').trim().toUpperCase();
+        const client = await pool.connect();
+        try {
+            const projRows = await client.query(
+                'SELECT id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
+                [usnNorm]
+            );
+            const rows = projRows.rows || [];
+            const projectIds = rows.map((p) => p.id);
+            let assets = [];
+            if (projectIds.length > 0) {
+                const assetRows = await client.query(
+                    'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+                    [projectIds]
+                );
+                assets = assetRows.rows || [];
+            }
+            const byProject = {};
+            assets.forEach((a) => {
+                if (!byProject[a.project_id]) byProject[a.project_id] = [];
+                byProject[a.project_id].push(a.original_url);
+            });
+            const legacy = rows.map((p) => ({
+                id: p.id,
+                usn: p.owner_usn,
+                title: p.title,
+                one_line_description: p.short_description,
+                full_description: p.description,
+                genre: p.category,
+                visibility: p.visibility || 'PRIVATE',
+                self_rating: null,
+                admin_rating: null,
+                priority: p.priority,
+                project_snaps: byProject[p.id] || [],
+                hosted_link: p.hosted_url,
+                github_repo: p.github_url,
+                mentor_name: p.mentor_name,
+                technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+                is_approved: p.is_verified,
+                updated_at: p.updated_at,
+            }));
+            res.json(legacy);
+        } finally {
+            client.release();
+        }
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to load projects.');
     }
@@ -2232,9 +2272,15 @@ exports.updateProjects = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_projects').delete().eq('usn', usn);
-            if (delError) return sendCaughtError(res, delError, 'Failed to update projects.');
-            return res.json([]);
+            const usnNormEmpty = String(usn || '').trim().toUpperCase();
+            const clientEmpty = await pool.connect();
+            try {
+                await clientEmpty.query('DELETE FROM public.project_assets WHERE project_id IN (SELECT id FROM public.projects WHERE owner_usn = $1)', [usnNormEmpty]);
+                await clientEmpty.query('DELETE FROM public.projects WHERE owner_usn = $1', [usnNormEmpty]);
+                return res.json([]);
+            } finally {
+                clientEmpty.release();
+            }
         }
 
         // --- 3. Validate each item, collect fieldErrors and parsed priorities ---
@@ -2364,7 +2410,7 @@ exports.updateProjects = async (req, res) => {
             return sendValidationError(res, 'Please correct the errors below.', fieldErrors);
         }
 
-        // Build itemsToInsert with raw priorities (null allowed)
+        // Build itemsToInsert with raw priorities (null allowed) — legacy shape for mapping to projects
         const itemsToInsert = rowData.map((r) => ({
             usn,
             title: String(r.title).trim(),
@@ -2393,20 +2439,77 @@ exports.updateProjects = async (req, res) => {
             itemsToInsert[x.idx].priority = k + 1;
         });
 
-        // --- 4. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_projects').delete().eq('usn', usn);
-        if (delError) return sendCaughtError(res, delError, 'Failed to update projects.');
+        // --- 4. Bulk replace: write to public.projects + project_assets (not student_projects) ---
+        const usnNorm = String(usn || '').trim().toUpperCase();
+        const ownerUserId = req.user?.id ?? req.user?.user_id ?? null;
 
-        if (itemsToInsert.length === 0) return res.json([]);
+        const dbClient = await pool.connect();
+        try {
+            // Delete existing projects for this USN (project_assets deleted via FK or explicitly)
+            await dbClient.query('DELETE FROM public.project_assets WHERE project_id IN (SELECT id FROM public.projects WHERE owner_usn = $1)', [usnNorm]);
+            await dbClient.query('DELETE FROM public.projects WHERE owner_usn = $1', [usnNorm]);
 
-        const { data: inserted, error: insError } = await supabase
-            .from('student_projects')
-            .insert(itemsToInsert)
-            .select();
+            if (itemsToInsert.length === 0) {
+                return res.json([]);
+            }
 
-        if (insError) return sendCaughtError(res, insError, 'Failed to save projects.');
+            const inserted = [];
+            for (const row of itemsToInsert) {
+                const projResult = await dbClient.query(
+                    `INSERT INTO public.projects (owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     RETURNING id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at`,
+                    [
+                        usnNorm,
+                        ownerUserId,
+                        row.title,
+                        row.one_line_description,
+                        row.full_description,
+                        row.genre,
+                        row.visibility,
+                        row.hosted_link,
+                        row.github_repo,
+                        row.mentor_name,
+                        row.technologies,
+                        row.is_approved === true,
+                        row.priority,
+                    ]
+                );
+                const proj = projResult.rows[0];
+                if (!proj) continue;
 
-        res.json(inserted || []);
+                for (let pos = 0; pos < (row.project_snaps || []).length; pos++) {
+                    const url = row.project_snaps[pos];
+                    if (url && String(url).trim()) {
+                        await dbClient.query(
+                            `INSERT INTO public.project_assets (project_id, asset_type, asset_role, original_url, position) VALUES ($1, 'IMAGE', 'GALLERY', $2, $3)`,
+                            [proj.id, String(url).trim(), pos]
+                        );
+                    }
+                }
+
+                inserted.push({
+                    id: proj.id,
+                    usn: proj.owner_usn,
+                    title: proj.title,
+                    one_line_description: proj.short_description,
+                    full_description: proj.description,
+                    genre: proj.category,
+                    visibility: proj.visibility,
+                    priority: proj.priority,
+                    project_snaps: row.project_snaps || [],
+                    hosted_link: proj.hosted_url,
+                    github_repo: proj.github_url,
+                    mentor_name: proj.mentor_name,
+                    technologies: proj.tech_stack || [],
+                    is_approved: proj.is_verified,
+                    updated_at: proj.updated_at,
+                });
+            }
+            res.json(inserted);
+        } finally {
+            dbClient.release();
+        }
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to update projects.');
     }

@@ -60,6 +60,7 @@ const uploadRoutes = require('./routes/uploadRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
 const companyRoutes = require('./routes/companyRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const projectRoutes = require('./routes/projectRoutes');
 const ensureProfileImageColumn = require('./migrations/ensureProfileImage');
 const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
@@ -73,6 +74,7 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/company', companyRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/projects', projectRoutes);
 
 app.get('/', (req, res) => {
   res.send('Hello from the Backend!');
