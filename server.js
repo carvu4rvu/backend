@@ -77,7 +77,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/projects', projectRoutes);
 
 app.get('/', (req, res) => {
-  res.send('Hello from the Backend!');
+  res.send('health');
 });
 
 app.get('/api/health', (req, res) => {
@@ -110,6 +110,7 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
 
   try {
     console.log(`Server listening on 0.0.0.0:${PORT}`);
+    console.log(`Server URL: http://localhost:${PORT}`);
 
     if (process.env.NODE_ENV === 'production') {
       const required = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
