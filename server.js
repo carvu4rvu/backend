@@ -80,6 +80,14 @@ app.get('/', (req, res) => {
   res.send('Hello from the Backend!');
 });
 
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+  });
+});
+
 app.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
 
