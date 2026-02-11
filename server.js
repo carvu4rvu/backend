@@ -88,7 +88,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-const server = app.listen(PORT, async () => {
+const server = app.listen(PORT, '0.0.0.0', async () => {
   const fs = require('fs');
   const path = require('path');
 
@@ -109,7 +109,15 @@ const server = app.listen(PORT, async () => {
   };
 
   try {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server listening on 0.0.0.0:${PORT}`);
+
+    if (process.env.NODE_ENV === 'production') {
+      const required = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
+      const missing = required.filter((k) => !process.env[k]);
+      if (missing.length) {
+        throw new Error(`Missing required env vars: ${missing.join(', ')}`);
+      }
+    }
 
     const publicDir = path.join(__dirname, 'public');
     if (!fs.existsSync(publicDir)) {
