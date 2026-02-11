@@ -88,19 +88,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.listen(PORT, async () => {
-  console.log(`Server is running on port ${PORT}`);
-
-  // Ensure public directory exists
+const server = app.listen(PORT, async () => {
   const fs = require('fs');
   const path = require('path');
-  const publicDir = path.join(__dirname, 'public');
-  if (!fs.existsSync(publicDir)) {
-    fs.mkdirSync(publicDir, { recursive: true });
-    console.log('Created public directory ✅');
-  } else {
-    console.log('Public directory exists ✅');
-  }
 
   const connectWithRetry = async (name, connectFn, attempts = 3) => {
     for (let i = 1; i <= attempts; i++) {
@@ -111,36 +101,51 @@ app.listen(PORT, async () => {
       } catch (err) {
         console.error(`${name} connect failed (Attempt ${i}/${attempts}) ❌`, err.message);
         if (i === attempts) {
-          console.error(`${name} failed after ${attempts} attempts`);
-        } else {
-          // Wait 2 seconds before retrying
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          throw new Error(`${name} failed after ${attempts} attempts: ${err.message}`);
         }
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
   };
 
-  // Database Connection Check
-  await connectWithRetry('database', async () => {
-    const client = await pool.connect();
-    client.release();
-  });
+  try {
+    console.log(`Server is running on port ${PORT}`);
 
-  // Run migrations
-  await ensureProfileImageColumn();
-  await ensureResumeFileColumn();
-  await ensureIsApprovedColumn();
-  await ensureEventsStatusColumn();
-  await ensureNotificationNodesRecipientEntityId();
-  // Supabase Storage Connection Check
-  await connectWithRetry('supabase storage', async () => {
-    const { data, error } = await supabase.storage.listBuckets();
-    if (error) throw error;
-  });
+    const publicDir = path.join(__dirname, 'public');
+    if (!fs.existsSync(publicDir)) {
+      fs.mkdirSync(publicDir, { recursive: true });
+      console.log('Created public directory ✅');
+    } else {
+      console.log('Public directory exists ✅');
+    }
 
-  // SMTP Connection Check
-  await connectWithRetry('smtp', async () => {
-    await transporter.verify();
-  });
+    await connectWithRetry('database', async () => {
+      const client = await pool.connect();
+      client.release();
+    });
 
+    await ensureProfileImageColumn();
+    await ensureResumeFileColumn();
+    await ensureIsApprovedColumn();
+    await ensureEventsStatusColumn();
+    await ensureNotificationNodesRecipientEntityId();
+
+    await connectWithRetry('supabase storage', async () => {
+      const { data, error } = await supabase.storage.listBuckets();
+      if (error) throw error;
+    });
+
+    if (process.env.NODE_ENV !== 'production') {
+      await connectWithRetry('smtp', async () => {
+        await transporter.verify();
+      });
+    } else {
+      console.log('smtp skipped (production)');
+    }
+  } catch (err) {
+    console.error('Startup failed:', err.message);
+    server.close(() => {
+      process.exit(1);
+    });
+  }
 });
