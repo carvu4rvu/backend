@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const pool = require('../config/db');
 const logger = require('../utils/logger');
 
 /**
@@ -552,18 +553,42 @@ exports.getStudentProfile = async (req, res) => {
       .order('semester', { ascending: false })
       .limit(1);
 
-    // Public projects only
-    const { data: projects } = await supabase
-      .from('student_projects')
-      .select(`
-        id, title, one_line_description, full_description, genre,
-        self_rating, admin_rating, priority, project_snaps,
-        hosted_link, github_repo, technologies, mentor_name
-      `)
-      .eq('usn', usn)
-      .eq('visibility', 'PUBLIC')
-      .eq('is_approved', true)
-      .order('priority', { ascending: true });
+    // Public projects only (projects table)
+    const projRes = await pool.query(
+      `SELECT p.id, p.title, p.short_description, p.description, p.category, p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.priority
+       FROM projects p
+       WHERE p.owner_usn = $1 AND p.visibility = 'PUBLIC' AND p.project_status = 'approved'
+       ORDER BY p.priority ASC NULLS LAST`,
+      [usn]
+    );
+    const projRows = projRes.rows || [];
+    const projIds = projRows.map((p) => p.id);
+    let projectSnapsByProj = {};
+    if (projIds.length > 0) {
+      const assetRes = await pool.query(
+        'SELECT project_id, original_url FROM project_assets WHERE project_id = ANY($1::bigint[]) AND asset_role IN (\'GALLERY\', \'COVER\') ORDER BY project_id, position',
+        [projIds]
+      );
+      (assetRes.rows || []).forEach((a) => {
+        if (!projectSnapsByProj[a.project_id]) projectSnapsByProj[a.project_id] = [];
+        projectSnapsByProj[a.project_id].push(a.original_url);
+      });
+    }
+    const projects = projRows.map((p) => ({
+      id: p.id,
+      title: p.title,
+      one_line_description: p.short_description,
+      full_description: p.description,
+      genre: p.category,
+      self_rating: null,
+      admin_rating: null,
+      priority: p.priority,
+      project_snaps: projectSnapsByProj[p.id] || [],
+      hosted_link: p.hosted_url,
+      github_repo: p.github_url,
+      technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+      mentor_name: p.mentor_name,
+    }));
 
     // Internships
     const { data: internships } = await supabase

@@ -298,13 +298,13 @@ function validateVisibility(value) {
 }
 
 /**
- * Validates self-rating (1-10).
+ * Validates self-rating (1-5, matches project_ratings schema).
  */
 function validateSelfRating(value) {
   if (value === null || value === undefined || value === '') return { valid: true };
   const n = parseInt(String(value), 10);
-  if (Number.isNaN(n) || n < 1 || n > 10) {
-    return { valid: false, message: 'Self-rating must be between 1 and 10.' };
+  if (Number.isNaN(n) || n < 1 || n > 5) {
+    return { valid: false, message: 'Self-rating must be between 1 and 5.' };
   }
   return { valid: true };
 }

@@ -30,11 +30,11 @@ const CONSTRAINT_MESSAGES = {
   student_semester_academics_semester_check:
     'Semester must be between 1 and 12.',
 
-  // student_projects
-  student_projects_visibility_check:
-    'Visibility must be PRIVATE or PUBLIC.',
-  student_projects_self_rating_check:
-    'Self-rating must be between 1 and 10.',
+  // projects
+  projects_visibility_check:
+    'Visibility must be PRIVATE, PUBLIC, or LINK_ONLY.',
+  projects_self_rating_check:
+    'Self-rating must be between 1 and 5.',
 
   // student_publications
   student_publications_author_count_check:

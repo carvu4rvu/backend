@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const studentProfileController = require('./studentProfileController');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
 const { sendLocked } = require('../utils/apiErrorResponse');
@@ -105,7 +106,31 @@ exports.getProfile = async (req, res) => {
         supabase.from('student_education_history').select('*').eq('usn', usn),
         supabase.from('student_education_gaps').select('*').eq('usn', usn),
         supabase.from('student_semester_academics').select('*').eq('usn', usn).order('semester', { ascending: true }),
-        supabase.from('student_projects').select('*').eq('usn', usn),
+        (async () => {
+            const projRes = await pool.query(
+                'SELECT id, owner_usn as usn, title, short_description as one_line_description, description as full_description, category as genre, visibility, hosted_url as hosted_link, github_url as github_repo, mentor_name, tech_stack as technologies, project_status, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
+                [usn]
+            );
+            const rows = projRes?.rows || [];
+            const projectIds = rows.map((r) => r.id);
+            if (projectIds.length > 0) {
+                const assetRes = await pool.query(
+                    'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+                    [projectIds]
+                );
+                const byProject = {};
+                (assetRes.rows || []).forEach((a) => {
+                    if (!byProject[a.project_id]) byProject[a.project_id] = [];
+                    byProject[a.project_id].push(a.original_url);
+                });
+                return { data: rows.map((p) => ({
+                    ...p,
+                    project_snaps: byProject[p.id] || [],
+                    is_approved: p.project_status === 'approved'
+                })), error: null };
+            }
+            return { data: rows, error: null };
+        })(),
         supabase.from('student_internships').select('*').eq('usn', usn),
         supabase.from('student_trainings').select('*').eq('usn', usn),
         supabase.from('student_certifications').select('*').eq('usn', usn),
@@ -268,14 +293,31 @@ exports.getProfileSection = async (req, res) => {
             break;
         }
 
-        case 'projects':
-            const { data: proj, error: prError } = await supabase
-                .from('student_projects')
-                .select('*')
-                .eq('usn', usn);
-            if (prError) throw prError;
-            result = proj || [];
+        case 'projects': {
+            const projRes = await pool.query(
+                'SELECT id, owner_usn as usn, title, short_description as one_line_description, description as full_description, category as genre, visibility, hosted_url as hosted_link, github_url as github_repo, mentor_name, tech_stack as technologies, project_status, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
+                [usn]
+            );
+            const rows = projRes.rows || [];
+            const projectIds = rows.map((r) => r.id);
+            let byProject = {};
+            if (projectIds.length > 0) {
+                const assetRes = await pool.query(
+                    'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+                    [projectIds]
+                );
+                (assetRes.rows || []).forEach((a) => {
+                    if (!byProject[a.project_id]) byProject[a.project_id] = [];
+                    byProject[a.project_id].push(a.original_url);
+                });
+            }
+            result = rows.map((p) => ({
+                ...p,
+                project_snaps: byProject[p.id] || [],
+                is_approved: p.project_status === 'approved'
+            }));
             break;
+        }
 
         case 'internships':
             const { data: intern, error: iError } = await supabase
@@ -515,9 +557,12 @@ exports.updateProfileSection = async (req, res) => {
              result = updatedResume;
              break;
 
+        case 'projects':
+            // Projects use public.projects table - delegate to studentProfileController
+            return studentProfileController.updateProjects(req, res);
+
         case 'education':
         case 'academic_performance':
-        case 'projects':
         case 'internships':
         case 'trainings':
         case 'certifications':
@@ -529,7 +574,6 @@ exports.updateProfileSection = async (req, res) => {
             const tableNameMap = {
                 'education': 'student_education_history',
                 'academic_performance': 'student_semester_academics',
-                'projects': 'student_projects',
                 'internships': 'student_internships',
                 'trainings': 'student_trainings',
                 'certifications': 'student_certifications',
@@ -644,26 +688,7 @@ exports.updateProfileSection = async (req, res) => {
                              newItem.end_date = null;
                          }
                      }
-                     if (tableName === 'student_projects') {
-                         if (newItem.project_snaps !== undefined) {
-                             newItem.project_snaps = Array.isArray(newItem.project_snaps)
-                                 ? newItem.project_snaps
-                                 : (typeof newItem.project_snaps === 'string' ? (newItem.project_snaps.trim() ? [newItem.project_snaps] : []) : []);
-                         } else {
-                             newItem.project_snaps = [];
-                         }
-                         if (newItem.technologies !== undefined) {
-                             newItem.technologies = Array.isArray(newItem.technologies)
-                                 ? newItem.technologies
-                                 : (typeof newItem.technologies === 'string' ? (newItem.technologies.trim() ? newItem.technologies.split(',').map(s => s.trim()).filter(Boolean) : []) : []);
-                         } else {
-                             newItem.technologies = [];
-                         }
-                         if (newItem.visibility === undefined) newItem.visibility = 'PRIVATE';
-                         if (newItem.self_rating === undefined) newItem.self_rating = 5;
-                         if (newItem.priority === undefined) newItem.priority = 1;
-                     }
-                     if (tableName === 'student_education_history') {
+                    if (tableName === 'student_education_history') {
                          if (newItem.result_type !== undefined && (newItem.result_type === '' || newItem.result_type === null)) {
                              newItem.result_type = null;
                          }
@@ -749,7 +774,6 @@ exports.updateProfileSection = async (req, res) => {
                     }
 
                      const tablesWithUpdatedAt = [
-                         'student_projects',
                          'student_internships',
                          'student_trainings',
                          'student_certifications',
@@ -769,7 +793,6 @@ exports.updateProfileSection = async (req, res) => {
                          // DB schema: start_year, end_year
                          student_education_history: ['usn', 'education_level', 'institute_name', 'city', 'board', 'start_year', 'end_year', 'result', 'result_type', 'subjects', 'marksheet_file'],
                          student_semester_academics: ['usn', 'academic_year', 'semester', 'result_in_sgpa', 'closed_backlogs', 'live_backlogs', 'provisional_result_upload_links'],
-                         student_projects: ['usn', 'title', 'one_line_description', 'full_description', 'genre', 'visibility', 'self_rating', 'admin_rating', 'priority', 'project_snaps', 'hosted_link', 'github_repo', 'mentor_name', 'technologies', 'is_approved', 'updated_at'],
                          student_internships: ['usn', 'job_role', 'organization', 'organization_details', 'duration_months', 'start_date', 'end_date', 'location', 'stipend', 'skills', 'description', 'mentor_name', 'proof_document', 'academic_year', 'updated_at'],
                          student_trainings: ['usn', 'title', 'institution', 'training_type', 'start_date', 'end_date', 'skills', 'description', 'proof_document', 'updated_at'],
                          student_certifications: ['usn', 'title', 'organization', 'certification_type', 'skills', 'score', 'issue_date', 'expiry_date', 'proof_document', 'updated_at'],

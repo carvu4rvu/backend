@@ -81,7 +81,35 @@ const authorizeRoles = (...allowedRoles) => {
   };
 };
 
+/**
+ * Optional auth: sets req.user when valid token present, does not fail when no token.
+ */
+const optionalAuthenticate = async (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return next();
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
+    const result = await pool.query(
+      'SELECT ul.id, ul.usn, ul.is_active, ul.email_id, r.name as role_name FROM user_login ul JOIN roles r ON r.id = ul.role_id WHERE ul.id = $1',
+      [decoded.sub]
+    );
+    if (result.rows.length && result.rows[0].is_active) {
+      req.user = {
+        id: result.rows[0].id,
+        user_id: result.rows[0].id,
+        usn: result.rows[0].usn,
+        role: result.rows[0].role_name,
+        email: result.rows[0].email_id || null
+      };
+    }
+  } catch (_e) { /* ignore invalid/expired token */ }
+  next();
+};
+
 module.exports = {
   authenticateToken,
-  authorizeRoles
+  authorizeRoles,
+  optionalAuthenticate
 };

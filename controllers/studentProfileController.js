@@ -2175,7 +2175,7 @@ exports.updateExtraCurricular = async (req, res) => {
 /**
  * Get Projects
  * GET /profile/:usn/projects
- * Reads from public.projects + project_assets (legacy student_projects table removed).
+ * Reads from public.projects + project_assets.
  * Returns legacy shape for profile UI: one_line_description, full_description, genre, project_snaps, etc.
  * Access: Student (own usn only), Admin/Placement (any usn). Ownership enforced by authMiddleware.
  */
@@ -2185,7 +2185,7 @@ exports.getProjects = async (req, res) => {
         const client = await pool.connect();
         try {
             const projRows = await client.query(
-                'SELECT id, owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
+                'SELECT id, owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, project_status, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
                 [usnNorm]
             );
             const rows = projRows.rows || [];
@@ -2231,7 +2231,8 @@ exports.getProjects = async (req, res) => {
                 github_repo: p.github_url,
                 mentor_name: p.mentor_name,
                 technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
-                is_approved: p.is_verified,
+                is_approved: p.project_status === 'approved',
+                project_status: p.project_status,
                 updated_at: p.updated_at,
             }));
             res.json(legacy);
@@ -2482,7 +2483,7 @@ exports.updateProjects = async (req, res) => {
             itemsToInsert[x.idx].priority = k + 1;
         });
 
-        // --- 4. Bulk replace: write to public.projects + project_assets (not student_projects) ---
+        // --- 4. Bulk replace: write to public.projects + project_assets ---
         const usnNorm = String(ownerUsn || '').trim().toUpperCase();
         const ownerUserId = userId ?? null;
 
@@ -2514,9 +2515,9 @@ exports.updateProjects = async (req, res) => {
             const inserted = [];
             for (const row of itemsToInsert) {
                 const projResult = await dbClient.query(
-                    `INSERT INTO public.projects (owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority)
+                    `INSERT INTO public.projects (owner_usn, owner_user_id, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, project_status, priority)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                     RETURNING id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, is_verified, priority, updated_at`,
+                     RETURNING id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, project_status, priority, updated_at`,
                     [
                         usnNorm,
                         ownerUserId,
@@ -2524,21 +2525,21 @@ exports.updateProjects = async (req, res) => {
                         row.one_line_description,
                         row.full_description,
                         row.genre,
-                        row.visibility,
+                        row.visibility === 'PUBLIC' ? 'PRIVATE' : row.visibility, // Draft must be PRIVATE until approved
                         row.hosted_link,
                         row.github_repo,
                         row.mentor_name,
                         row.technologies,
-                        row.is_approved === true,
+                        'draft', // Admin sets approved via admin API; bulk replace always creates as draft
                         row.priority,
                     ]
                 );
                 const proj = projResult.rows[0];
                 if (!proj) continue;
 
-                // Upsert self-rating into project_ratings as the owner's rating
+                // Upsert self-rating into project_ratings (1-5 scale per schema)
                 if (row.self_rating != null && !Number.isNaN(Number(row.self_rating))) {
-                    const selfRatingValue = Math.max(1, Math.min(10, parseInt(String(row.self_rating), 10)));
+                    const selfRatingValue = Math.max(1, Math.min(5, parseInt(String(row.self_rating), 10)));
                     await dbClient.query(
                         `INSERT INTO public.project_ratings (project_id, user_id, rating)
                          VALUES ($1, $2, $3)
@@ -2550,12 +2551,21 @@ exports.updateProjects = async (req, res) => {
                 for (let pos = 0; pos < (row.project_snaps || []).length; pos++) {
                     const url = row.project_snaps[pos];
                     if (url && String(url).trim()) {
+                        const assetRole = pos === 0 ? 'COVER' : 'GALLERY';
                         await dbClient.query(
-                            `INSERT INTO public.project_assets (project_id, asset_type, asset_role, original_url, position) VALUES ($1, 'IMAGE', 'GALLERY', $2, $3)`,
-                            [proj.id, String(url).trim(), pos]
+                            `INSERT INTO public.project_assets (project_id, asset_type, asset_role, original_url, position) VALUES ($1, 'IMAGE', $2, $3, $4)`,
+                            [proj.id, assetRole, String(url).trim(), pos]
                         );
                     }
                 }
+
+                // Ensure project_metrics row exists (schema: projects + project_metrics + ...)
+                await dbClient.query(
+                    `INSERT INTO public.project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
+                     VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())
+                     ON CONFLICT (project_id) DO NOTHING`,
+                    [proj.id]
+                );
 
                 inserted.push({
                     id: proj.id,
@@ -2571,7 +2581,7 @@ exports.updateProjects = async (req, res) => {
                     github_repo: proj.github_url,
                     mentor_name: proj.mentor_name,
                     technologies: proj.tech_stack || [],
-                    is_approved: proj.is_verified,
+                    is_approved: proj.project_status === 'approved',
                     updated_at: proj.updated_at,
                 });
             }

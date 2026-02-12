@@ -1,36 +1,45 @@
 /**
- * Projects API routes (new): /api/projects
- * Uses projects table and owner_user_id. Separate from placement/projectController.
+ * Project routes: /api/projects
+ * Student-facing CRUD, feed, assets, share links, reviews, likes, favorites, ratings.
  */
 
 const express = require('express');
 const router = express.Router();
-const projectsController = require('../controllers/projectsController');
-const { authenticateToken } = require('../middleware/authMiddleware');
+const projectController = require('../controllers/projectController');
+const { authenticateToken, optionalAuthenticate } = require('../middleware/authMiddleware');
 
-// Public
-router.get('/feed', projectsController.feed);
-router.get('/share/:token', projectsController.resolveShare);
+// Public routes (no auth required)
+router.get('/feed', projectController.feed);
+router.get('/share/:token', projectController.getByShareToken);
 
-// Auth required: list mine (or ?usn= for profile view, ?profile=1 for public-only list)
-router.get('/', authenticateToken, projectsController.list);
+// All routes below require auth (except feed and share)
+router.use(authenticateToken);
 
-// Single project (visibility enforced; includes assets, variants, reviews; registers view for PUBLIC)
-router.get('/:id', projectsController.getOne);
+// List (with optional usn, profile params)
+router.get('/', projectController.list);
 
-router.post('/', authenticateToken, projectsController.create);
-router.patch('/:id/publish', authenticateToken, projectsController.publish);
-router.patch('/:id', authenticateToken, projectsController.update);
-router.delete('/:id', authenticateToken, projectsController.delete);
+// CRUD
+router.post('/', projectController.create);
+router.get('/:id', projectController.getOne);
+router.patch('/:id', projectController.update);
+router.delete('/:id', projectController.delete);
+
+// Workflow
+router.patch('/:id/submit', projectController.submit);
+router.patch('/:id/publish', projectController.publish);
 
 // Assets
-router.post('/:id/assets', authenticateToken, projectsController.addAsset);
-router.delete('/:id/assets/:assetId', authenticateToken, projectsController.deleteAsset);
+router.post('/:id/assets', projectController.addAsset);
+router.delete('/:id/assets/:assetId', projectController.deleteAsset);
 
-// Share links
-router.post('/:id/share', authenticateToken, projectsController.createShareLink);
+// Share
+router.post('/:id/share', projectController.createShareLink);
 
-// Reviews (auth required)
-router.post('/:id/reviews', authenticateToken, projectsController.addReview);
+// Engagement (reviews, like, favorite, rate)
+router.post('/:id/reviews', projectController.addReview);
+router.patch('/:id/reviews/:reviewId', projectController.replyReview);
+router.post('/:id/like', projectController.toggleLike);
+router.post('/:id/favorite', projectController.toggleFavorite);
+router.put('/:id/rate', projectController.rate);
 
 module.exports = router;

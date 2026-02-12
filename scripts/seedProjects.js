@@ -1,13 +1,14 @@
 /**
- * Seed script: inserts at least 20 student projects with 4+ images each.
+ * Seed script: inserts at least 20 projects into projects table with project_assets.
  * Run from backend: node scripts/seedProjects.js
- * Requires .env with SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.
+ * Requires .env with DATABASE_URL (and optionally SUPABASE_URL for storage URLs).
  * Run seedStudents.js first so student_basic_details has USNs.
+ * Uses: projects, project_assets, project_metrics, project_ratings.
  */
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
-const supabase = require('../config/supabaseClient');
+const pool = require('../config/db');
 
-// 4 image paths under public/projects/STUD1_23 (reused for all seed projects so each has 4 images)
+// 4 image paths (reused for all seed projects - each project gets 4 GALLERY assets)
 const PROJECT_SNAP_PATHS = [
   'projects/STUD1_23/1769681280716_spidey.jpg',
   'projects/STUD1_23/1769681721045_Screenshot_2026_01_29_123051.png',
@@ -53,52 +54,97 @@ const TECH_SAMPLES = [
   ['Next.js', 'Prisma', 'Supabase'],
 ];
 
-async function seed() {
-  console.log('Seeding student projects...\n');
+/** Build storage URL from path (Supabase storage or relative) */
+function toStorageUrl(path) {
+  const base = process.env.SUPABASE_URL || 'https://example.supabase.co';
+  const bucket = process.env.SUPABASE_STORAGE_BUCKET || 'public';
+  return path.startsWith('http') ? path : `${base}/storage/v1/object/public/${bucket}/${path}`;
+}
 
-  const { data: students, error: studentsErr } = await supabase.from('student_basic_details').select('usn');
-  if (studentsErr || !students?.length) {
+async function seed() {
+  console.log('Seeding projects (projects + project_assets)...\n');
+
+  const studentsRes = await pool.query('SELECT usn FROM student_basic_details');
+  const students = studentsRes.rows || [];
+  if (!students.length) {
     console.error('No students found. Run seedStudents.js first.');
     process.exit(1);
   }
 
-  const usns = students.map((s) => s.usn);
-  const { data: existingProjects } = await supabase.from('student_projects').select('id');
-  const existingCount = existingProjects?.length ?? 0;
+  const usnToUserId = {};
+  const userRes = await pool.query('SELECT id, usn FROM user_login WHERE usn IS NOT NULL');
+  (userRes.rows || []).forEach((r) => { usnToUserId[r.usn] = r.id; });
 
-  const toInsert = [];
+  const existingRes = await pool.query('SELECT id FROM projects');
+  const existingCount = existingRes.rows?.length ?? 0;
+
+  const usns = students.map((s) => s.usn);
   const n = Math.max(20, usns.length);
+  let inserted = 0;
+
   for (let i = 0; i < n; i++) {
     const usn = usns[i % usns.length];
     const title = TITLES[i % TITLES.length];
     const genre = GENRES[i % GENRES.length];
     const tech = TECH_SAMPLES[i % TECH_SAMPLES.length];
-    toInsert.push({
-      usn,
-      title,
-      one_line_description: `${title} – student project for ${genre}.`,
-      full_description: `This project implements ${title}. It was developed as part of the curriculum and demonstrates skills in ${tech.join(', ')}.`,
-      genre,
-      visibility: i % 3 === 0 ? 'PRIVATE' : 'PUBLIC',
-      self_rating: Math.min(10, Math.max(1, 5 + (i % 5))),
-      admin_rating: i % 2 === 0 ? Math.min(10, Math.max(1, 6 + (i % 4))) : null,
-      priority: (i % 3) + 1,
-      project_snaps: PROJECT_SNAP_PATHS,
-      hosted_link: i % 4 === 0 ? 'https://example.com/demo' : null,
-      github_repo: i % 2 === 0 ? 'https://github.com/example/repo' : null,
-      mentor_name: i % 3 === 0 ? 'Dr. Smith' : null,
-      technologies: tech,
-      is_approved: i % 2 === 0,
-    });
+    const ownerUserId = usnToUserId[usn] || null;
+    const projectStatus = i % 2 === 0 ? 'approved' : 'draft';
+    const selfRating = Math.min(5, Math.max(1, 2 + (i % 4)));
+    const adminRating = i % 2 === 0 ? Math.min(5, Math.max(1, 3 + (i % 3))) : null;
+
+    const projRes = await pool.query(
+      `INSERT INTO projects (owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, owner_user_id, project_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING id`,
+      [
+        usn,
+        title,
+        `${title} – student project for ${genre}.`,
+        `This project implements ${title}. It was developed as part of the curriculum and demonstrates skills in ${tech.join(', ')}.`,
+        genre,
+        i % 3 === 0 ? 'PRIVATE' : 'PUBLIC',
+        i % 4 === 0 ? 'https://example.com/demo' : null,
+        i % 2 === 0 ? 'https://github.com/example/repo' : null,
+        i % 3 === 0 ? 'Dr. Smith' : null,
+        tech,
+        (i % 3) + 1,
+        ownerUserId,
+        projectStatus,
+      ]
+    );
+
+    const projectId = projRes.rows[0]?.id;
+    if (!projectId) continue;
+
+    for (let j = 0; j < PROJECT_SNAP_PATHS.length; j++) {
+      const url = toStorageUrl(PROJECT_SNAP_PATHS[j]);
+      await pool.query(
+        `INSERT INTO project_assets (project_id, asset_type, asset_role, original_url, position)
+         VALUES ($1, 'IMAGE', 'GALLERY', $2, $3)`,
+        [projectId, url, j]
+      );
+    }
+
+    if (ownerUserId) {
+      await pool.query(
+        `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
+         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating`,
+        [projectId, ownerUserId, selfRating]
+      );
+    }
+
+    await pool.query(
+      `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
+       VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())`,
+      [projectId]
+    );
+
+    inserted++;
   }
 
-  const { data: inserted, error } = await supabase.from('student_projects').insert(toInsert).select('id');
-  if (error) {
-    console.error('Insert error:', error.message);
-    process.exit(1);
-  }
-  console.log('Inserted', inserted?.length ?? toInsert.length, 'student projects (each with', PROJECT_SNAP_PATHS.length, 'images).');
+  console.log(`Inserted ${inserted} projects (each with ${PROJECT_SNAP_PATHS.length} images).`);
   console.log('\nSeed completed.');
+  await pool.end();
 }
 
 seed().catch((err) => {

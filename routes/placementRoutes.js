@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const placementController = require('../controllers/placementController');
-const projectController = require('../controllers/projectController');
 const emailRecipientsController = require('../controllers/emailRecipientsController');
 const violationsController = require('../controllers/violationsController');
 const studentEditControlController = require('../controllers/studentEditControlController');
@@ -80,6 +79,11 @@ router.post('/policies/sync', authenticateToken, placementController.syncPolicie
 // Email recipients for bulk email (filter by category: students, parents, alumni, staff)
 router.get('/email-recipients', authenticateToken, emailRecipientsController.getEmailRecipients);
 
+// Projects: alumni feed, view increment, like (alumni or authenticated)
+router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniProjects);
+router.post('/projects/:id/view', placementController.incrementProjectView);
+router.post('/projects/:id/like', authenticateToken, placementController.toggleProjectLike);
+
 // Alumni (me before :identifier; codes before :identifier to avoid matching "codes" as id)
 router.get('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniMe);
 router.put('/alumni/me', authenticateToken, authorizeRoles('alumni'), placementController.updateAlumniMe);
@@ -99,16 +103,6 @@ router.get('/alumni/conversion-logs', authenticateToken, authorizeRoles('admin')
 router.post('/alumni/convert', authenticateToken, authorizeRoles('admin'), placementController.convertToAlumni);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
-
-// Student projects: admin list/update; public showcase
-router.get('/projects/public', projectController.getPublicProjects);
-router.get('/projects', authenticateToken, authorizeRoles('admin'), projectController.getAllProjects);
-router.patch('/projects/:id', authenticateToken, authorizeRoles('admin'), projectController.updateProject);
-
-// Alumni projects: view and like
-router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), projectController.getAlumniProjects);
-router.post('/projects/:id/like', authenticateToken, authorizeRoles('alumni'), projectController.toggleProjectLike);
-router.post('/projects/:id/view', projectController.incrementProjectView);
 
 // Violations: eligibility logs, placement violations, disciplinary records
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);

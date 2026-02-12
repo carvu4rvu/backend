@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const morgan = require('morgan');
 const cors = require('cors');
@@ -56,25 +56,28 @@ const testRoutes = require('./routes/testRoutes');
 const authRoutes = require('./routes/authRoutes');
 const placementRoutes = require('./routes/placementRoutes');
 const studentRoutes = require('./routes/studentRoutes');
+const projectRoutes = require('./routes/projectRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
 const companyRoutes = require('./routes/companyRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
-const projectRoutes = require('./routes/projectRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 const ensureProfileImageColumn = require('./migrations/ensureProfileImage');
 const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
+const ensureAlumniLikedProjectIds = require('./migrations/ensureAlumniLikedProjectIds');
 const ensureEventsStatusColumn = require('./migrations/ensureEventsStatusColumn');
 const ensureNotificationNodesRecipientEntityId = require('./migrations/ensureNotificationNodesRecipientEntityId');
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/placement', placementRoutes);
 app.use('/api/student', studentRoutes);
+app.use('/api/projects', projectRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/company', companyRoutes);
 app.use('/api/notifications', notificationRoutes);
-app.use('/api/projects', projectRoutes);
+app.use('/api/admin', adminRoutes);
 
 app.get('/', (req, res) => {
   res.send('health');
@@ -96,7 +99,6 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     for (let i = 1; i <= attempts; i++) {
       try {
         await connectFn();
-        console.log(`${name} connected ✅`);
         return;
       } catch (err) {
         console.error(`${name} connect failed (Attempt ${i}/${attempts}) ❌`, err.message);
@@ -110,7 +112,6 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
 
   try {
     console.log(`Server listening on 0.0.0.0:${PORT}`);
-    console.log(`Server URL: http://localhost:${PORT}`);
 
     if (process.env.NODE_ENV === 'production') {
       const required = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
@@ -136,6 +137,7 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     await ensureProfileImageColumn();
     await ensureResumeFileColumn();
     await ensureIsApprovedColumn();
+    await ensureAlumniLikedProjectIds();
     await ensureEventsStatusColumn();
     await ensureNotificationNodesRecipientEntityId();
 
@@ -148,8 +150,6 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       await connectWithRetry('smtp', async () => {
         await transporter.verify();
       });
-    } else {
-      console.log('smtp skipped (production)');
     }
   } catch (err) {
     console.error('Startup failed:', err.message);

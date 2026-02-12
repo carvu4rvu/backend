@@ -11,7 +11,6 @@ const ensureEventsStatusColumn = async () => {
         ALTER TABLE public.events
         ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'scheduled'
       `);
-      console.log('Added status column to events');
     }
   } catch (err) {
     console.warn('ensureEventsStatusColumn:', err.message);

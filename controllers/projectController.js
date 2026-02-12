@@ -1,266 +1,1365 @@
-const supabase = require('../config/supabaseClient');
+/**
+ * Project Controller - Student projects API
+ * Handles CRUD, feed, assets, share links, reviews, likes, favorites, ratings.
+ * Tables: projects, project_assets, project_asset_variants, project_metrics,
+ * project_ratings, project_likes, project_favorites, project_reviews,
+ * project_share_links, project_views.
+ */
 
-/** Compute average rating: (self_rating + admin_rating) / 2; if admin_rating null, use self_rating only */
-function averageRating(project) {
-  const self = project.self_rating != null ? Number(project.self_rating) : 0;
-  const admin = project.admin_rating != null ? Number(project.admin_rating) : null;
-  if (admin != null) return (self + admin) / 2;
-  return self;
+const pool = require('../config/db');
+const {
+  sendError,
+  sendNotFound,
+  sendValidationError,
+  sendAccessDenied,
+  sendCaughtError,
+} = require('../utils/apiErrorResponse');
+const crypto = require('crypto');
+
+const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC', 'LINK_ONLY'];
+const VALID_ASSET_TYPES = ['IMAGE', 'VIDEO'];
+const VALID_ASSET_ROLES = ['LOGO', 'COVER', 'GALLERY', 'VIDEO'];
+const VALID_PROJECT_STATUS = ['draft', 'submitted', 'approved', 'rejected', 'archived'];
+
+/** Ensure user owns project (by owner_usn or owner_user_id) */
+async function assertOwnership(client, projectId, userId, usn) {
+  const r = await client.query(
+    'SELECT owner_usn, owner_user_id FROM projects WHERE id = $1',
+    [projectId]
+  );
+  if (!r.rows.length) return { ok: false, error: 'not_found' };
+  const p = r.rows[0];
+  const matchUser = userId && p.owner_user_id && p.owner_user_id === userId;
+  const matchUsn = usn && p.owner_usn && p.owner_usn.toUpperCase() === usn.toUpperCase();
+  if (matchUser || matchUsn) return { ok: true };
+  return { ok: false, error: 'access_denied' };
+}
+
+/** Load project with assets, metrics, and optionally ownership flags */
+async function loadProject(client, projectId, options = {}) {
+  const { forUserId, includeRank } = options;
+  const projRes = await client.query(
+    `SELECT p.id, p.owner_usn, p.owner_user_id, p.title, p.short_description, p.description,
+      p.category, p.tags, p.visibility, p.hosted_url, p.github_url, p.mentor_name,
+      p.tech_stack, p.published_at, p.created_at, p.updated_at, p.priority, p.project_status
+     FROM projects p WHERE p.id = $1`,
+    [projectId]
+  );
+  if (!projRes.rows.length) return null;
+  const p = projRes.rows[0];
+
+  const [assetsRes, metricsRes, ratingsRes] = await Promise.all([
+    client.query(
+      'SELECT id, asset_type, asset_role, original_url, position FROM project_assets WHERE project_id = $1 ORDER BY position',
+      [projectId]
+    ),
+    client.query(
+      'SELECT views, likes, favorites, avg_rating, rating_count, comments FROM project_metrics WHERE project_id = $1',
+      [projectId]
+    ),
+    client.query(
+      'SELECT user_id, rating FROM project_ratings WHERE project_id = $1',
+      [projectId]
+    ),
+  ]);
+
+  const assets = assetsRes.rows || [];
+  const metrics = metricsRes.rows[0] || { views: 0, likes: 0, favorites: 0, avg_rating: 0, rating_count: 0, comments: 0 };
+  const ratings = ratingsRes.rows || [];
+
+  let isLiked = false;
+  let isFavorited = false;
+  let userRating = null;
+  if (forUserId) {
+    const [likeRes, favRes] = await Promise.all([
+      client.query('SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, forUserId]),
+      client.query('SELECT 1 FROM project_favorites WHERE project_id = $1 AND user_id = $2', [projectId, forUserId]),
+    ]);
+    isLiked = !!likeRes.rows.length;
+    isFavorited = !!favRes.rows.length;
+    const ur = ratings.find((r) => r.user_id === forUserId);
+    userRating = ur ? ur.rating : null;
+  }
+
+  const project = {
+    id: p.id,
+    owner_usn: p.owner_usn,
+    owner_user_id: p.owner_user_id,
+    title: p.title,
+    short_description: p.short_description,
+    description: p.description,
+    category: p.category,
+    tags: Array.isArray(p.tags) ? p.tags : [],
+    visibility: p.visibility || 'PRIVATE',
+    hosted_url: p.hosted_url,
+    github_url: p.github_url,
+    mentor_name: p.mentor_name,
+    tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+    published_at: p.published_at,
+    created_at: p.created_at,
+    updated_at: p.updated_at,
+    priority: p.priority,
+    project_status: p.project_status,
+    assets: assets.map((a) => ({
+      id: a.id,
+      asset_type: a.asset_type,
+      asset_role: a.asset_role,
+      original_url: a.original_url,
+      position: a.position,
+    })),
+    views: metrics.views ?? 0,
+    likes: metrics.likes ?? 0,
+    favorites: metrics.favorites ?? 0,
+    avg_rating: Number(metrics.avg_rating ?? 0),
+    rating_count: metrics.rating_count ?? 0,
+    comments: metrics.comments ?? 0,
+  };
+  if (forUserId) {
+    project.is_liked = isLiked;
+    project.is_favorited = isFavorited;
+    project.user_rating = userRating;
+  }
+  return project;
 }
 
 /**
- * GET /api/placement/projects (admin)
- * List all student projects for admin: view, approve, rate.
+ * List projects
+ * GET /api/projects?usn=...&profile=1
+ * - No params: list projects for current user (student)
+ * - usn + profile=1: list for profile view (any non-private, ordered by priority)
  */
-exports.getAllProjects = async (req, res) => {
+exports.list = async (req, res) => {
   try {
-    const { is_approved, visibility } = req.query;
-    let query = supabase.from('student_projects').select('*').order('created_at', { ascending: false });
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    const queryUsn = (req.query.usn || '').trim().toUpperCase();
+    const isProfile = req.query.profile === '1' || req.query.profile === 'true';
 
-    if (is_approved !== undefined && is_approved !== '') {
-      const val = is_approved === 'true';
-      query = query.eq('is_approved', val);
+    const client = await pool.connect();
+    try {
+      let targetUsn = queryUsn || usn;
+      if (!targetUsn && !userId) {
+        return sendError(res, 401, 'Authentication required');
+      }
+      if (!targetUsn && userId) {
+        const uRes = await client.query('SELECT usn FROM user_login WHERE id = $1', [userId]);
+        targetUsn = uRes.rows[0]?.usn ? uRes.rows[0].usn.toUpperCase() : null;
+      }
+      if (!targetUsn) {
+        return res.json([]);
+      }
+
+      let sql = `SELECT p.id, p.owner_usn, p.owner_user_id, p.title, p.short_description, p.description,
+        p.category, p.visibility, p.hosted_url, p.github_url, p.mentor_name, p.tech_stack,
+        p.published_at, p.created_at, p.updated_at, p.priority, p.project_status
+        FROM projects p WHERE p.owner_usn = $1`;
+      const params = [targetUsn];
+
+      if (isProfile) {
+        sql += ` AND p.visibility != 'PRIVATE' ORDER BY p.priority ASC NULLS LAST, p.published_at DESC NULLS LAST, p.created_at DESC`;
+      } else {
+        sql += ` ORDER BY p.priority ASC NULLS LAST, p.created_at DESC`;
+      }
+
+      const projRes = await client.query(sql, params);
+      const rows = projRes.rows || [];
+      const projectIds = rows.map((r) => r.id);
+      let assets = [];
+      let metricsByProj = {};
+      if (projectIds.length > 0) {
+        const [assetRes, metricRes] = await Promise.all([
+          client.query(
+            'SELECT project_id, original_url, position FROM project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+            [projectIds]
+          ),
+          client.query(
+            'SELECT project_id, views, likes, favorites, avg_rating, rating_count FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+            [projectIds]
+          ),
+        ]);
+        assets = assetRes.rows || [];
+        (metricRes.rows || []).forEach((m) => {
+          metricsByProj[m.project_id] = m;
+        });
+      }
+
+      const byProject = {};
+      assets.forEach((a) => {
+        if (!byProject[a.project_id]) byProject[a.project_id] = [];
+        byProject[a.project_id].push(a.original_url);
+      });
+
+      const list = rows.map((p) => {
+        const m = metricsByProj[p.id] || {};
+        return {
+          id: p.id,
+          owner_usn: p.owner_usn,
+          owner_user_id: p.owner_user_id,
+          title: p.title,
+          short_description: p.short_description,
+          description: p.description,
+          category: p.category,
+          visibility: p.visibility || 'PRIVATE',
+          hosted_url: p.hosted_url,
+          github_url: p.github_url,
+          mentor_name: p.mentor_name,
+          tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+          published_at: p.published_at,
+          created_at: p.created_at,
+          updated_at: p.updated_at,
+          priority: p.priority,
+          project_status: p.project_status,
+          project_snaps: byProject[p.id] || [],
+          views: m.views ?? 0,
+          likes: m.likes ?? 0,
+          favorites: m.favorites ?? 0,
+          avg_rating: Number(m.avg_rating ?? 0),
+          rating_count: m.rating_count ?? 0,
+        };
+      });
+
+      res.json(list);
+    } finally {
+      client.release();
     }
-    if (visibility) query = query.eq('visibility', visibility);
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    const withAverage = (data || []).map((p) => ({
-      ...p,
-      average_rating: averageRating(p),
-    }));
-
-    res.json(withAverage);
   } catch (error) {
-    console.error('getAllProjects:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to list projects.');
   }
 };
 
 /**
- * GET /api/placement/projects/public (no auth)
- * Public list for showcase: approved, PUBLIC only. Optional ?best=true for top-rated.
+ * Feed - public projects ranked (score | newest | popular)
+ * GET /api/projects/feed?limit=20&sort=score|newest|popular
  */
-exports.getPublicProjects = async (req, res) => {
+exports.feed = async (req, res) => {
   try {
-    const { best, limit } = req.query;
-    let query = supabase
-      .from('student_projects')
-      .select('*')
-      .eq('visibility', 'PUBLIC')
-      .eq('is_approved', true)
-      .order('created_at', { ascending: false });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const sort = req.query.sort || 'score';
 
-    const { data: rows, error } = await query;
-    if (error) throw error;
+    const client = await pool.connect();
+    try {
+      let orderBy = 'COALESCE(m.views, 0) DESC, COALESCE(m.likes, 0) DESC, p.published_at DESC NULLS LAST';
+      if (sort === 'newest') {
+        orderBy = 'p.published_at DESC NULLS LAST, p.id DESC';
+      } else if (sort === 'popular') {
+        orderBy = 'COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC, COALESCE(m.avg_rating, 0) DESC';
+      }
+      // score = blueprint-style discovery (default: views + likes weighted)
 
-    const withAverage = (rows || []).map((p) => ({
-      ...p,
-      average_rating: averageRating(p),
-    }));
+      const projRes = await client.query(
+        `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
+          p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at
+         FROM projects p
+         LEFT JOIN project_metrics m ON m.project_id = p.id
+         WHERE p.visibility = 'PUBLIC' AND p.project_status = 'approved' AND p.published_at IS NOT NULL
+         ORDER BY ${orderBy}
+         LIMIT $1`,
+        [limit]
+      );
+      const rows = projRes.rows || [];
+      const projectIds = rows.map((r) => r.id);
 
-    // Sort by average_rating desc for "best"
-    withAverage.sort((a, b) => (b.average_rating || 0) - (a.average_rating || 0));
+      let coverByProj = {};
+      if (projectIds.length > 0) {
+        const assetRes = await client.query(
+          `SELECT DISTINCT ON (project_id) project_id, original_url
+           FROM project_assets
+           WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
+           ORDER BY project_id, position`,
+          [projectIds]
+        );
+        (assetRes.rows || []).forEach((a) => {
+          coverByProj[a.project_id] = a.original_url;
+        });
+      }
 
-    let result = withAverage;
-    if (best === 'true') {
-      result = withAverage.slice(0, Math.min(10, parseInt(limit, 10) || 10));
-    } else if (limit) {
-      result = withAverage.slice(0, Math.min(100, parseInt(limit, 10) || 50));
+      const feed = rows.map((p, i) => ({
+        id: p.id,
+        owner_usn: p.owner_usn,
+        title: p.title,
+        short_description: p.short_description,
+        description: p.description,
+        category: p.category,
+        hosted_url: p.hosted_url,
+        github_url: p.github_url,
+        mentor_name: p.mentor_name,
+        tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        published_at: p.published_at,
+        cover_url: coverByProj[p.id] || null,
+        rank: i + 1,
+      }));
+
+      // Attach metrics for each
+      const metricRes = await client.query(
+        'SELECT project_id, views, likes, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+        [projectIds]
+      );
+      const metricMap = {};
+      (metricRes.rows || []).forEach((m) => {
+        metricMap[m.project_id] = m;
+      });
+      feed.forEach((f) => {
+        const m = metricMap[f.id] || {};
+        f.views = m.views ?? 0;
+        f.likes = m.likes ?? 0;
+        f.avg_rating = Number(m.avg_rating ?? 0);
+      });
+
+      res.json(feed);
+    } finally {
+      client.release();
     }
-
-    res.json(result);
   } catch (error) {
-    console.error('getPublicProjects:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to load feed.');
   }
 };
 
 /**
- * PATCH /api/placement/projects/:id (admin)
- * Update admin_rating and/or is_approved.
+ * Get one project by id
+ * GET /api/projects/:id?include_rank=true
  */
-exports.updateProject = async (req, res) => {
+exports.getOne = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { admin_rating, is_approved } = req.body;
-
-    const update = { updated_at: new Date() };
-    if (typeof is_approved === 'boolean') update.is_approved = is_approved;
-    if (admin_rating !== undefined && admin_rating !== null) {
-      const r = Number(admin_rating);
-      if (r < 1 || r > 10) return res.status(400).json({ message: 'admin_rating must be between 1 and 10' });
-      update.admin_rating = r;
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
     }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const includeRank = req.query.include_rank === 'true';
 
-    const { data, error } = await supabase
-      .from('student_projects')
-      .update(update)
-      .eq('id', id)
-      .select()
-      .single();
+    const client = await pool.connect();
+    try {
+      const project = await loadProject(client, projectId, { forUserId: userId });
+      if (!project) {
+        return sendNotFound(res, 'Project not found.');
+      }
 
-    if (error) throw error;
-    if (!data) return res.status(404).json({ message: 'Project not found' });
+      const visibility = project.visibility || 'PRIVATE';
+      const status = project.project_status;
+      const isOwner = userId && (project.owner_user_id === userId || req.user?.usn?.toUpperCase() === project.owner_usn?.toUpperCase());
 
-    res.json({ ...data, average_rating: averageRating(data) });
+      if (!isOwner) {
+        if (visibility === 'PRIVATE') {
+          return sendNotFound(res, 'Project not found.');
+        }
+        if (status !== 'approved' && !project.published_at) {
+          return sendNotFound(res, 'Project not found.');
+        }
+      }
+
+      if (includeRank && visibility === 'PUBLIC' && status === 'approved') {
+        const rankRes = await client.query(
+          `SELECT COUNT(*)::int as total FROM projects p
+           JOIN project_metrics m ON m.project_id = p.id
+           WHERE p.visibility = 'PUBLIC' AND p.project_status = 'approved' AND p.published_at IS NOT NULL
+           AND (m.views > (SELECT views FROM project_metrics WHERE project_id = $1)
+                OR (m.views = (SELECT views FROM project_metrics WHERE project_id = $1) AND p.id <= $1))`,
+          [projectId]
+        );
+        project.rank = rankRes.rows[0]?.total ?? 0;
+        const totalRes = await client.query(
+          `SELECT COUNT(*)::int as total FROM projects WHERE visibility = 'PUBLIC' AND project_status = 'approved' AND published_at IS NOT NULL`
+        );
+        project.total_public = totalRes.rows[0]?.total ?? 0;
+      }
+
+      res.json(project);
+    } finally {
+      client.release();
+    }
   } catch (error) {
-    console.error('updateProject:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to load project.');
   }
 };
 
 /**
- * GET /api/placement/projects/alumni (alumni)
- * Get approved public projects for alumni view with their like status
+ * Create project
+ * POST /api/projects
  */
-exports.getAlumniProjects = async (req, res) => {
+exports.create = async (req, res) => {
   try {
-    const email = req.user?.email?.trim().toLowerCase();
-    
-    // Get alumni to check liked projects
-    let likedProjectIds = [];
-    if (email) {
-      const { data: alumni } = await supabase
-        .from('alumni')
-        .select('liked_project_ids')
-        .ilike('personal_email', email)
-        .maybeSingle();
-      
-      likedProjectIds = alumni?.liked_project_ids || [];
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId || !usn) {
+      return sendError(res, 403, 'Only students can create projects.');
     }
 
-    // Get approved public projects
-    const { data: projects, error } = await supabase
-      .from('student_projects')
-      .select('*')
-      .eq('visibility', 'PUBLIC')
-      .eq('is_approved', true)
-      .order('created_at', { ascending: false });
+    const body = req.body || {};
+    const title = (body.title || '').trim();
+    if (!title) {
+      return sendValidationError(res, 'Title is required.', { title: 'Title is required.' });
+    }
 
-    if (error) throw error;
+    const short_description = (body.short_description || '').trim() || title.slice(0, 200);
+    const description = (body.description || '').trim() || null;
+    const category = (body.category || '').trim() || null;
+    const tags = Array.isArray(body.tags) ? body.tags : [];
+    const visibility = (body.visibility || 'PRIVATE').toString().toUpperCase().trim();
+    const hosted_url = (body.hosted_url || '').trim() || null;
+    const github_url = (body.github_url || '').trim() || null;
+    const mentor_name = (body.mentor_name || '').trim() || null;
+    const tech_stack = Array.isArray(body.tech_stack) ? body.tech_stack : [];
+    const priority = body.priority != null ? parseInt(body.priority, 10) : null;
 
-    // Add average rating and like status
-    const withExtras = (projects || []).map((p) => ({
-      ...p,
-      average_rating: averageRating(p),
-      is_liked: likedProjectIds.includes(p.id),
-    }));
+    if (!VALID_VISIBILITY.includes(visibility)) {
+      return sendValidationError(res, 'Invalid visibility.', { visibility: `Must be one of: ${VALID_VISIBILITY.join(', ')}` });
+    }
 
-    res.json(withExtras);
+    const client = await pool.connect();
+    try {
+      const insertRes = await client.query(
+        `INSERT INTO projects (owner_usn, owner_user_id, title, short_description, description, category, tags, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, project_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'draft')
+         RETURNING id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, project_status, created_at`,
+        [
+          usn.toUpperCase(),
+          userId,
+          title,
+          short_description,
+          description,
+          category,
+          tags,
+          visibility,
+          hosted_url,
+          github_url,
+          mentor_name,
+          tech_stack,
+          Number.isNaN(priority) ? null : priority,
+        ]
+      );
+      const proj = insertRes.rows[0];
+
+      await client.query(
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
+         VALUES ($1, 0, 0, 0, 0, 0, 0)
+         ON CONFLICT (project_id) DO NOTHING`,
+        [proj.id]
+      );
+
+      res.status(201).json({
+        id: proj.id,
+        owner_usn: proj.owner_usn,
+        owner_user_id: proj.owner_user_id,
+        title: proj.title,
+        short_description: proj.short_description,
+        description: proj.description,
+        category: proj.category,
+        tags: proj.tags || [],
+        visibility: proj.visibility,
+        hosted_url: proj.hosted_url,
+        github_url: proj.github_url,
+        mentor_name: proj.mentor_name,
+        tech_stack: proj.tech_stack || [],
+        priority: proj.priority,
+        project_status: proj.project_status,
+        created_at: proj.created_at,
+      });
+    } finally {
+      client.release();
+    }
   } catch (error) {
-    console.error('getAlumniProjects:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to create project.');
   }
 };
 
 /**
- * POST /api/placement/projects/:id/like (alumni)
- * Toggle like on a project
+ * Update project
+ * PATCH /api/projects/:id
  */
-exports.toggleProjectLike = async (req, res) => {
+exports.update = async (req, res) => {
   try {
-    const { id } = req.params;
-    const projectId = parseInt(id, 10);
-    const email = req.user?.email?.trim().toLowerCase();
-
-    if (!email) {
-      return res.status(403).json({ message: 'Not authenticated as alumni' });
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
     }
 
-    // Get alumni
-    const { data: alumni, error: alumniError } = await supabase
-      .from('alumni')
-      .select('id, liked_project_ids')
-      .ilike('personal_email', email)
-      .maybeSingle();
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'You can only edit your own projects.');
+      }
 
-    if (alumniError) throw alumniError;
-    if (!alumni) return res.status(404).json({ message: 'Alumni not found' });
+      const body = req.body || {};
+      const updates = [];
+      const values = [];
+      let idx = 1;
 
-    const likedIds = alumni.liked_project_ids || [];
-    const isCurrentlyLiked = likedIds.includes(projectId);
+      const allowed = ['title', 'short_description', 'description', 'category', 'tags', 'visibility', 'hosted_url', 'github_url', 'mentor_name', 'tech_stack', 'priority'];
+      for (const field of allowed) {
+        if (body[field] === undefined) continue;
+        if (field === 'tags' || field === 'tech_stack') {
+          updates.push(`${field} = $${idx}`);
+          values.push(Array.isArray(body[field]) ? body[field] : []);
+        } else if (field === 'visibility') {
+          const v = (body[field] || 'PRIVATE').toString().toUpperCase().trim();
+          if (!VALID_VISIBILITY.includes(v)) continue;
+          updates.push(`${field} = $${idx}`);
+          values.push(v);
+        } else if (field === 'priority') {
+          const p = body[field];
+          if (p !== null && p !== undefined) {
+            updates.push(`${field} = $${idx}`);
+            values.push(parseInt(body[field], 10));
+          }
+        } else {
+          updates.push(`${field} = $${idx}`);
+          values.push(typeof body[field] === 'string' ? body[field].trim() : body[field]);
+        }
+        idx++;
+      }
 
-    let newLikedIds;
-    let likeDelta;
+      if (updates.length === 0) {
+        const project = await loadProject(client, projectId, { forUserId: userId });
+        return res.json(project);
+      }
 
-    if (isCurrentlyLiked) {
-      // Unlike
-      newLikedIds = likedIds.filter((lid) => lid !== projectId);
-      likeDelta = -1;
-    } else {
-      // Like
-      newLikedIds = [...likedIds, projectId];
-      likeDelta = 1;
+      updates.push(`updated_at = NOW()`);
+      values.push(projectId);
+      await client.query(
+        `UPDATE projects SET ${updates.join(', ')} WHERE id = $${idx}`,
+        values
+      );
+
+      const project = await loadProject(client, projectId, { forUserId: userId });
+      res.json(project);
+    } finally {
+      client.release();
     }
-
-    // Update alumni liked_project_ids
-    const { error: updateAlumniError } = await supabase
-      .from('alumni')
-      .update({ liked_project_ids: newLikedIds, updated_at: new Date() })
-      .eq('id', alumni.id);
-
-    if (updateAlumniError) throw updateAlumniError;
-
-    // Update project likes_count
-    const { data: project, error: getProjectError } = await supabase
-      .from('student_projects')
-      .select('likes_count')
-      .eq('id', projectId)
-      .single();
-
-    if (getProjectError) throw getProjectError;
-
-    const newLikesCount = Math.max(0, (project?.likes_count || 0) + likeDelta);
-
-    const { error: updateProjectError } = await supabase
-      .from('student_projects')
-      .update({ likes_count: newLikesCount })
-      .eq('id', projectId);
-
-    if (updateProjectError) throw updateProjectError;
-
-    res.json({ 
-      is_liked: !isCurrentlyLiked, 
-      likes_count: newLikesCount 
-    });
   } catch (error) {
-    console.error('toggleProjectLike:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to update project.');
   }
 };
 
 /**
- * POST /api/placement/projects/:id/view (public or authenticated)
- * Increment view count
+ * Delete project
+ * DELETE /api/projects/:id
  */
-exports.incrementProjectView = async (req, res) => {
+exports.delete = async (req, res) => {
   try {
-    const { id } = req.params;
-    const projectId = parseInt(id, 10);
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
 
-    const { data: project, error: getError } = await supabase
-      .from('student_projects')
-      .select('views_count')
-      .eq('id', projectId)
-      .single();
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'You can only delete your own projects.');
+      }
 
-    if (getError) throw getError;
-    if (!project) return res.status(404).json({ message: 'Project not found' });
+      await client.query('DELETE FROM project_asset_variants WHERE asset_id IN (SELECT id FROM project_assets WHERE project_id = $1)', [projectId]);
+      await client.query('DELETE FROM project_assets WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_favorites WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_likes WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_ratings WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_reviews WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_share_links WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_views WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_metrics WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM projects WHERE id = $1', [projectId]);
 
-    const newViewsCount = (project.views_count || 0) + 1;
-
-    const { error: updateError } = await supabase
-      .from('student_projects')
-      .update({ views_count: newViewsCount })
-      .eq('id', projectId);
-
-    if (updateError) throw updateError;
-
-    res.json({ views_count: newViewsCount });
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
   } catch (error) {
-    console.error('incrementProjectView:', error);
-    res.status(500).json({ message: error.message || 'Server error' });
+    return sendCaughtError(res, error, 'Failed to delete project.');
+  }
+};
+
+/**
+ * Submit project for approval
+ * PATCH /api/projects/:id/submit
+ */
+exports.submit = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can submit.');
+      }
+
+      const r = await client.query('SELECT project_status FROM projects WHERE id = $1', [projectId]);
+      if (!r.rows.length) return sendNotFound(res, 'Project not found.');
+      const status = r.rows[0].project_status;
+
+      if (status !== 'draft' && status !== 'rejected') {
+        return sendValidationError(res, 'Project can only be submitted when in draft or rejected state.');
+      }
+
+      await client.query(
+        "UPDATE projects SET project_status = 'submitted', updated_at = NOW() WHERE id = $1",
+        [projectId]
+      );
+
+      const project = await loadProject(client, projectId, { forUserId: userId });
+      res.json(project);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to submit project.');
+  }
+};
+
+/**
+ * Publish project (requires approved status)
+ * PATCH /api/projects/:id/publish
+ */
+exports.publish = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can publish.');
+      }
+
+      const r = await client.query('SELECT project_status FROM projects WHERE id = $1', [projectId]);
+      if (!r.rows.length) return sendNotFound(res, 'Project not found.');
+      const status = r.rows[0].project_status;
+
+      if (status !== 'approved') {
+        return sendValidationError(res, 'Project must be approved by admin before publishing.');
+      }
+
+      await client.query(
+        "UPDATE projects SET visibility = 'PUBLIC', published_at = NOW(), updated_at = NOW() WHERE id = $1",
+        [projectId]
+      );
+
+      const project = await loadProject(client, projectId, { forUserId: userId });
+      res.json(project);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to publish project.');
+  }
+};
+
+/**
+ * Add asset
+ * POST /api/projects/:id/assets
+ */
+exports.addAsset = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const body = req.body || {};
+    const original_url = (body.original_url || '').trim();
+    if (!original_url) {
+      return sendValidationError(res, 'original_url is required.', { original_url: 'Asset URL is required.' });
+    }
+    const asset_type = (body.asset_type || 'IMAGE').toUpperCase();
+    const asset_role = (body.asset_role || 'GALLERY').toUpperCase();
+    const position = body.position != null ? parseInt(body.position, 10) : 0;
+    const width = body.width != null ? parseInt(body.width, 10) : null;
+    const height = body.height != null ? parseInt(body.height, 10) : null;
+    const file_size_kb = body.file_size_kb != null ? parseInt(body.file_size_kb, 10) : null;
+    const mime_type = (body.mime_type || '').trim() || null;
+
+    if (!VALID_ASSET_TYPES.includes(asset_type)) {
+      return sendValidationError(res, 'Invalid asset_type.', { asset_type: `Must be one of: ${VALID_ASSET_TYPES.join(', ')}` });
+    }
+    if (!VALID_ASSET_ROLES.includes(asset_role)) {
+      return sendValidationError(res, 'Invalid asset_role.', { asset_role: `Must be one of: ${VALID_ASSET_ROLES.join(', ')}` });
+    }
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can add assets.');
+      }
+
+      const insertRes = await client.query(
+        `INSERT INTO project_assets (project_id, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, project_id, asset_type, asset_role, original_url, position`,
+        [projectId, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position]
+      );
+      const asset = insertRes.rows[0];
+      res.status(201).json(asset);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to add asset.');
+  }
+};
+
+/**
+ * Delete asset
+ * DELETE /api/projects/:id/assets/:assetId
+ */
+exports.deleteAsset = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const assetId = parseInt(req.params.assetId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(assetId)) {
+      return sendValidationError(res, 'Invalid project or asset id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can delete assets.');
+      }
+
+      const checkRes = await client.query(
+        'SELECT id FROM project_assets WHERE project_id = $1 AND id = $2',
+        [projectId, assetId]
+      );
+      if (!checkRes.rows.length) {
+        return sendNotFound(res, 'Asset not found.');
+      }
+
+      await client.query('DELETE FROM project_asset_variants WHERE asset_id = $1', [assetId]);
+      await client.query('DELETE FROM project_assets WHERE id = $1', [assetId]);
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete asset.');
+  }
+};
+
+/**
+ * Create share link
+ * POST /api/projects/:id/share
+ */
+exports.createShareLink = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const expires_in_hours = req.body?.expires_in_hours != null ? parseInt(req.body.expires_in_hours, 10) : 168; // 7 days default
+    const expiresAt = expires_in_hours > 0
+      ? new Date(Date.now() + expires_in_hours * 60 * 60 * 1000)
+      : null;
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can create share links.');
+      }
+
+      const shareToken = crypto.randomBytes(24).toString('hex');
+      await client.query(
+        `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active)
+         VALUES ($1, $2, $3, true)`,
+        [projectId, shareToken, expiresAt]
+      );
+
+      const path = `/projects/share/${shareToken}`;
+      res.status(201).json({
+        share_token: shareToken,
+        url: path,
+        expires_at: expiresAt ? expiresAt.toISOString() : null,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to create share link.');
+  }
+};
+
+/**
+ * Get project by share token (public)
+ * GET /api/projects/share/:token
+ */
+exports.getByShareToken = async (req, res) => {
+  try {
+    const token = (req.params.token || '').trim();
+    if (!token) {
+      return sendNotFound(res, 'Share link not found.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const linkRes = await client.query(
+        `SELECT psl.project_id, psl.expires_at, psl.is_active
+         FROM project_share_links psl
+         WHERE psl.share_token = $1`,
+        [token]
+      );
+      if (!linkRes.rows.length) {
+        return sendNotFound(res, 'Invalid or expired share link.');
+      }
+      const link = linkRes.rows[0];
+      if (!link.is_active) {
+        return sendNotFound(res, 'Share link is no longer active.');
+      }
+      if (link.expires_at && new Date(link.expires_at) < new Date()) {
+        return sendNotFound(res, 'Share link has expired.');
+      }
+
+      const projectId = link.project_id;
+      const project = await loadProject(client, projectId, {});
+      if (!project) {
+        return sendNotFound(res, 'Project not found.');
+      }
+
+      res.json(project);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to load shared project.');
+  }
+};
+
+/**
+ * Add review
+ * POST /api/projects/:id/reviews
+ */
+exports.addReview = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const review_text = (req.body?.review_text || '').trim();
+    if (!review_text) {
+      return sendValidationError(res, 'review_text is required.', { review_text: 'Review text is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, owner_user_id, visibility, project_status FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      if (!canView) {
+        return sendNotFound(res, 'Project not found.');
+      }
+
+      const ownerUserId = p.owner_user_id;
+      const insertRes = await client.query(
+        `INSERT INTO project_reviews (project_id, reviewer_id, owner_id, review_text)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, project_id, reviewer_id, review_text, review_created_at`,
+        [projectId, userId, ownerUserId, review_text]
+      );
+
+      await client.query(
+        `UPDATE project_metrics SET comments = comments + 1, last_updated = NOW() WHERE project_id = $1`,
+        [projectId]
+      );
+
+      res.status(201).json(insertRes.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to add review.');
+  }
+};
+
+/**
+ * Reply to review (owner only)
+ * PATCH /api/projects/:id/reviews/:reviewId
+ */
+exports.replyReview = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const reviewId = parseInt(req.params.reviewId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(reviewId)) {
+      return sendValidationError(res, 'Invalid project or review id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    const usn = req.user?.usn;
+    if (!userId && !usn) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const reply_text = (req.body?.reply_text || '').trim();
+    if (!reply_text) {
+      return sendValidationError(res, 'reply_text is required.', { reply_text: 'Reply text is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const ownership = await assertOwnership(client, projectId, userId, usn);
+      if (!ownership.ok) {
+        if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
+        return sendAccessDenied(res, 'Only owner can reply to reviews.');
+      }
+
+      const updateRes = await client.query(
+        `UPDATE project_reviews SET reply_text = $1, reply_created_at = NOW() WHERE id = $2 AND project_id = $3
+         RETURNING id, reply_text, reply_created_at`,
+        [reply_text, reviewId, projectId]
+      );
+      if (!updateRes.rows.length) {
+        return sendNotFound(res, 'Review not found.');
+      }
+      res.json(updateRes.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to reply to review.');
+  }
+};
+
+/**
+ * Toggle like
+ * POST /api/projects/:id/like
+ */
+exports.toggleLike = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, owner_user_id, visibility, project_status FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      if (!canView) {
+        return sendNotFound(res, 'Project not found.');
+      }
+
+      const existRes = await client.query(
+        'SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2',
+        [projectId, userId]
+      );
+      const existed = !!existRes.rows.length;
+
+      if (existed) {
+        await client.query('DELETE FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, userId]);
+        await client.query(
+          'UPDATE project_metrics SET likes = GREATEST(0, likes - 1), last_updated = NOW() WHERE project_id = $1',
+          [projectId]
+        );
+      } else {
+        await client.query(
+          'INSERT INTO project_likes (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [projectId, userId]
+        );
+        await client.query(
+          'UPDATE project_metrics SET likes = likes + 1, last_updated = NOW() WHERE project_id = $1',
+          [projectId]
+        );
+      }
+
+      const metricRes = await client.query(
+        'SELECT likes FROM project_metrics WHERE project_id = $1',
+        [projectId]
+      );
+      const likes = metricRes.rows[0]?.likes ?? 0;
+      const newLiked = !existed;
+
+      res.json({ liked: newLiked, likes });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to toggle like.');
+  }
+};
+
+/**
+ * Toggle favorite
+ * POST /api/projects/:id/favorite
+ */
+exports.toggleFavorite = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, visibility, project_status FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      if (!canView) {
+        return sendNotFound(res, 'Project not found.');
+      }
+
+      const existRes = await client.query(
+        'SELECT 1 FROM project_favorites WHERE project_id = $1 AND user_id = $2',
+        [projectId, userId]
+      );
+      const existed = !!existRes.rows.length;
+
+      if (existed) {
+        await client.query('DELETE FROM project_favorites WHERE project_id = $1 AND user_id = $2', [projectId, userId]);
+        await client.query(
+          'UPDATE project_metrics SET favorites = GREATEST(0, favorites - 1), last_updated = NOW() WHERE project_id = $1',
+          [projectId]
+        );
+      } else {
+        await client.query(
+          'INSERT INTO project_favorites (project_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [projectId, userId]
+        );
+        await client.query(
+          'UPDATE project_metrics SET favorites = favorites + 1, last_updated = NOW() WHERE project_id = $1',
+          [projectId]
+        );
+      }
+
+      const metricRes = await client.query(
+        'SELECT favorites FROM project_metrics WHERE project_id = $1',
+        [projectId]
+      );
+      const favorites = metricRes.rows[0]?.favorites ?? 0;
+      const newFavorited = !existed;
+
+      res.json({ favorited: newFavorited, favorites });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to toggle favorite.');
+  }
+};
+
+/**
+ * Rate project (1-5)
+ * PUT /api/projects/:id/rate
+ */
+exports.rate = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const rating = req.body?.rating != null ? parseInt(req.body.rating, 10) : null;
+    if (rating == null || rating < 1 || rating > 5) {
+      return sendValidationError(res, 'Rating must be between 1 and 5.', { rating: 'Rating must be 1-5.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, visibility, project_status FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      if (!canView) {
+        return sendNotFound(res, 'Project not found.');
+      }
+
+      await client.query(
+        `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
+         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
+        [projectId, userId, rating]
+      );
+
+      const aggRes = await client.query(
+        `UPDATE project_metrics SET
+          avg_rating = (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1),
+          rating_count = (SELECT COUNT(*) FROM project_ratings WHERE project_id = $1),
+          last_updated = NOW()
+         WHERE project_id = $1
+         RETURNING avg_rating, rating_count`,
+        [projectId]
+      );
+      const agg = aggRes.rows[0] || { avg_rating: 0, rating_count: 0 };
+
+      res.json({
+        rating,
+        avg_rating: Number(agg.avg_rating),
+        rating_count: agg.rating_count,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to rate project.');
+  }
+};
+
+/**
+ * Admin: list all projects
+ * GET /api/admin/projects?search=...&project_status=...
+ */
+exports.adminList = async (req, res) => {
+  try {
+    const search = (req.query.search || '').trim();
+    const projectStatus = (req.query.project_status || '').trim().toLowerCase();
+
+    const client = await pool.connect();
+    try {
+      let sql = `SELECT p.id, p.owner_usn as usn, p.owner_user_id, p.title, p.short_description as one_line_description,
+        p.description as full_description, p.category as genre, p.visibility, p.hosted_url as hosted_link,
+        p.github_url as github_repo, p.mentor_name, p.tech_stack as technologies, p.project_status,
+        p.priority, p.published_at, p.created_at, p.updated_at
+        FROM projects p WHERE 1=1`;
+      const params = [];
+      let idx = 1;
+
+      if (search) {
+        sql += ` AND (p.title ILIKE $${idx} OR p.owner_usn ILIKE $${idx} OR p.category ILIKE $${idx})`;
+        params.push(`%${search}%`);
+        idx++;
+      }
+      if (projectStatus && VALID_PROJECT_STATUS.includes(projectStatus)) {
+        sql += ` AND p.project_status = $${idx}`;
+        params.push(projectStatus);
+        idx++;
+      }
+
+      sql += ` ORDER BY p.created_at DESC`;
+
+      const projRes = await client.query(sql, params);
+      const rows = projRes.rows || [];
+      const projectIds = rows.map((r) => r.id);
+
+      let assets = [];
+      let metricsByProj = {};
+      let ratingsByProj = {};
+      if (projectIds.length > 0) {
+        const [assetRes, metricRes, ratingRes] = await Promise.all([
+          client.query(
+            'SELECT project_id, original_url, position FROM project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+            [projectIds]
+          ),
+          client.query(
+            'SELECT project_id, views, likes, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+            [projectIds]
+          ),
+          client.query(
+            'SELECT project_id, user_id, rating FROM project_ratings WHERE project_id = ANY($1::bigint[])',
+            [projectIds]
+          ),
+        ]);
+        assets = assetRes.rows || [];
+        (metricRes.rows || []).forEach((m) => {
+          metricsByProj[m.project_id] = m;
+        });
+        (ratingRes.rows || []).forEach((r) => {
+          if (!ratingsByProj[r.project_id]) ratingsByProj[r.project_id] = [];
+          ratingsByProj[r.project_id].push({ user_id: r.user_id, rating: r.rating });
+        });
+      }
+
+      const byProject = {};
+      assets.forEach((a) => {
+        if (!byProject[a.project_id]) byProject[a.project_id] = [];
+        byProject[a.project_id].push(a.original_url);
+      });
+
+      const list = rows.map((p) => {
+        const m = metricsByProj[p.id] || {};
+        const ratings = ratingsByProj[p.id] || [];
+        const ownerRating = ratings.find((r) => r.user_id === p.owner_user_id);
+        const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
+        const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
+
+        let avgRating = Number(m.avg_rating ?? 0);
+        if (ownerRating && adminRating != null) {
+          avgRating = (ownerRating.rating + adminRating) / 2;
+        } else if (ownerRating) {
+          avgRating = ownerRating.rating;
+        }
+
+        return {
+          id: p.id,
+          usn: p.usn,
+          title: p.title,
+          one_line_description: p.one_line_description,
+          full_description: p.full_description,
+          genre: p.genre,
+          visibility: p.visibility,
+          hosted_link: p.hosted_link,
+          github_repo: p.github_repo,
+          mentor_name: p.mentor_name,
+          technologies: Array.isArray(p.technologies) ? p.technologies : [],
+          project_status: p.project_status,
+          project_snaps: byProject[p.id] || [],
+          views_count: m.views ?? 0,
+          likes_count: m.likes ?? 0,
+          average_rating: avgRating,
+          self_rating: ownerRating ? ownerRating.rating : null,
+          admin_rating: adminRating,
+          is_approved: p.project_status === 'approved',
+        };
+      });
+
+      res.json(list);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to list projects.');
+  }
+};
+
+/**
+ * Admin: update project (status, admin_rating)
+ * PATCH /api/admin/projects/:id
+ */
+exports.adminUpdate = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const body = req.body || {};
+    let projectStatus = body.project_status;
+    if (projectStatus === undefined && body.is_approved !== undefined) {
+      projectStatus = body.is_approved ? 'approved' : 'rejected';
+    }
+    const adminRating = body.admin_rating != null ? Math.min(5, Math.max(1, Math.round(Number(body.admin_rating)))) : null;
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, owner_user_id FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+
+      if (projectStatus && VALID_PROJECT_STATUS.includes(projectStatus)) {
+        await client.query(
+          'UPDATE projects SET project_status = $1, updated_at = NOW() WHERE id = $2',
+          [projectStatus, projectId]
+        );
+      }
+
+      if (adminRating != null) {
+        await client.query(
+          `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
+           ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
+          [projectId, userId, adminRating]
+        );
+        await client.query(
+          `UPDATE project_metrics SET
+            avg_rating = (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1),
+            rating_count = (SELECT COUNT(*) FROM project_ratings WHERE project_id = $1),
+            last_updated = NOW()
+           WHERE project_id = $1`,
+          [projectId]
+        );
+      }
+
+      const project = await loadProject(client, projectId, {});
+      res.json(project);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to update project.');
   }
 };
