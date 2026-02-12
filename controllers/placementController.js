@@ -4065,7 +4065,7 @@ exports.incrementProjectView = async (req, res) => {
       return res.status(400).json({ message: 'Invalid project id.' });
     }
 
-    const userId = req.user?.id ?? req.user?.user_id || null;
+    const userId = req.user ? (req.user.id || req.user.user_id) : null;
     const ipAddress = (req.headers['x-forwarded-for'] || req.connection?.remoteAddress || '').toString().split(',')[0].trim() || null;
 
     const projRes = await pool.query('SELECT id FROM projects WHERE id = $1', [projectId]);
