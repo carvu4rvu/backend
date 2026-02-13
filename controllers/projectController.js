@@ -16,10 +16,10 @@ const {
 } = require('../utils/apiErrorResponse');
 const crypto = require('crypto');
 
-const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC', 'LINK_ONLY'];
+const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC', 'PUBLIC_LINK'];
 const VALID_ASSET_TYPES = ['IMAGE', 'VIDEO'];
 const VALID_ASSET_ROLES = ['LOGO', 'COVER', 'GALLERY', 'VIDEO'];
-const VALID_PROJECT_STATUS = ['draft', 'submitted', 'approved', 'rejected', 'archived'];
+const VALID_PROJECT_STATUS = ['not_approved', 'approved', 'rejected', 'archived'];
 
 /** Ensure user owns project (by owner_usn or owner_user_id) */
 async function assertOwnership(client, projectId, userId, usn) {
@@ -409,7 +409,7 @@ exports.create = async (req, res) => {
     try {
       const insertRes = await client.query(
         `INSERT INTO projects (owner_usn, owner_user_id, title, short_description, description, category, tags, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, project_status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'draft')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'not_approved')
          RETURNING id, owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, project_status, created_at`,
         [
           usn.toUpperCase(),
@@ -609,12 +609,12 @@ exports.submit = async (req, res) => {
       if (!r.rows.length) return sendNotFound(res, 'Project not found.');
       const status = r.rows[0].project_status;
 
-      if (status !== 'draft' && status !== 'rejected') {
-        return sendValidationError(res, 'Project can only be submitted when in draft or rejected state.');
+      if (status !== 'not_approved' && status !== 'rejected') {
+        return sendValidationError(res, 'Project can only be submitted when not yet approved or when rejected (resubmit).');
       }
 
       await client.query(
-        "UPDATE projects SET project_status = 'submitted', updated_at = NOW() WHERE id = $1",
+        "UPDATE projects SET project_status = 'not_approved', updated_at = NOW() WHERE id = $1",
         [projectId]
       );
 
@@ -784,14 +784,18 @@ exports.deleteAsset = async (req, res) => {
  * POST /api/projects/:id/share
  */
 exports.createShareLink = async (req, res) => {
+  console.log('[createShareLink] ENTRY', { params: req.params, body: req.body, path: req.path, originalUrl: req.originalUrl });
   try {
     const projectId = parseInt(req.params.id, 10);
     if (Number.isNaN(projectId)) {
+      console.log('[createShareLink] Invalid projectId:', req.params.id);
       return sendValidationError(res, 'Invalid project id.');
     }
     const userId = req.user?.id ?? req.user?.user_id;
+    console.log('[createShareLink] projectId=', projectId, 'userId=', userId, 'usn=', req.user?.usn);
     const usn = req.user?.usn;
     if (!userId && !usn) {
+      console.log('[createShareLink] No auth:', { userId, usn });
       return sendError(res, 401, 'Authentication required.');
     }
 
@@ -804,8 +808,16 @@ exports.createShareLink = async (req, res) => {
     try {
       const ownership = await assertOwnership(client, projectId, userId, usn);
       if (!ownership.ok) {
+        console.log('[createShareLink] Ownership failed:', ownership);
         if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
         return sendAccessDenied(res, 'Only owner can create share links.');
+      }
+
+      const projRes = await client.query('SELECT visibility FROM projects WHERE id = $1', [projectId]);
+      const visibility = projRes.rows[0]?.visibility;
+      console.log('[createShareLink] visibility=', visibility, 'required=PUBLIC_LINK');
+      if (projRes.rows.length && visibility !== 'PUBLIC_LINK') {
+        return sendValidationError(res, 'Share links are only available for projects with visibility PUBLIC_LINK (Public + Shareable Link).');
       }
 
       const shareToken = crypto.randomBytes(24).toString('hex');
@@ -816,6 +828,7 @@ exports.createShareLink = async (req, res) => {
       );
 
       const path = `/projects/share/${shareToken}`;
+      console.log('[createShareLink] SUCCESS', { projectId, shareToken, path });
       res.status(201).json({
         share_token: shareToken,
         url: path,
@@ -825,6 +838,7 @@ exports.createShareLink = async (req, res) => {
       client.release();
     }
   } catch (error) {
+    console.error('[createShareLink] error:', error?.message || error, error?.stack);
     return sendCaughtError(res, error, 'Failed to create share link.');
   }
 };
@@ -905,7 +919,7 @@ exports.addReview = async (req, res) => {
       }
       const p = projRes.rows[0];
 
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1004,7 +1018,7 @@ exports.toggleLike = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1014,6 +1028,14 @@ exports.toggleLike = async (req, res) => {
         [projectId, userId]
       );
       const existed = !!existRes.rows.length;
+
+      // Ensure project_metrics row exists (some projects may not have one)
+      await client.query(
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
+         VALUES ($1, 0, 0, 0, 0, 0, 0)
+         ON CONFLICT (project_id) DO NOTHING`,
+        [projectId]
+      );
 
       if (existed) {
         await client.query('DELETE FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, userId]);
@@ -1073,7 +1095,7 @@ exports.toggleFavorite = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1083,6 +1105,14 @@ exports.toggleFavorite = async (req, res) => {
         [projectId, userId]
       );
       const existed = !!existRes.rows.length;
+
+      // Ensure project_metrics row exists (some projects may not have one)
+      await client.query(
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
+         VALUES ($1, 0, 0, 0, 0, 0, 0)
+         ON CONFLICT (project_id) DO NOTHING`,
+        [projectId]
+      );
 
       if (existed) {
         await client.query('DELETE FROM project_favorites WHERE project_id = $1 AND user_id = $2', [projectId, userId]);
@@ -1147,7 +1177,7 @@ exports.rate = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1221,29 +1251,52 @@ exports.adminList = async (req, res) => {
       let assets = [];
       let metricsByProj = {};
       let ratingsByProj = {};
+      let likedProjectIds = new Set();
+      let favoritedProjectIds = new Set();
+      const userId = req.user?.id ?? req.user?.user_id;
+
       if (projectIds.length > 0) {
-        const [assetRes, metricRes, ratingRes] = await Promise.all([
+        const queries = [
           client.query(
             'SELECT project_id, original_url, position FROM project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
             [projectIds]
           ),
           client.query(
-            'SELECT project_id, views, likes, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+            'SELECT project_id, views, likes, favorites, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
             [projectIds]
           ),
           client.query(
             'SELECT project_id, user_id, rating FROM project_ratings WHERE project_id = ANY($1::bigint[])',
             [projectIds]
           ),
-        ]);
-        assets = assetRes.rows || [];
-        (metricRes.rows || []).forEach((m) => {
+        ];
+        if (userId) {
+          queries.push(
+            client.query(
+              'SELECT project_id FROM project_likes WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+              [projectIds, userId]
+            ),
+            client.query(
+              'SELECT project_id FROM project_favorites WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+              [projectIds, userId]
+            )
+          );
+        }
+        const results = await Promise.all(queries);
+        assets = results[0].rows || [];
+        (results[1].rows || []).forEach((m) => {
           metricsByProj[m.project_id] = m;
         });
-        (ratingRes.rows || []).forEach((r) => {
+        (results[2].rows || []).forEach((r) => {
           if (!ratingsByProj[r.project_id]) ratingsByProj[r.project_id] = [];
           ratingsByProj[r.project_id].push({ user_id: r.user_id, rating: r.rating });
         });
+        if (userId && results[3]) {
+          (results[3].rows || []).forEach((r) => likedProjectIds.add(r.project_id));
+        }
+        if (userId && results[4]) {
+          (results[4].rows || []).forEach((r) => favoritedProjectIds.add(r.project_id));
+        }
       }
 
       const byProject = {};
@@ -1255,16 +1308,10 @@ exports.adminList = async (req, res) => {
       const list = rows.map((p) => {
         const m = metricsByProj[p.id] || {};
         const ratings = ratingsByProj[p.id] || [];
-        const ownerRating = ratings.find((r) => r.user_id === p.owner_user_id);
         const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
         const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
-
-        let avgRating = Number(m.avg_rating ?? 0);
-        if (ownerRating && adminRating != null) {
-          avgRating = (ownerRating.rating + adminRating) / 2;
-        } else if (ownerRating) {
-          avgRating = ownerRating.rating;
-        }
+        // Only show rating when admin has rated; avoid showing stale/default values
+        const avgRating = adminRating != null ? adminRating : null;
 
         return {
           id: p.id,
@@ -1282,8 +1329,10 @@ exports.adminList = async (req, res) => {
           project_snaps: byProject[p.id] || [],
           views_count: m.views ?? 0,
           likes_count: m.likes ?? 0,
+          favorites_count: m.favorites ?? 0,
+          is_liked: likedProjectIds.has(p.id),
+          is_favorited: favoritedProjectIds.has(p.id),
           average_rating: avgRating,
-          self_rating: ownerRating ? ownerRating.rating : null,
           admin_rating: adminRating,
           is_approved: p.project_status === 'approved',
         };

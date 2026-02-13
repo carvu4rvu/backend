@@ -1,4 +1,30 @@
 require('dotenv').config({ quiet: true });
+
+// Global error handlers - log why process exits/crashes
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException - process will exit:', err?.message || err);
+  console.error(err?.stack || err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] unhandledRejection - promise:', promise);
+  console.error('[FATAL] reason:', reason?.message || reason);
+  if (reason && typeof reason === 'object' && reason.stack) {
+    console.error(reason.stack);
+  }
+});
+
+process.on('SIGTERM', () => {
+  console.log('[SERVER] SIGTERM received - shutting down');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('[SERVER] SIGINT received - shutting down');
+  process.exit(0);
+});
+
 const express = require('express');
 const morgan = require('morgan');
 const cors = require('cors');
@@ -56,6 +82,8 @@ const testRoutes = require('./routes/testRoutes');
 const authRoutes = require('./routes/authRoutes');
 const placementRoutes = require('./routes/placementRoutes');
 const studentRoutes = require('./routes/studentRoutes');
+const { authenticateToken } = require('./middleware/authMiddleware');
+const projectController = require('./controllers/projectController');
 const projectRoutes = require('./routes/projectRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const eventsRoutes = require('./routes/eventsRoutes');
@@ -68,10 +96,16 @@ const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
 const ensureAlumniLikedProjectIds = require('./migrations/ensureAlumniLikedProjectIds');
 const ensureEventsStatusColumn = require('./migrations/ensureEventsStatusColumn');
 const ensureNotificationNodesRecipientEntityId = require('./migrations/ensureNotificationNodesRecipientEntityId');
+const ensureProjectsVisibilityPublicLink = require('./migrations/ensureProjectsVisibilityPublicLink');
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/placement', placementRoutes);
 app.use('/api/student', studentRoutes);
+// Direct share route (avoids router ordering issues)
+app.post('/api/projects/:id/share', (req, res, next) => {
+  console.log('[server] POST /api/projects/:id/share direct route hit', req.params.id);
+  next();
+}, authenticateToken, projectController.createShareLink);
 app.use('/api/projects', projectRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/events', eventsRoutes);
@@ -88,6 +122,23 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
+  });
+});
+
+// Debug: verify backend is reachable
+app.get('/api/share-debug', (req, res) => {
+  console.log('[server] GET /api/share-debug hit');
+  res.json({ ok: true, message: 'Backend reachable' });
+});
+
+// 404 handler - must be last; return JSON for unmatched routes (helps debug)
+app.use((req, res) => {
+  console.warn('[404] No route matched:', req.method, req.originalUrl);
+  res.set('Content-Type', 'application/json');
+  res.status(404).json({
+    success: false,
+    message: `Not found: ${req.method} ${req.originalUrl}`,
+    errorCode: 'NOT_FOUND',
   });
 });
 
@@ -140,6 +191,7 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     await ensureAlumniLikedProjectIds();
     await ensureEventsStatusColumn();
     await ensureNotificationNodesRecipientEntityId();
+    await ensureProjectsVisibilityPublicLink();
 
     await connectWithRetry('supabase storage', async () => {
       const { data, error } = await supabase.storage.listBuckets();

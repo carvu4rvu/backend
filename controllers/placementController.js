@@ -3980,7 +3980,7 @@ exports.createAlumniConnectionRequest = async (req, res) => {
  */
 exports.getAlumniProjects = async (req, res) => {
   try {
-    const userId = req.user?.id ?? req.user?.user_id;
+    const userId = req.user ? (req.user.id || req.user.user_id) : null;
     if (!userId) {
       return res.status(401).json({ message: 'Authentication required.' });
     }
@@ -3999,8 +3999,9 @@ exports.getAlumniProjects = async (req, res) => {
 
     let coverByProj = {};
     let likedSet = new Set();
+    let favoritedSet = new Set();
     if (projectIds.length > 0) {
-      const [assetRes, likeRes] = await Promise.all([
+      const [assetRes, likeRes, favRes] = await Promise.all([
         pool.query(
           `SELECT DISTINCT ON (project_id) project_id, original_url
            FROM project_assets
@@ -4012,13 +4013,18 @@ exports.getAlumniProjects = async (req, res) => {
           'SELECT project_id FROM project_likes WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
           [projectIds, userId]
         ),
+        pool.query(
+          'SELECT project_id FROM project_favorites WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+          [projectIds, userId]
+        ),
       ]);
       (assetRes.rows || []).forEach((a) => { coverByProj[a.project_id] = a.original_url; });
       (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
+      (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
     }
 
     const metricRes = await pool.query(
-      'SELECT project_id, views, likes, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+      'SELECT project_id, views, likes, favorites, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
       [projectIds]
     );
     const metricMap = {};
@@ -4042,8 +4048,10 @@ exports.getAlumniProjects = async (req, res) => {
         cover_url: coverByProj[p.id] || null,
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
+        favorites_count: m.favorites ?? 0,
         average_rating: Number(m.avg_rating ?? 0),
         is_liked: likedSet.has(p.id),
+        is_favorited: favoritedSet.has(p.id),
       };
     });
 
@@ -4100,7 +4108,7 @@ exports.toggleProjectLike = async (req, res) => {
     if (Number.isNaN(projectId)) {
       return res.status(400).json({ message: 'Invalid project id.' });
     }
-    const userId = req.user?.id ?? req.user?.user_id;
+    const userId = req.user ? (req.user.id || req.user.user_id) : null;
     if (!userId) {
       return res.status(401).json({ message: 'Authentication required.' });
     }
@@ -4113,7 +4121,7 @@ exports.toggleProjectLike = async (req, res) => {
       return res.status(404).json({ message: 'Project not found.' });
     }
     const p = projRes.rows[0];
-    const canView = p.visibility === 'PUBLIC' || p.visibility === 'LINK_ONLY' || p.project_status === 'approved';
+    const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
     if (!canView) {
       return res.status(404).json({ message: 'Project not found.' });
     }
@@ -4123,6 +4131,14 @@ exports.toggleProjectLike = async (req, res) => {
       [projectId, userId]
     );
     const existed = !!existRes.rows.length;
+
+    // Ensure project_metrics row exists (some projects may not have one)
+    await pool.query(
+      `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
+       VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())
+       ON CONFLICT (project_id) DO NOTHING`,
+      [projectId]
+    );
 
     if (existed) {
       await pool.query('DELETE FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, userId]);

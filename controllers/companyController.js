@@ -580,7 +580,6 @@ exports.getStudentProfile = async (req, res) => {
       one_line_description: p.short_description,
       full_description: p.description,
       genre: p.category,
-      self_rating: null,
       admin_rating: null,
       priority: p.priority,
       project_snaps: projectSnapsByProj[p.id] || [],

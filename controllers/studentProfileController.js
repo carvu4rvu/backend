@@ -31,7 +31,6 @@ const {
   validateSgpa,
   validateUrl,
   validateVisibility,
-  validateSelfRating,
   validateBloodGroup,
   validateSection,
   validateFullName,
@@ -2191,23 +2190,28 @@ exports.getProjects = async (req, res) => {
             const rows = projRows.rows || [];
             const projectIds = rows.map((p) => p.id);
             let assets = [];
-            let selfRatings = {};
+            const metricsByProj = {};
+            const ratingsByProj = {};
             if (projectIds.length > 0) {
-                const assetRows = await client.query(
-                    'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
-                    [projectIds]
-                );
+                const [assetRows, metricRows, ratingRows] = await Promise.all([
+                    client.query(
+                        'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
+                        [projectIds]
+                    ),
+                    client.query(
+                        'SELECT project_id, views, likes, avg_rating FROM public.project_metrics WHERE project_id = ANY($1::bigint[])',
+                        [projectIds]
+                    ),
+                    client.query(
+                        'SELECT project_id, user_id, rating FROM public.project_ratings WHERE project_id = ANY($1::bigint[])',
+                        [projectIds]
+                    ),
+                ]);
                 assets = assetRows.rows || [];
-
-                // Load self ratings (owner's rating) from project_ratings
-                const ratingRows = await client.query(
-                    `SELECT pr.project_id, pr.rating
-                     FROM public.project_ratings pr
-                     WHERE pr.project_id = ANY($1::bigint[])`,
-                    [projectIds]
-                );
+                (metricRows.rows || []).forEach((m) => { metricsByProj[m.project_id] = m; });
                 (ratingRows.rows || []).forEach((r) => {
-                    selfRatings[r.project_id] = r.rating;
+                    if (!ratingsByProj[r.project_id]) ratingsByProj[r.project_id] = [];
+                    ratingsByProj[r.project_id].push({ user_id: r.user_id, rating: r.rating });
                 });
             }
             const byProject = {};
@@ -2215,26 +2219,35 @@ exports.getProjects = async (req, res) => {
                 if (!byProject[a.project_id]) byProject[a.project_id] = [];
                 byProject[a.project_id].push(a.original_url);
             });
-            const legacy = rows.map((p) => ({
-                id: p.id,
-                usn: p.owner_usn,
-                title: p.title,
-                one_line_description: p.short_description,
-                full_description: p.description,
-                genre: p.category,
-                visibility: p.visibility || 'PRIVATE',
-                self_rating: selfRatings[p.id] ?? null,
-                admin_rating: null,
-                priority: p.priority,
-                project_snaps: byProject[p.id] || [],
-                hosted_link: p.hosted_url,
-                github_repo: p.github_url,
-                mentor_name: p.mentor_name,
-                technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
-                is_approved: p.project_status === 'approved',
-                project_status: p.project_status,
-                updated_at: p.updated_at,
-            }));
+            const legacy = rows.map((p) => {
+                const m = metricsByProj[p.id] || {};
+                const ratings = ratingsByProj[p.id] || [];
+                const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
+                const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
+                const avgRating = adminRating != null ? adminRating : (Number(m.avg_rating) || null);
+                return {
+                    id: p.id,
+                    usn: p.owner_usn,
+                    title: p.title,
+                    one_line_description: p.short_description,
+                    full_description: p.description,
+                    genre: p.category,
+                    visibility: p.visibility || 'PRIVATE',
+                    admin_rating: adminRating,
+                    average_rating: avgRating,
+                    views_count: m.views ?? 0,
+                    likes_count: m.likes ?? 0,
+                    priority: p.priority,
+                    project_snaps: byProject[p.id] || [],
+                    hosted_link: p.hosted_url,
+                    github_repo: p.github_url,
+                    mentor_name: p.mentor_name,
+                    technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+                    is_approved: p.project_status === 'approved',
+                    project_status: p.project_status,
+                    updated_at: p.updated_at,
+                };
+            });
             res.json(legacy);
         } finally {
             client.release();
@@ -2344,7 +2357,6 @@ exports.updateProjects = async (req, res) => {
             const oneLineDesc = item.one_line_description ?? item.oneLineDescription ?? '';
             const genre = item.genre ?? '';
             const visibility = (item.visibility ?? 'PRIVATE').toString().toUpperCase().trim();
-            const selfRating = item.self_rating ?? item.selfRating;
             const priority = item.priority;
             const projectSnaps = item.project_snaps ?? item.projectSnaps ?? [];
             const snapsArr = Array.isArray(projectSnaps)
@@ -2372,9 +2384,6 @@ exports.updateProjects = async (req, res) => {
                     fieldErrors[key('visibility')] = 'Project must be approved before it can be set to PUBLIC.';
                 }
             }
-
-            const rSelf = validateSelfRating(selfRating);
-            if (!rSelf.valid) fieldErrors[key('self_rating')] = rSelf.message;
 
             // Priority: optional. When present must be positive integer. Empty does not participate in uniqueness.
             let resolvedPriority = null;
@@ -2418,7 +2427,6 @@ exports.updateProjects = async (req, res) => {
                 oneLineDesc,
                 genre,
                 visibility,
-                selfRating,
                 priority: resolvedPriority,
                 snapsArr,
                 hostedLink,
@@ -2459,10 +2467,9 @@ exports.updateProjects = async (req, res) => {
             visibility:
                 r.visibility === 'PUBLIC'
                     ? 'PUBLIC'
-                    : r.visibility === 'LINK_ONLY'
-                        ? 'LINK_ONLY'
+                    : r.visibility === 'PUBLIC_LINK'
+                        ? 'PUBLIC_LINK'
                         : 'PRIVATE',
-            self_rating: r.selfRating != null && r.selfRating !== '' ? parseInt(String(r.selfRating), 10) : 5,
             admin_rating: r.item.admin_rating ?? r.item.adminRating ?? null,
             priority: r.priority, // null or number; will normalize next
             project_snaps: r.snapsArr,
@@ -2530,23 +2537,12 @@ exports.updateProjects = async (req, res) => {
                         row.github_repo,
                         row.mentor_name,
                         row.technologies,
-                        'draft', // Admin sets approved via admin API; bulk replace always creates as draft
+                        'not_approved', // Admin sets approved via admin API; bulk replace always creates as not_approved
                         row.priority,
                     ]
                 );
                 const proj = projResult.rows[0];
                 if (!proj) continue;
-
-                // Upsert self-rating into project_ratings (1-5 scale per schema)
-                if (row.self_rating != null && !Number.isNaN(Number(row.self_rating))) {
-                    const selfRatingValue = Math.max(1, Math.min(5, parseInt(String(row.self_rating), 10)));
-                    await dbClient.query(
-                        `INSERT INTO public.project_ratings (project_id, user_id, rating)
-                         VALUES ($1, $2, $3)
-                         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
-                        [proj.id, ownerUserId, selfRatingValue]
-                    );
-                }
 
                 for (let pos = 0; pos < (row.project_snaps || []).length; pos++) {
                     const url = row.project_snaps[pos];

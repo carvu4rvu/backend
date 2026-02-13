@@ -32,9 +32,7 @@ const CONSTRAINT_MESSAGES = {
 
   // projects
   projects_visibility_check:
-    'Visibility must be PRIVATE, PUBLIC, or LINK_ONLY.',
-  projects_self_rating_check:
-    'Self-rating must be between 1 and 5.',
+    'Visibility must be PRIVATE, PUBLIC, or PUBLIC_LINK.',
 
   // student_publications
   student_publications_author_count_check:

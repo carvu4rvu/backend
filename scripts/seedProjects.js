@@ -88,9 +88,7 @@ async function seed() {
     const genre = GENRES[i % GENRES.length];
     const tech = TECH_SAMPLES[i % TECH_SAMPLES.length];
     const ownerUserId = usnToUserId[usn] || null;
-    const projectStatus = i % 2 === 0 ? 'approved' : 'draft';
-    const selfRating = Math.min(5, Math.max(1, 2 + (i % 4)));
-    const adminRating = i % 2 === 0 ? Math.min(5, Math.max(1, 3 + (i % 3))) : null;
+    const projectStatus = i % 2 === 0 ? 'approved' : 'not_approved';
 
     const projRes = await pool.query(
       `INSERT INTO projects (owner_usn, title, short_description, description, category, visibility, hosted_url, github_url, mentor_name, tech_stack, priority, owner_user_id, project_status)
@@ -122,14 +120,6 @@ async function seed() {
         `INSERT INTO project_assets (project_id, asset_type, asset_role, original_url, position)
          VALUES ($1, 'IMAGE', 'GALLERY', $2, $3)`,
         [projectId, url, j]
-      );
-    }
-
-    if (ownerUserId) {
-      await pool.query(
-        `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
-         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating`,
-        [projectId, ownerUserId, selfRating]
       );
     }
 

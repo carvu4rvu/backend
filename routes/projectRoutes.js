@@ -20,6 +20,13 @@ router.get('/', projectController.list);
 
 // CRUD
 router.post('/', projectController.create);
+
+// Share - MUST be before /:id (more specific path)
+router.post('/:id/share', (req, res, next) => {
+  console.log('[projectRoutes] POST /:id/share hit', { id: req.params.id, method: req.method, path: req.path, originalUrl: req.originalUrl });
+  next();
+}, projectController.createShareLink);
+
 router.get('/:id', projectController.getOne);
 router.patch('/:id', projectController.update);
 router.delete('/:id', projectController.delete);
@@ -31,9 +38,6 @@ router.patch('/:id/publish', projectController.publish);
 // Assets
 router.post('/:id/assets', projectController.addAsset);
 router.delete('/:id/assets/:assetId', projectController.deleteAsset);
-
-// Share
-router.post('/:id/share', projectController.createShareLink);
 
 // Engagement (reviews, like, favorite, rate)
 router.post('/:id/reviews', projectController.addReview);

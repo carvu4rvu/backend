@@ -25,7 +25,7 @@ const RESULT_TYPES = ['PERCENTAGE', 'CGPA'];
 const GAP_TYPES = ['12TH_TO_GRADUATION', 'DIPLOMA_TO_GRADUATION', 'GRADUATION_TO_POST_GRADUATION'];
 
 /** Visibility */
-const VISIBILITY_VALUES = ['PRIVATE', 'PUBLIC', 'LINK_ONLY'];
+const VISIBILITY_VALUES = ['PRIVATE', 'PUBLIC', 'PUBLIC_LINK'];
 
 const currentYear = new Date().getFullYear();
 
@@ -297,18 +297,6 @@ function validateVisibility(value) {
   return validateEnum(value, VISIBILITY_VALUES, 'visibility');
 }
 
-/**
- * Validates self-rating (1-5, matches project_ratings schema).
- */
-function validateSelfRating(value) {
-  if (value === null || value === undefined || value === '') return { valid: true };
-  const n = parseInt(String(value), 10);
-  if (Number.isNaN(n) || n < 1 || n > 5) {
-    return { valid: false, message: 'Self-rating must be between 1 and 5.' };
-  }
-  return { valid: true };
-}
-
 /** Valid blood groups */
 const BLOOD_GROUPS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
 
@@ -414,7 +402,6 @@ module.exports = {
   validateEducationLevel,
   validateResultType,
   validateVisibility,
-  validateSelfRating,
   validateBloodGroup,
   validateSection,
   validateOccupation,
