@@ -539,17 +539,34 @@ exports.getAllDrives = async (req, res) => {
     if (error) throw error;
     const driveIds = (data || []).map((d) => d.id).filter(Boolean);
     let registeredCountByDrive = {};
+    const usnsByDrive = {};
     if (driveIds.length > 0) {
       const { data: processRows } = await supabase
         .from('student_placement_process')
-        .select('placement_drive_id')
+        .select('placement_drive_id, usn')
         .in('placement_drive_id', driveIds);
       (processRows || []).forEach((row) => {
         const id = row.placement_drive_id;
         registeredCountByDrive[id] = (registeredCountByDrive[id] || 0) + 1;
+        if (!usnsByDrive[id]) usnsByDrive[id] = new Set();
+        if (row.usn) usnsByDrive[id].add(row.usn);
       });
     }
-    // Use eligibility_criteria from each drive (stored in placements_drives)
+    // Schools/programs from process table (students registered in each drive)
+    const allUsns = [...new Set(Object.values(usnsByDrive).flatMap((s) => [...s]))];
+    let studentSchoolProgramMap = {};
+    if (allUsns.length > 0) {
+      const { data: studentRows } = await supabase
+        .from('student_basic_details')
+        .select('usn, school_id, program_id')
+        .in('usn', allUsns);
+      studentSchoolProgramMap = (studentRows || []).reduce((acc, s) => {
+        acc[s.usn] = { school_id: s.school_id, program_id: s.program_id };
+        return acc;
+      }, {});
+    }
+
+    // Use eligibility_criteria from each drive (stored in placements_drives) + school/program IDs from process
     const schoolIds = new Set();
     const programIds = new Set();
     (data || []).forEach((d) => {
@@ -558,6 +575,11 @@ exports.getAllDrives = async (req, res) => {
       if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
       if (!elig && d.eligibility_academics?.school_id) schoolIds.add(d.eligibility_academics.school_id);
       if (!elig && d.eligibility_academics?.program_id) programIds.add(d.eligibility_academics.program_id);
+    });
+    // Add school/program IDs from registered students
+    Object.values(studentSchoolProgramMap).forEach(({ school_id, program_id }) => {
+      if (school_id != null) schoolIds.add(school_id);
+      if (program_id != null) programIds.add(program_id);
     });
     let schoolMap = {};
     let programMap = {};
@@ -588,6 +610,26 @@ exports.getAllDrives = async (req, res) => {
         ? elig.allowed_program_ids[0] : d.eligibility_academics?.program_id;
       if (!sid && pid && programMap[pid]?.school_id) sid = programMap[pid].school_id;
       const prog = pid && programMap[pid] ? programMap[pid] : null;
+
+      // School-program pairs from process table; only include when program belongs to that school
+      const driveUsns = usnsByDrive[d.id] ? [...usnsByDrive[d.id]] : [];
+      const pairKeys = new Set();
+      const schoolProgramPairs = [];
+      driveUsns.forEach((usn) => {
+        const sp = studentSchoolProgramMap[usn];
+        if (!sp?.school_id || !sp?.program_id) return;
+        const prog = programMap[sp.program_id];
+        if (!prog || (typeof prog === 'object' && prog.school_id !== sp.school_id)) return;
+        const schoolName = schoolMap[sp.school_id];
+        const programName = typeof prog === 'object' ? prog.name : prog;
+        if (!schoolName || !programName) return;
+        const key = `${schoolName}|${programName}`;
+        if (pairKeys.has(key)) return;
+        pairKeys.add(key);
+        schoolProgramPairs.push({ school: schoolName, program: programName });
+      });
+      const eligibility_display = schoolProgramPairs.map((p) => `${p.school} - ${p.program}`).join(', ');
+
       return {
         ...d,
         process_rounds: sanitizeProcessRounds(d.process_rounds),
@@ -598,6 +640,8 @@ exports.getAllDrives = async (req, res) => {
         school: sid ? schoolMap[sid] ?? null : null,
         program: prog ? (typeof prog === 'object' ? prog.name : prog) : (pid && programMap[pid] ? programMap[pid].name : null),
         registered_count: registeredCountByDrive[d.id] ?? 0,
+        school_program_pairs: schoolProgramPairs,
+        eligibility_display: eligibility_display || null,
       };
     });
     res.json(drives);
@@ -1528,6 +1572,80 @@ exports.getStudentsForPlacement = async (req, res) => {
             return { ...s, is_eligible: isEligible, rejection_reasons: rejectionReasons };
           });
         }
+
+        // Fetch placement-related data: offers, placement CTC, violations, disciplinary
+        const usnSet = new Set(usns);
+        const [
+          { data: offersRows },
+          { data: placementRows },
+          { data: capstoneRows },
+          { data: violationRows },
+          { data: disciplinaryRows },
+        ] = await Promise.all([
+          supabase.from('offers').select('student_id, placement_id, capstone_id, job_type, is_accepted').in('student_id', usns),
+          supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa').in('student_id', usns),
+          supabase.from('capstone').select('usn, internship_stipend_min, internship_stipend_max').in('usn', usns),
+          supabase.from('student_placement_violations').select('usn').in('usn', usns).eq('is_active', true),
+          supabase.from('student_disciplinary_records').select('usn').in('usn', usns).eq('is_active', true),
+        ]);
+
+        const perUsn = {};
+        usns.forEach((u) => {
+          perUsn[u] = {
+            offers_count: 0,
+            max_ctc_lpa: null,
+            has_placement_from_drive: false,
+            has_capstone_only: false,
+            placement_violations: 0,
+            disciplinary: 0,
+            admin_hold: false,
+          };
+        });
+
+        (violationRows || []).forEach((v) => { if (perUsn[v.usn]) perUsn[v.usn].placement_violations += 1; });
+        (disciplinaryRows || []).forEach((d) => { if (perUsn[d.usn]) perUsn[d.usn].disciplinary += 1; });
+
+        const placementByStudent = {};
+        (placementRows || []).forEach((pl) => {
+          if (!placementByStudent[pl.student_id]) placementByStudent[pl.student_id] = [];
+          placementByStudent[pl.student_id].push(pl);
+        });
+        const capstoneByStudent = {};
+        (capstoneRows || []).forEach((c) => {
+          if (!capstoneByStudent[c.usn]) capstoneByStudent[c.usn] = [];
+          capstoneByStudent[c.usn].push(c);
+        });
+
+        (offersRows || []).forEach((off) => {
+          if (!perUsn[off.student_id]) return;
+          const o = perUsn[off.student_id];
+          o.offers_count += 1;
+          if (off.placement_id) o.has_placement_from_drive = true;
+          if (off.capstone_id && !off.placement_id) o.has_capstone_only = true;
+        });
+
+        Object.keys(placementByStudent).forEach((sid) => {
+          const o = perUsn[sid];
+          if (!o) return;
+          placementByStudent[sid].forEach((pl) => {
+            const ctc = pl.ctc_max_lpa != null ? pl.ctc_max_lpa : pl.ctc_min_lpa;
+            if (ctc != null && (o.max_ctc_lpa == null || ctc > o.max_ctc_lpa)) o.max_ctc_lpa = Number(ctc);
+          });
+        });
+
+        list = list.map((s) => {
+          const agg = perUsn[s.usn] || {};
+          return {
+            ...s,
+            offers_count: agg.offers_count ?? 0,
+            max_ctc_lpa: agg.max_ctc_lpa != null ? agg.max_ctc_lpa : null,
+            is_placed: (agg.offers_count ?? 0) > 0,
+            is_placed_off_campus: (agg.offers_count ?? 0) > 0 && !agg.has_placement_from_drive,
+            placement_violations: agg.placement_violations ?? 0,
+            disciplinary: agg.disciplinary ?? 0,
+            admin_hold: agg.admin_hold ?? false,
+          };
+        });
       }
     }
 
@@ -1918,10 +2036,18 @@ exports.addCompany = async (req, res) => {
     } else if (remarks == null) {
       remarks = [];
     }
+    const toCamelCase = (str) => {
+      if (!str || typeof str !== 'string') return '';
+      return str.trim().split(/[\s_-]+/).filter(Boolean)
+        .map((word, i) => (i === 0 ? word.toLowerCase() : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()))
+        .join('');
+    };
+    const companyTypeRaw = body.company_type;
+    const companyTypeCamel = companyTypeRaw ? toCamelCase(String(companyTypeRaw)) : null;
     const payload = {
       company_name: String(company_name).trim(),
       description: body.description || null,
-      company_type: body.company_type || null,
+      company_type: companyTypeCamel,
       address: body.address || null,
       website: body.website || null,
       linkedin: body.linkedin || null,
@@ -1982,7 +2108,15 @@ exports.updateCompany = async (req, res) => {
     };
     if (body.company_name != null) payload.company_name = String(body.company_name).trim();
     if (body.description != null) payload.description = body.description;
-    if (body.company_type != null) payload.company_type = body.company_type;
+    if (body.company_type != null) {
+      const toCamelCase = (str) => {
+        if (!str || typeof str !== 'string') return '';
+        return str.trim().split(/[\s_-]+/).filter(Boolean)
+          .map((word, i) => (i === 0 ? word.toLowerCase() : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()))
+          .join('');
+      };
+      payload.company_type = toCamelCase(String(body.company_type));
+    }
     if (body.address != null) payload.address = body.address;
     if (body.website != null) payload.website = body.website;
     if (body.linkedin != null) payload.linkedin = body.linkedin;
@@ -4002,6 +4136,110 @@ exports.createAlumniConnectionRequest = async (req, res) => {
   } catch (err) {
     logger.error('createAlumniConnectionRequest:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to create connection request') });
+  }
+};
+
+/**
+ * GET /placement/alumni/connection-requests
+ * Admin: get all alumni connection requests with alumni and student info.
+ */
+exports.getAlumniConnectionRequests = async (req, res) => {
+  try {
+    const statusFilter = (req.query.status || '').trim().toUpperCase();
+    let q = supabase
+      .from('alumni_connection_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (statusFilter && ['PENDING', 'APPROVED', 'REJECTED', 'CONTACTED'].includes(statusFilter)) {
+      q = q.eq('status', statusFilter);
+    }
+
+    const { data: requests, error } = await q;
+    if (error) throw error;
+
+    const rows = requests || [];
+    const alumniIds = [...new Set(rows.map((r) => r.alumni_id).filter(Boolean))];
+    const studentUsns = [...new Set(rows.map((r) => r.student_usn).filter(Boolean))];
+
+    const alumniMap = {};
+    const studentMap = {};
+
+    if (alumniIds.length > 0) {
+      const { data: alumniRows } = await supabase
+        .from('alumni')
+        .select('id, full_name, personal_email, current_company, current_designation')
+        .in('id', alumniIds);
+      (alumniRows || []).forEach((a) => { alumniMap[a.id] = a; });
+    }
+
+    if (studentUsns.length > 0) {
+      const { data: studentRows } = await supabase
+        .from('student_basic_details')
+        .select('usn, full_name, college_email')
+        .in('usn', studentUsns);
+      (studentRows || []).forEach((s) => { studentMap[s.usn] = s; });
+    }
+
+    const enriched = rows.map((r) => {
+      const alum = alumniMap[r.alumni_id];
+      const stud = studentMap[r.student_usn];
+      return {
+        ...r,
+        alumni_name: alum?.full_name || '—',
+        alumni_email: alum?.personal_email || '—',
+        alumni_company: alum?.current_company || '—',
+        alumni_designation: alum?.current_designation || '—',
+        student_name: stud?.full_name || '—',
+        student_email: stud?.college_email || '—',
+      };
+    });
+
+    res.json({ rows: enriched });
+  } catch (err) {
+    logger.error('getAlumniConnectionRequests:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to fetch connection requests') });
+  }
+};
+
+/**
+ * PATCH /placement/alumni/connection-requests/:id
+ * Admin: update connection request status (approve/reject/contacted).
+ */
+exports.updateAlumniConnectionRequest = async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ message: 'Invalid request ID.' });
+    }
+
+    const { status, po_remarks } = req.body;
+    const validStatuses = ['PENDING', 'APPROVED', 'REJECTED', 'CONTACTED'];
+    if (!status || !validStatuses.includes(String(status).toUpperCase())) {
+      return res.status(400).json({ message: 'Invalid status. Use PENDING, APPROVED, REJECTED, or CONTACTED.' });
+    }
+
+    const payload = {
+      status: String(status).toUpperCase(),
+      po_remarks: (po_remarks != null && String(po_remarks).trim()) ? String(po_remarks).trim() : null,
+      decided_at: ['APPROVED', 'REJECTED'].includes(String(status).toUpperCase()) ? new Date().toISOString() : undefined,
+      contacted_at: String(status).toUpperCase() === 'CONTACTED' ? new Date().toISOString() : undefined,
+    };
+
+    const { data, error } = await supabase
+      .from('alumni_connection_requests')
+      .update(payload)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'Request not found.' });
+
+    res.json(data);
+  } catch (err) {
+    logger.error('updateAlumniConnectionRequest:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to update connection request') });
   }
 };
 

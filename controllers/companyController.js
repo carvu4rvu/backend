@@ -255,12 +255,41 @@ exports.getDrives = async (req, res) => {
     if (error) throw error;
 
     const rows = data || [];
+    const driveIds = (rows || []).map((d) => d.id).filter(Boolean);
+    const usnsByDrive = {};
+    if (driveIds.length > 0) {
+      const { data: processRows } = await supabase
+        .from('student_placement_process')
+        .select('placement_drive_id, usn')
+        .in('placement_drive_id', driveIds);
+      (processRows || []).forEach((row) => {
+        const id = row.placement_drive_id;
+        if (!usnsByDrive[id]) usnsByDrive[id] = new Set();
+        if (row.usn) usnsByDrive[id].add(row.usn);
+      });
+    }
+    const allUsns = [...new Set(Object.values(usnsByDrive).flatMap((s) => [...s]))];
+    let studentSchoolProgramMap = {};
+    if (allUsns.length > 0) {
+      const { data: studentRows } = await supabase
+        .from('student_basic_details')
+        .select('usn, school_id, program_id')
+        .in('usn', allUsns);
+      studentSchoolProgramMap = (studentRows || []).reduce((acc, s) => {
+        acc[s.usn] = { school_id: s.school_id, program_id: s.program_id };
+        return acc;
+      }, {});
+    }
     const schoolIds = new Set();
     const programIds = new Set();
     rows.forEach((d) => {
       const elig = d.eligibility_criteria || null;
       if (elig && Array.isArray(elig.allowed_school_ids)) elig.allowed_school_ids.forEach((id) => schoolIds.add(id));
       if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
+    });
+    Object.values(studentSchoolProgramMap).forEach(({ school_id, program_id }) => {
+      if (school_id != null) schoolIds.add(school_id);
+      if (program_id != null) programIds.add(program_id);
     });
     let schoolMap = {};
     let programMap = {};
@@ -269,8 +298,8 @@ exports.getDrives = async (req, res) => {
       schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
     }
     if (programIds.size) {
-      const { data: programs } = await supabase.from('programs').select('id, name').in('id', [...programIds]);
-      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p.name; return acc; }, {});
+      const { data: programs } = await supabase.from('programs').select('id, name, school_id').in('id', [...programIds]);
+      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
     }
 
     const drives = rows.map((d) => {
@@ -279,12 +308,31 @@ exports.getDrives = async (req, res) => {
         ? elig.allowed_school_ids[0] : null;
       const pid = elig && Array.isArray(elig.allowed_program_ids) && elig.allowed_program_ids.length > 0
         ? elig.allowed_program_ids[0] : null;
+      const driveUsns = usnsByDrive[d.id] ? [...usnsByDrive[d.id]] : [];
+      const pairKeys = new Set();
+      const schoolProgramPairs = [];
+      driveUsns.forEach((usn) => {
+        const sp = studentSchoolProgramMap[usn];
+        if (!sp?.school_id || !sp?.program_id) return;
+        const prog = programMap[sp.program_id];
+        if (!prog || (typeof prog === 'object' && prog.school_id !== sp.school_id)) return;
+        const schoolName = schoolMap[sp.school_id];
+        const programName = typeof prog === 'object' ? prog.name : prog;
+        if (!schoolName || !programName) return;
+        const key = `${schoolName}|${programName}`;
+        if (pairKeys.has(key)) return;
+        pairKeys.add(key);
+        schoolProgramPairs.push({ school: schoolName, program: programName });
+      });
+      const eligibility_display = schoolProgramPairs.map((p) => `${p.school} - ${p.program}`).join(', ');
       return {
         ...d,
         company_name: d.company?.company_name ?? null,
         school: sid ? schoolMap[sid] ?? null : null,
-        program: pid ? programMap[pid] ?? null : null,
+        program: pid ? (typeof programMap[pid] === 'object' ? programMap[pid]?.name : programMap[pid]) ?? null : null,
         registered_count: d.number_of_registrations ?? 0,
+        school_program_pairs: schoolProgramPairs,
+        eligibility_display: eligibility_display || null,
       };
     });
 
