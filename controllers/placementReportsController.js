@@ -33,7 +33,6 @@ exports.getPlacementReport = async (req, res) => {
       { data: disciplinary },
       { data: events },
       { data: hrRecs },
-      { data: snapshotRows },
     ] = await Promise.all([
       buildQuery('placement', '*, company:companies(company_name)'),
       buildQuery('offers', '*, company:companies(company_name)'),
@@ -46,7 +45,6 @@ exports.getPlacementReport = async (req, res) => {
       buildQuery('student_disciplinary_records', '*'),
       buildQuery('events', '*'),
       buildQuery('hr_recommendations', '*'),
-      supabase.from('placement_academic_year_snapshot').select('*'),
     ]);
 
     const { data: schools } = await supabase.from('schools').select('id, name');

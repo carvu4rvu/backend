@@ -95,7 +95,7 @@ async function getStudentAcademicsMap(usns) {
   return map;
 }
 
-/** Evaluate student against placement_drive_eligibility rules. */
+/** Evaluate student against eligibility_criteria rules (from placements_drives). */
 function evaluateEligibility(student, eligibility, opts = {}) {
   const reasons = [];
   if (!eligibility) return { isEligible: true, rejectionReasons: [] };
@@ -192,12 +192,13 @@ exports.applyToDrive = async (req, res) => {
     // Self-registration (student applying) = Registered; admin adding students = Pending
     const registrationStatus = isSelfRegistration ? 'REGISTERED' : 'Pending';
 
-    // Check placement_drive_eligibility when admin adds (or self-registers if we want to enforce for students too)
-    const { data: eligibility } = await supabase
-      .from('placement_drive_eligibility')
-      .select('*')
-      .eq('placement_drive_id', driveIdNum)
+    // Check eligibility_criteria on drive when admin adds (or self-registers)
+    const { data: driveRow } = await supabase
+      .from('placements_drives')
+      .select('eligibility_criteria')
+      .eq('id', driveIdNum)
       .maybeSingle();
+    const eligibility = driveRow?.eligibility_criteria || null;
 
     let isEligible = true;
     if (eligibility) {
@@ -548,19 +549,11 @@ exports.getAllDrives = async (req, res) => {
         registeredCountByDrive[id] = (registeredCountByDrive[id] || 0) + 1;
       });
     }
-    // Fetch placement_drive_eligibility for drives (new source of truth)
-    let eligibilityByDrive = {};
-    if (driveIds.length > 0) {
-      const { data: eligibilityRows } = await supabase
-        .from('placement_drive_eligibility')
-        .select('*')
-        .in('placement_drive_id', driveIds);
-      (eligibilityRows || []).forEach((e) => { eligibilityByDrive[e.placement_drive_id] = e; });
-    }
+    // Use eligibility_criteria from each drive (stored in placements_drives)
     const schoolIds = new Set();
     const programIds = new Set();
     (data || []).forEach((d) => {
-      const elig = eligibilityByDrive[d.id];
+      const elig = d.eligibility_criteria || null;
       if (elig && Array.isArray(elig.allowed_school_ids)) elig.allowed_school_ids.forEach((id) => schoolIds.add(id));
       if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
       if (!elig && d.eligibility_academics?.school_id) schoolIds.add(d.eligibility_academics.school_id);
@@ -573,15 +566,28 @@ exports.getAllDrives = async (req, res) => {
       schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
     }
     if (programIds.size) {
-      const { data: programs } = await supabase.from('programs').select('id, name').in('id', [...programIds]);
-      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p.name; return acc; }, {});
+      const { data: programs } = await supabase.from('programs').select('id, name, school_id').in('id', [...programIds]);
+      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
+      (programs || []).forEach((p) => { if (p.school_id) schoolIds.add(p.school_id); });
+    }
+    if (schoolIds.size && Object.keys(schoolMap).length === 0) {
+      const { data: schools } = await supabase.from('schools').select('id, name').in('id', [...schoolIds]);
+      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
+    } else if (schoolIds.size) {
+      const missing = [...schoolIds].filter((id) => !schoolMap[id]);
+      if (missing.length) {
+        const { data: schools } = await supabase.from('schools').select('id, name').in('id', missing);
+        (schools || []).forEach((s) => { schoolMap[s.id] = s.name; });
+      }
     }
     const drives = (data || []).map((d) => {
-      const elig = eligibilityByDrive[d.id];
-      const sid = elig && Array.isArray(elig.allowed_school_ids) && elig.allowed_school_ids.length > 0
+      const elig = d.eligibility_criteria || null;
+      let sid = elig && Array.isArray(elig.allowed_school_ids) && elig.allowed_school_ids.length > 0
         ? elig.allowed_school_ids[0] : d.eligibility_academics?.school_id;
       const pid = elig && Array.isArray(elig.allowed_program_ids) && elig.allowed_program_ids.length > 0
         ? elig.allowed_program_ids[0] : d.eligibility_academics?.program_id;
+      if (!sid && pid && programMap[pid]?.school_id) sid = programMap[pid].school_id;
+      const prog = pid && programMap[pid] ? programMap[pid] : null;
       return {
         ...d,
         process_rounds: sanitizeProcessRounds(d.process_rounds),
@@ -590,7 +596,7 @@ exports.getAllDrives = async (req, res) => {
         school_id: sid ?? null,
         program_id: pid ?? null,
         school: sid ? schoolMap[sid] ?? null : null,
-        program: pid ? programMap[pid] ?? null : null,
+        program: prog ? (typeof prog === 'object' ? prog.name : prog) : (pid && programMap[pid] ? programMap[pid].name : null),
         registered_count: registeredCountByDrive[d.id] ?? 0,
       };
     });
@@ -679,11 +685,7 @@ exports.getDriveById = async (req, res) => {
       if (error.code === 'PGRST116') return res.status(404).json({ message: 'Drive not found' });
       throw error;
     }
-    const { data: elig } = await supabase
-      .from('placement_drive_eligibility')
-      .select('*')
-      .eq('placement_drive_id', id)
-      .maybeSingle();
+    const elig = data.eligibility_criteria || null;
     const sid = elig?.allowed_school_ids?.[0] ?? data.eligibility_academics?.school_id;
     const pid = elig?.allowed_program_ids?.[0] ?? data.eligibility_academics?.program_id;
     let school = null;
@@ -1260,7 +1262,7 @@ exports.updatePlacementDriveStatusOnly = async (req, res) => {
 
 /**
  * GET /placement/drives/:driveId/eligibility
- * Returns placement_drive_eligibility for a drive.
+ * Returns eligibility_criteria for a drive (from placements_drives).
  */
 exports.getDriveEligibility = async (req, res) => {
   try {
@@ -1268,13 +1270,13 @@ exports.getDriveEligibility = async (req, res) => {
     if (Number.isNaN(driveId)) return res.status(400).json({ message: 'Invalid drive ID' });
 
     const { data, error } = await supabase
-      .from('placement_drive_eligibility')
-      .select('*')
-      .eq('placement_drive_id', driveId)
+      .from('placements_drives')
+      .select('eligibility_criteria')
+      .eq('id', driveId)
       .maybeSingle();
 
     if (error) throw error;
-    res.json(data || null);
+    res.json(data?.eligibility_criteria || null);
   } catch (err) {
     logger.error('getDriveEligibility:', err);
     res.status(500).json({ message: apiMessage(err, 'Server error') });
@@ -1283,7 +1285,7 @@ exports.getDriveEligibility = async (req, res) => {
 
 /**
  * PUT /placement/drives/:driveId/eligibility
- * Upsert placement_drive_eligibility for a drive.
+ * Upsert eligibility_criteria on placements_drives for a drive.
  */
 exports.upsertDriveEligibility = async (req, res) => {
   try {
@@ -1303,8 +1305,7 @@ exports.upsertDriveEligibility = async (req, res) => {
       return arr.map((x) => (typeof x === 'number' ? x : parseInt(x, 10))).filter((n) => !Number.isNaN(n));
     };
 
-    const payload = {
-      placement_drive_id: driveId,
+    const eligibilityCriteria = {
       min_cgpa: body.min_cgpa != null && body.min_cgpa !== '' ? parseFloat(body.min_cgpa) : null,
       max_cgpa: body.max_cgpa != null && body.max_cgpa !== '' ? parseFloat(body.max_cgpa) : null,
       max_active_backlogs: body.max_active_backlogs != null && body.max_active_backlogs !== '' ? parseInt(body.max_active_backlogs, 10) : null,
@@ -1327,35 +1328,16 @@ exports.upsertDriveEligibility = async (req, res) => {
       admin_override_allowed: body.admin_override_allowed === true,
       max_total_offers: body.max_total_offers != null && body.max_total_offers !== '' ? parseInt(body.max_total_offers, 10) : null,
     };
-    Object.keys(payload).forEach((k) => { if (payload[k] === undefined) delete payload[k]; });
+    Object.keys(eligibilityCriteria).forEach((k) => { if (eligibilityCriteria[k] === undefined) delete eligibilityCriteria[k]; });
 
-    const { data: existing } = await supabase
-      .from('placement_drive_eligibility')
-      .select('id')
-      .eq('placement_drive_id', driveId)
-      .maybeSingle();
-
-    delete payload.placement_drive_id;
-    let result;
-    if (existing) {
-      const { data: updated, error: updErr } = await supabase
-        .from('placement_drive_eligibility')
-        .update(payload)
-        .eq('id', existing.id)
-        .select()
-        .single();
-      if (updErr) throw updErr;
-      result = updated;
-    } else {
-      payload.placement_drive_id = driveId;
-      const { data: inserted, error: insErr } = await supabase
-        .from('placement_drive_eligibility')
-        .insert(payload)
-        .select()
-        .single();
-      if (insErr) throw insErr;
-      result = inserted;
-    }
+    const { data: updated, error: updErr } = await supabase
+      .from('placements_drives')
+      .update({ eligibility_criteria: eligibilityCriteria, updated_at: new Date().toISOString() })
+      .eq('id', driveId)
+      .select()
+      .single();
+    if (updErr) throw updErr;
+    const result = { ...updated, ...eligibilityCriteria };
 
     // Add all eligible students to this drive's process
     try {
@@ -1534,11 +1516,12 @@ exports.getStudentsForPlacement = async (req, res) => {
       });
 
       if (driveId) {
-        const { data: elig } = await supabase
-          .from('placement_drive_eligibility')
-          .select('*')
-          .eq('placement_drive_id', driveId)
+        const { data: driveRow } = await supabase
+          .from('placements_drives')
+          .select('eligibility_criteria')
+          .eq('id', driveId)
           .maybeSingle();
+        const elig = driveRow?.eligibility_criteria || null;
         if (elig) {
           list = list.map((s) => {
             const { isEligible, rejectionReasons } = evaluateEligibility(s, elig);
@@ -2155,24 +2138,19 @@ exports.deleteCompanyContact = async (req, res) => {
 exports.getPlacementOverview = async (req, res) => {
   try {
     const academicYear = req.query.academic_year || null;
-    const snapshotQuery = supabase.from('placement_academic_year_snapshot').select('*');
     const [
       { data: students },
       { data: schools },
       { data: programs },
       { data: policies },
-      { data: snapshotRows },
       { data: placementRows },
-      { data: allSnapshotYears },
       { data: placementYears }
     ] = await Promise.all([
       supabase.from('student_basic_details').select('usn, school_id, program_id, year_of_joining, current_year'),
       supabase.from('schools').select('id, name'),
       supabase.from('programs').select('id, school_id, name, graduation_level'),
       supabase.from('batch_academic_policies').select('school_id, program_id, joining_year, summer_immersion, summer_internship, capstone, placement'),
-      snapshotQuery,
       supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa, academic_year'),
-      supabase.from('placement_academic_year_snapshot').select('academic_year'),
       supabase.from('placement').select('academic_year')
     ]);
 
@@ -2280,46 +2258,34 @@ exports.getPlacementOverview = async (req, res) => {
       return acc;
     }, {});
 
+    // Compute schoolOverview from live placement data (by school)
     const schoolOverview = {};
+    const studentToSchool = {};
     (students || []).forEach((s) => {
       const schoolName = schoolMap[s.school_id] || 'Unknown';
+      studentToSchool[s.usn] = schoolName;
       if (!schoolOverview[schoolName]) schoolOverview[schoolName] = { max: 0, min: 0, avg: 0, median: 0, paidInternships: 0 };
-      const placements = placementByStudent[s.usn] || [];
-      placements.forEach((pl) => {
-        const ctc = pl.ctc_max_lpa != null ? pl.ctc_max_lpa : pl.ctc_min_lpa;
-        if (ctc != null) {
-          if (schoolOverview[schoolName].max < ctc) schoolOverview[schoolName].max = ctc;
-          if (schoolOverview[schoolName].min === 0 || schoolOverview[schoolName].min > ctc) schoolOverview[schoolName].min = ctc;
-        }
-      });
     });
-    const snapshotRowsForYear = academicYear && parseAcademicYearStart(academicYear) != null
-      ? (snapshotRows || []).filter((r) => parseAcademicYearStart(r.academic_year) === parseAcademicYearStart(academicYear))
-      : (snapshotRows || []);
-    const schoolSnapshots = snapshotRowsForYear.reduce((acc, r) => {
-      const name = r.school_name || 'Unknown';
-      if (!acc[name]) acc[name] = [];
-      acc[name].push(r);
-      return acc;
-    }, {});
-    Object.keys(schoolSnapshots).forEach((name) => {
-      if (!schoolOverview[name]) schoolOverview[name] = { max: 0, min: 0, avg: 0, median: 0, paidInternships: 0 };
+    const ctcBySchool = {};
+    (placementRowsFiltered || []).forEach((pl) => {
+      const schoolName = studentToSchool[pl.student_id];
+      if (!schoolName) return;
+      const ctc = pl.ctc_max_lpa != null ? Number(pl.ctc_max_lpa) : pl.ctc_min_lpa != null ? Number(pl.ctc_min_lpa) : null;
+      if (ctc != null && !Number.isNaN(ctc)) {
+        if (!ctcBySchool[schoolName]) ctcBySchool[schoolName] = [];
+        ctcBySchool[schoolName].push(ctc);
+      }
     });
-    Object.keys(schoolOverview).forEach((name) => {
-      const snaps = schoolSnapshots[name] || [];
-      if (snaps.length > 0) {
-        const maxVal = Math.max(...snaps.map((s) => Number(s.max_ctc) || 0));
-        const minVals = snaps.map((s) => Number(s.min_ctc)).filter((n) => n > 0);
-        const minVal = minVals.length > 0 ? Math.min(...minVals) : 0;
-        const avgVal = snaps.reduce((sum, s) => sum + (Number(s.avg_ctc) || 0), 0) / snaps.length;
-        const medianVals = snaps.map((s) => Number(s.median_ctc)).filter((n) => !Number.isNaN(n));
-        const medianVal = medianVals.length > 0 ? medianVals.reduce((a, b) => a + b, 0) / medianVals.length : 0;
-        const paidVal = snaps.reduce((sum, s) => sum + (Number(s.paid_internships_count) || 0), 0);
-        schoolOverview[name].max = maxVal || schoolOverview[name].max;
-        schoolOverview[name].min = minVal || schoolOverview[name].min;
-        schoolOverview[name].avg = avgVal || 0;
-        schoolOverview[name].median = medianVal || 0;
-        schoolOverview[name].paidInternships = paidVal;
+    Object.keys(ctcBySchool).forEach((name) => {
+      const vals = ctcBySchool[name].sort((a, b) => a - b);
+      if (vals.length > 0) {
+        schoolOverview[name] = schoolOverview[name] || { max: 0, min: 0, avg: 0, median: 0, paidInternships: 0 };
+        schoolOverview[name].max = Math.max(...vals);
+        schoolOverview[name].min = Math.min(...vals);
+        schoolOverview[name].avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+        schoolOverview[name].median = vals.length % 2 === 1
+          ? vals[Math.floor(vals.length / 2)]
+          : (vals[vals.length / 2 - 1] + vals[vals.length / 2]) / 2;
       }
     });
 
@@ -2332,11 +2298,10 @@ exports.getPlacementOverview = async (req, res) => {
       return (a.currentYear || 0) - (b.currentYear || 0);
     });
 
-    // Build academic years: fill complete range from min to max (no gaps like missing 2022-23)
-    const fromSnapshot = (allSnapshotYears || snapshotRows || []).map((r) => parseAcademicYearStart(r.academic_year)).filter(Boolean);
+    // Build academic years: from placement academic_year and students' year_of_joining
     const fromPlacement = (placementYears || []).map((r) => parseAcademicYearStart(r.academic_year)).filter(Boolean);
     const fromJoining = [...new Set((students || []).map((s) => s.year_of_joining).filter(Boolean))];
-    const allStarts = [...new Set([...fromSnapshot, ...fromPlacement, ...fromJoining])].filter((y) => y >= 2000 && y <= 2030);
+    const allStarts = [...new Set([...fromPlacement, ...fromJoining])].filter((y) => y >= 2000 && y <= 2030);
     const minYear = allStarts.length > 0 ? Math.min(...allStarts) : new Date().getFullYear();
     const maxYear = allStarts.length > 0 ? Math.max(...allStarts) : new Date().getFullYear();
     const academicYears = [];

@@ -246,6 +246,7 @@ exports.getDrives = async (req, res) => {
         ctc_structure, stipend_structure, process_rounds, number_of_openings,
         number_of_registrations, placement_status, last_date_to_registration,
         event_datetime, onboarded_date, tpo, company_remarks, created_at,
+        eligibility_criteria,
         company:companies (company_name)
       `)
       .eq('company_id', companyId)
@@ -254,20 +255,10 @@ exports.getDrives = async (req, res) => {
     if (error) throw error;
 
     const rows = data || [];
-    const driveIds = rows.map((d) => d.id).filter(Boolean);
-
-    let eligibilityByDrive = {};
-    if (driveIds.length > 0) {
-      const { data: eligibilityRows } = await supabase
-        .from('placement_drive_eligibility')
-        .select('*')
-        .in('placement_drive_id', driveIds);
-      (eligibilityRows || []).forEach((e) => { eligibilityByDrive[e.placement_drive_id] = e; });
-    }
     const schoolIds = new Set();
     const programIds = new Set();
     rows.forEach((d) => {
-      const elig = eligibilityByDrive[d.id];
+      const elig = d.eligibility_criteria || null;
       if (elig && Array.isArray(elig.allowed_school_ids)) elig.allowed_school_ids.forEach((id) => schoolIds.add(id));
       if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
     });
@@ -283,7 +274,7 @@ exports.getDrives = async (req, res) => {
     }
 
     const drives = rows.map((d) => {
-      const elig = eligibilityByDrive[d.id];
+      const elig = d.eligibility_criteria || null;
       const sid = elig && Array.isArray(elig.allowed_school_ids) && elig.allowed_school_ids.length > 0
         ? elig.allowed_school_ids[0] : null;
       const pid = elig && Array.isArray(elig.allowed_program_ids) && elig.allowed_program_ids.length > 0
@@ -352,26 +343,16 @@ exports.getDriveEligibility = async (req, res) => {
 
     const { id } = req.params;
 
-    // First verify the drive belongs to this company
-    const { data: drive } = await supabase
+    const { data, error } = await supabase
       .from('placements_drives')
-      .select('id')
+      .select('eligibility_criteria')
       .eq('id', id)
       .eq('company_id', companyId)
-      .single();
+      .maybeSingle();
 
-    if (!drive) {
-      return res.status(404).json({ error: 'Drive not found' });
-    }
-
-    const { data, error } = await supabase
-      .from('placement_drive_eligibility')
-      .select('*')
-      .eq('placement_drive_id', id)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error;
-    res.json({ data: data || null });
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Drive not found' });
+    res.json({ data: data.eligibility_criteria || null });
   } catch (err) {
     logger.error('getDriveEligibility error:', err);
     res.status(500).json({ error: 'Failed to fetch eligibility criteria' });
