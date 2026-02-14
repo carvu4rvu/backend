@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const placementController = require('../controllers/placementController');
+const placementReportsController = require('../controllers/placementReportsController');
 const emailRecipientsController = require('../controllers/emailRecipientsController');
 const violationsController = require('../controllers/violationsController');
 const studentEditControlController = require('../controllers/studentEditControlController');
+const semesterUnlockRequestController = require('../controllers/semesterUnlockRequestController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 
 // Validate critical middleware/handlers (avoids cryptic "argument handler must be a function" crash)
@@ -45,6 +47,38 @@ router.get('/students/overview-table', authenticateToken, authorizeRoles('admin'
 router.get('/students/eligibility', authenticateToken, authorizeRoles('admin'), placementController.getStudentsEligibility);
 router.put('/students/eligibility/bulk', authenticateToken, authorizeRoles('admin'), placementController.bulkUpdateStudentEligibility);
 router.put('/students/:usn/eligibility', authenticateToken, authorizeRoles('admin'), placementController.updateStudentEligibility);
+
+// Semester unlock requests - must be before /students/:usn
+router.get(
+  '/students/sem-unlock-requests',
+  authenticateToken,
+  authorizeRoles('admin'),
+  semesterUnlockRequestController.list
+);
+router.get(
+  '/students/sem-unlock-requests/me',
+  authenticateToken,
+  authorizeRoles('student'),
+  semesterUnlockRequestController.getMyPending
+);
+router.post(
+  '/students/sem-unlock-requests',
+  authenticateToken,
+  authorizeRoles('student'),
+  semesterUnlockRequestController.create
+);
+router.put(
+  '/students/sem-unlock-requests/:id/approve',
+  authenticateToken,
+  authorizeRoles('admin'),
+  semesterUnlockRequestController.approve
+);
+router.put(
+  '/students/sem-unlock-requests/:id/reject',
+  authenticateToken,
+  authorizeRoles('admin'),
+  semesterUnlockRequestController.reject
+);
 
 // Student edit control (profile locks) - admin only
 router.get(
@@ -127,6 +161,9 @@ router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin'), placem
 
 // Dashboard Stats (admin and VC - VC can only view dashboard)
 router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardStats);
+
+// Placement Reports (admin)
+router.get('/reports', authenticateToken, authorizeRoles('admin'), placementReportsController.getPlacementReport);
 
 // HR Recommendations (admin)
 router.get('/hr-recommendations', authenticateToken, authorizeRoles('admin'), placementController.getAllHrRecommendations);

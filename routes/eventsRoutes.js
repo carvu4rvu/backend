@@ -5,6 +5,7 @@ const { authenticateToken, authorizeRoles } = require('../middleware/authMiddlew
 
 // Public
 router.get('/', eventsController.list);
+router.get('/notification-stats', eventsController.getNotificationStats);
 router.get('/:id', eventsController.getById);
 
 // Admin only

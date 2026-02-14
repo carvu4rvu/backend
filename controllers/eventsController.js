@@ -25,6 +25,44 @@ exports.list = async (req, res) => {
 };
 
 /**
+ * GET /events/notification-stats
+ * Returns eventId -> { notificationId, sent, read } for events that have linked notifications.
+ */
+exports.getNotificationStats = async (req, res) => {
+  try {
+    const { data: notifications } = await supabase
+      .from('notifications')
+      .select('id, link')
+      .eq('is_active', true);
+    const stats = {};
+    for (const n of notifications || []) {
+      const m = (n.link || '').match(/event[s]?[\/\-](\d+)/i) || (n.link || '').match(/\?.*event[=_]?(\d+)/i);
+      if (m) {
+        const eventId = m[1];
+        stats[eventId] = { notificationId: n.id, sent: 0, read: 0 };
+      }
+    }
+    const { data: nodes } = await supabase
+      .from('notification_nodes')
+      .select('notification_id, is_read');
+    for (const node of nodes || []) {
+      const n = (notifications || []).find((x) => x.id === node.notification_id);
+      if (n) {
+        const m = (n.link || '').match(/event[s]?[\/\-](\d+)/i) || (n.link || '').match(/\?.*event[=_]?(\d+)/i);
+        if (m && stats[m[1]]) {
+          stats[m[1]].sent = (stats[m[1]].sent || 0) + 1;
+          if (node.is_read) stats[m[1]].read = (stats[m[1]].read || 0) + 1;
+        }
+      }
+    }
+    res.json(stats);
+  } catch (err) {
+    console.error('Events getNotificationStats error:', err);
+    res.json({});
+  }
+};
+
+/**
  * Get single event by id
  */
 exports.getById = async (req, res) => {

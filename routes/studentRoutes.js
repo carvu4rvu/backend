@@ -4,7 +4,13 @@ const studentController = require('../controllers/studentController');
 const studentProfileController = require('../controllers/studentProfileController');
 const studentAcademicsController = require('../controllers/studentAcademicsController');
 const studentEditControlController = require('../controllers/studentEditControlController');
+const studentNotificationController = require('../controllers/studentNotificationController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
+
+// Student notifications (authenticated student - own notifications)
+router.get('/notifications/unread-count', authenticateToken, studentNotificationController.getUnreadCount);
+router.get('/notifications', authenticateToken, studentNotificationController.list);
+router.patch('/notifications/:nodeId', authenticateToken, studentNotificationController.updateNode);
 
 // Metadata routes (public - no auth needed)
 router.get('/schools', studentProfileController.getSchools);

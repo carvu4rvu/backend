@@ -2155,22 +2155,25 @@ exports.deleteCompanyContact = async (req, res) => {
 exports.getPlacementOverview = async (req, res) => {
   try {
     const academicYear = req.query.academic_year || null;
-    let snapshotQuery = supabase.from('placement_academic_year_snapshot').select('*');
-    if (academicYear) snapshotQuery = snapshotQuery.eq('academic_year', academicYear);
+    const snapshotQuery = supabase.from('placement_academic_year_snapshot').select('*');
     const [
       { data: students },
       { data: schools },
       { data: programs },
       { data: policies },
       { data: snapshotRows },
-      { data: placementRows }
+      { data: placementRows },
+      { data: allSnapshotYears },
+      { data: placementYears }
     ] = await Promise.all([
       supabase.from('student_basic_details').select('usn, school_id, program_id, year_of_joining, current_year'),
       supabase.from('schools').select('id, name'),
       supabase.from('programs').select('id, school_id, name, graduation_level'),
       supabase.from('batch_academic_policies').select('school_id, program_id, joining_year, summer_immersion, summer_internship, capstone, placement'),
       snapshotQuery,
-      supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa, academic_year')
+      supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa, academic_year'),
+      supabase.from('placement_academic_year_snapshot').select('academic_year'),
+      supabase.from('placement').select('academic_year')
     ]);
 
     const schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
@@ -2212,20 +2215,46 @@ exports.getPlacementOverview = async (req, res) => {
       return 'Foundation';
     }
 
+    // Parse academic year to get start year (e.g. "2023", "2023-24", "2024" -> 2023)
+    const parseAcademicYearStart = (ay) => {
+      if (!ay) return null;
+      const str = String(ay).trim();
+      const m = str.match(/^(\d{4})/);
+      return m ? parseInt(m[1], 10) : parseInt(str, 10) || null;
+    };
+
     const key = (schoolId, programId, year) => `${schoolId}-${programId}-${year}`;
     const agg = {};
+    const academicYearStart = parseAcademicYearStart(academicYear);
+
     (students || []).forEach((s) => {
-      const k = key(s.school_id, s.program_id, s.current_year);
+      const prog = programMap[s.program_id];
+      const isPG = (prog && prog.graduation_level || '').toUpperCase() === 'PG';
+      const maxYear = isPG ? 2 : 6; // PG: 2 years (master's); UG: up to 6 years
+
+      // When academic year is selected: compute effective year from year_of_joining
+      // year_of_joining = when they joined THIS program (PG students joined PG here, not bachelor's)
+      // Formula: effective_year = academicYearStart - year_of_joining + 1
+      let yearToUse;
+      if (academicYearStart != null && s.year_of_joining != null) {
+        const effectiveYear = academicYearStart - Number(s.year_of_joining) + 1;
+        if (effectiveYear < 1 || effectiveYear > maxYear) return; // PG: 1-2, UG: 1-6
+        yearToUse = effectiveYear;
+      } else {
+        yearToUse = s.current_year;
+        if (!yearToUse) return;
+      }
+
+      const k = key(s.school_id, s.program_id, yearToUse);
       if (!agg[k]) {
         const schoolName = schoolMap[s.school_id] || 'Unknown';
-        const prog = programMap[s.program_id];
         agg[k] = {
           school: schoolName,
           course: prog ? prog.name : 'Unknown',
-          currentYear: s.current_year,
-          currentYearLabel: yearLabels[s.current_year] || `${s.current_year}`,
+          currentYear: yearToUse,
+          currentYearLabel: yearLabels[yearToUse] || `${yearToUse}`,
           batchStrength: 0,
-          mode: getMode(prog && prog.graduation_level, s.current_year, s.year_of_joining, s.school_id, s.program_id),
+          mode: getMode(prog && prog.graduation_level, yearToUse, s.year_of_joining, s.school_id, s.program_id),
           studentsTrained: 0,
           optedIn: 0,
           currentPlacement: 0,
@@ -2235,7 +2264,18 @@ exports.getPlacementOverview = async (req, res) => {
       agg[k].batchStrength += 1;
     });
 
-    const placementByStudent = (placementRows || []).reduce((acc, p) => {
+    const placementRowsFiltered = academicYear
+      ? (placementRows || []).filter((p) => {
+          const py = String(p.academic_year || '').trim();
+          const ay = String(academicYear).trim();
+          if (py === ay) return true;
+          const ayStart = parseAcademicYearStart(ay);
+          const pyStart = parseAcademicYearStart(py);
+          if (ayStart != null && pyStart != null && ayStart === pyStart) return true; // "2023" and "2023-24" match
+          return false;
+        })
+      : (placementRows || []);
+    const placementByStudent = placementRowsFiltered.reduce((acc, p) => {
       acc[p.student_id] = (acc[p.student_id] || []).concat(p);
       return acc;
     }, {});
@@ -2253,17 +2293,37 @@ exports.getPlacementOverview = async (req, res) => {
         }
       });
     });
+    const snapshotRowsForYear = academicYear && parseAcademicYearStart(academicYear) != null
+      ? (snapshotRows || []).filter((r) => parseAcademicYearStart(r.academic_year) === parseAcademicYearStart(academicYear))
+      : (snapshotRows || []);
+    const schoolSnapshots = snapshotRowsForYear.reduce((acc, r) => {
+      const name = r.school_name || 'Unknown';
+      if (!acc[name]) acc[name] = [];
+      acc[name].push(r);
+      return acc;
+    }, {});
+    Object.keys(schoolSnapshots).forEach((name) => {
+      if (!schoolOverview[name]) schoolOverview[name] = { max: 0, min: 0, avg: 0, median: 0, paidInternships: 0 };
+    });
     Object.keys(schoolOverview).forEach((name) => {
-      const snap = (snapshotRows || []).find((r) => r.school_name === name);
-      if (snap) {
-        schoolOverview[name].max = snap.max_ctc != null ? Number(snap.max_ctc) : schoolOverview[name].max;
-        schoolOverview[name].min = snap.min_ctc != null ? Number(snap.min_ctc) : schoolOverview[name].min;
-        schoolOverview[name].avg = snap.avg_ctc != null ? Number(snap.avg_ctc) : 0;
-        schoolOverview[name].median = snap.median_ctc != null ? Number(snap.median_ctc) : 0;
-        schoolOverview[name].paidInternships = snap.paid_internships_count != null ? snap.paid_internships_count : 0;
+      const snaps = schoolSnapshots[name] || [];
+      if (snaps.length > 0) {
+        const maxVal = Math.max(...snaps.map((s) => Number(s.max_ctc) || 0));
+        const minVals = snaps.map((s) => Number(s.min_ctc)).filter((n) => n > 0);
+        const minVal = minVals.length > 0 ? Math.min(...minVals) : 0;
+        const avgVal = snaps.reduce((sum, s) => sum + (Number(s.avg_ctc) || 0), 0) / snaps.length;
+        const medianVals = snaps.map((s) => Number(s.median_ctc)).filter((n) => !Number.isNaN(n));
+        const medianVal = medianVals.length > 0 ? medianVals.reduce((a, b) => a + b, 0) / medianVals.length : 0;
+        const paidVal = snaps.reduce((sum, s) => sum + (Number(s.paid_internships_count) || 0), 0);
+        schoolOverview[name].max = maxVal || schoolOverview[name].max;
+        schoolOverview[name].min = minVal || schoolOverview[name].min;
+        schoolOverview[name].avg = avgVal || 0;
+        schoolOverview[name].median = medianVal || 0;
+        schoolOverview[name].paidInternships = paidVal;
       }
     });
 
+    // Rows always from live aggregation (batch strength recalculated from year_of_joining when academic year selected)
     const rows = Object.values(agg).sort((a, b) => {
       const sc = (a.school || '').localeCompare(b.school || '');
       if (sc !== 0) return sc;
@@ -2272,10 +2332,16 @@ exports.getPlacementOverview = async (req, res) => {
       return (a.currentYear || 0) - (b.currentYear || 0);
     });
 
-    const academicYears = [...new Set((snapshotRows || []).map((r) => r.academic_year).filter(Boolean))].sort().reverse();
-    if (academicYears.length === 0) {
-      const years = [...new Set((students || []).map((s) => s.year_of_joining).filter(Boolean))].sort().reverse();
-      academicYears.push(...years.map((y) => String(y)));
+    // Build academic years: fill complete range from min to max (no gaps like missing 2022-23)
+    const fromSnapshot = (allSnapshotYears || snapshotRows || []).map((r) => parseAcademicYearStart(r.academic_year)).filter(Boolean);
+    const fromPlacement = (placementYears || []).map((r) => parseAcademicYearStart(r.academic_year)).filter(Boolean);
+    const fromJoining = [...new Set((students || []).map((s) => s.year_of_joining).filter(Boolean))];
+    const allStarts = [...new Set([...fromSnapshot, ...fromPlacement, ...fromJoining])].filter((y) => y >= 2000 && y <= 2030);
+    const minYear = allStarts.length > 0 ? Math.min(...allStarts) : new Date().getFullYear();
+    const maxYear = allStarts.length > 0 ? Math.max(...allStarts) : new Date().getFullYear();
+    const academicYears = [];
+    for (let y = maxYear; y >= minYear; y--) {
+      academicYears.push(`${y}-${String(y + 1).slice(-2)}`);
     }
 
     res.json({ rows, schoolOverview, academicYears });
