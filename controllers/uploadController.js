@@ -1,10 +1,9 @@
-const fs = require('fs');
-const path = require('path');
+const storageService = require('../services/storageService');
 
 exports.uploadFile = async (req, res) => {
   try {
     const file = req.file;
-    const { usn, folder } = req.body;
+    const { usn, folder, project_id, alumni_id, company_id } = req.body;
 
     if (!file) {
       const contentType = req.headers['content-type'] || '';
@@ -12,50 +11,30 @@ exports.uploadFile = async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded', error: 'No file uploaded', hint });
     }
 
-    if (!usn) {
-      return res.status(400).json({ error: 'USN is required' });
+    const entityId = usn || project_id || alumni_id || company_id;
+    if (!entityId) {
+      return res.status(400).json({ error: 'USN, project_id, alumni_id, or company_id is required' });
     }
 
-    // Sanitize USN and folder name
-    const sanitizedUsn = usn.replace(/[^a-zA-Z0-9]/g, '_');
-    const sanitizedFolder = (folder || 'uploads').replace(/[^a-zA-Z0-9]/g, '_');
-    
-    // Create directory structure: public/{folder}/{usn}/
-    const publicDir = path.join(__dirname, '..', 'public');
-    const folderDir = path.join(publicDir, sanitizedFolder);
-    const usnDir = path.join(folderDir, sanitizedUsn);
+    let bucketOverride;
+    if (alumni_id != null) bucketOverride = 'alumni-assets';
+    else if (company_id != null) bucketOverride = 'company-assets';
+    else if (project_id != null) bucketOverride = 'projects';
 
-    // Create directories if they don't exist
-    if (!fs.existsSync(publicDir)) {
-      fs.mkdirSync(publicDir, { recursive: true });
-    }
-    if (!fs.existsSync(folderDir)) {
-      fs.mkdirSync(folderDir, { recursive: true });
-    }
-    if (!fs.existsSync(usnDir)) {
-      fs.mkdirSync(usnDir, { recursive: true });
-    }
-
-    // Generate a server-side filename (no user-provided name)
-    const timestamp = Date.now();
-    const fileExtension = path.extname(file.originalname) || '';
-    const randomPart = Math.random().toString(36).slice(2, 10);
-    const fileName = `${timestamp}_${randomPart}${fileExtension}`;
-    const filePath = path.join(usnDir, fileName);
-
-    // Write file to disk
-    fs.writeFileSync(filePath, file.buffer);
-
-    // Return relative path from public directory (for URL construction)
-    const relativePath = path.join(sanitizedFolder, sanitizedUsn, fileName).replace(/\\/g, '/');
-    const url = `/uploads/${relativePath}`;
+    const { url, path: storagePath, bucket } = await storageService.upload(
+      file.buffer,
+      folder || 'uploads',
+      entityId,
+      file.originalname,
+      bucketOverride
+    );
 
     res.status(200).json({
       message: 'File uploaded successfully',
-      path: relativePath,
-      url: url
+      path: storagePath,
+      url,
+      bucket,
     });
-
   } catch (err) {
     console.error('Upload controller error:', err);
     res.status(500).json({ error: 'Server error during upload', details: err.message });

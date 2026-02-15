@@ -1860,18 +1860,112 @@ exports.getStudentsOverviewTable = async (req, res) => {
   }
 };
 
+/**
+ * GET /placement/companies
+ * Returns companies with optional school_id filter.
+ * Query: school_id (optional) - filter to companies that have drives with students from this school.
+ * Response: { companies, schoolsList } - schoolsList = [{ id, name, count }] for filter UI.
+ * Logic: companies -> placements_drives -> student_placement_process -> student_basic_details.school_id
+ */
 exports.getAllCompanies = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('companies')
-      .select('*')
-      .order('company_name', { ascending: true });
+    const schoolIdParam = req.query.school_id;
+    const schoolId = schoolIdParam ? parseInt(schoolIdParam, 10) : null;
+    const filterBySchool = schoolId != null && !Number.isNaN(schoolId);
+
+    // Build company_id -> school_ids via: process -> drive -> company, process.usn -> student.school_id
+    const { data: processRows } = await supabase
+      .from('student_placement_process')
+      .select('placement_drive_id, usn');
+    const processList = processRows || [];
+    const driveIds = [...new Set(processList.map((p) => p.placement_drive_id).filter(Boolean))];
+
+    let companySchoolMap = {}; // company_id -> Set(school_id)
+    if (driveIds.length > 0) {
+      const { data: drives } = await supabase
+        .from('placements_drives')
+        .select('id, company_id')
+        .in('id', driveIds);
+      const driveToCompany = (drives || []).reduce((acc, d) => {
+        if (d.company_id != null) acc[d.id] = d.company_id;
+        return acc;
+      }, {});
+
+      const usns = [...new Set(processList.map((p) => p.usn).filter(Boolean))];
+      let studentSchoolMap = {};
+      if (usns.length > 0) {
+        const { data: students } = await supabase
+          .from('student_basic_details')
+          .select('usn, school_id')
+          .in('usn', usns);
+        studentSchoolMap = (students || []).reduce((acc, s) => {
+          if (s.school_id != null) acc[s.usn] = s.school_id;
+          return acc;
+        }, {});
+      }
+
+      processList.forEach((p) => {
+        const companyId = driveToCompany[p.placement_drive_id];
+        const schoolIdFromStudent = studentSchoolMap[p.usn];
+        if (companyId != null && schoolIdFromStudent != null) {
+          if (!companySchoolMap[companyId]) companySchoolMap[companyId] = new Set();
+          companySchoolMap[companyId].add(schoolIdFromStudent);
+        }
+      });
+    }
+
+    // Build schoolsList: schools that have at least one company (via drives/process)
+    const allSchoolIds = new Set();
+    Object.values(companySchoolMap).forEach((sids) => sids.forEach((sid) => allSchoolIds.add(sid)));
+    let schoolsList = [];
+    if (allSchoolIds.size > 0) {
+      const { data: schools } = await supabase
+        .from('schools')
+        .select('id, name')
+        .in('id', [...allSchoolIds])
+        .order('name', { ascending: true });
+      const schoolIdsWithCompanies = new Set();
+      Object.entries(companySchoolMap).forEach(([companyId, sids]) => {
+        sids.forEach((sid) => schoolIdsWithCompanies.add(sid));
+      });
+      schoolsList = (schools || []).map((s) => {
+        const count = Object.values(companySchoolMap).filter((sids) => sids.has(s.id)).length;
+        return { id: s.id, name: s.name, count };
+      }).filter((s) => s.count > 0);
+    }
+
+    // Fetch companies (filter by school if requested)
+    let companyIdsToFetch = null;
+    if (filterBySchool) {
+      companyIdsToFetch = Object.keys(companySchoolMap)
+        .filter((cid) => companySchoolMap[cid].has(schoolId))
+        .map((x) => parseInt(x, 10))
+        .filter((n) => !Number.isNaN(n));
+      if (companyIdsToFetch.length === 0) {
+        const { count } = await supabase.from('companies').select('*', { count: 'exact', head: true });
+        return res.json({ companies: [], schoolsList, totalCompanies: count ?? 0 });
+      }
+    }
+
+    let query = supabase.from('companies').select('*').order('company_name', { ascending: true });
+    if (companyIdsToFetch && companyIdsToFetch.length > 0) {
+      query = query.in('id', companyIdsToFetch);
+    }
+    const { data: companies, error } = await query;
 
     if (error) throw error;
-    res.json(data || []);
+
+    // totalCompanies = total count of all companies (for "All Schools" card)
+    let totalCompanies = (companies || []).length;
+    if (filterBySchool) {
+      const { count } = await supabase.from('companies').select('*', { count: 'exact', head: true });
+      totalCompanies = count ?? totalCompanies;
+    }
+
+    res.json({ companies: companies || [], schoolsList, totalCompanies });
   } catch (error) {
     logger.error('Error fetching companies:', error);
-    res.json([]);
+    res.status(500).json({ companies: [], schoolsList: [] });
   }
 };
 

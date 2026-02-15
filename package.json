@@ -9,7 +9,10 @@
     "dev": "nodemon server.js",
     "seed:students": "node scripts/seedStudents.js",
     "seed:companies": "node scripts/seedCompanies.js",
-    "seed:placement": "node scripts/seedPlacementData.js"
+    "seed:placement": "node scripts/seedPlacementData.js",
+    "storage:test": "node ../scripts/test-storage-connectivity.js",
+    "storage:migrate": "node ../scripts/migrate-to-supabase-storage.js",
+    "storage:verify": "node ../scripts/verify-db-storage-urls.js"
   },
   "keywords": [],
   "author": "",

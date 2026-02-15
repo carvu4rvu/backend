@@ -3,6 +3,31 @@ const router = express.Router();
 const multer = require('multer');
 const uploadController = require('../controllers/uploadController');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const storageService = require('../services/storageService');
+
+// GET /api/upload/asset?url=... - redirect to signed URL for private bucket files
+router.get('/asset', async (req, res) => {
+  try {
+    const url = req.query.url;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url query parameter required' });
+    }
+    if (!storageService.isSupabaseUrl(url)) {
+      return res.redirect(url);
+    }
+    const match = url.match(/\/storage\/v1\/object\/public\/([^/]+)\/(.+)$/);
+    if (!match) return res.redirect(url);
+    const [, bucket, filePath] = match;
+    if (storageService.PUBLIC_BUCKETS.includes(bucket)) {
+      return res.redirect(url);
+    }
+    const signedUrl = await storageService.getSignedUrl(bucket, filePath, 3600);
+    return res.redirect(signedUrl || url);
+  } catch (err) {
+    console.error('Asset URL error:', err);
+    res.status(500).json({ error: 'Failed to get asset URL' });
+  }
+});
 
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
