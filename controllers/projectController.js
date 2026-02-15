@@ -1412,3 +1412,653 @@ exports.adminUpdate = async (req, res) => {
     return sendCaughtError(res, error, 'Failed to update project.');
   }
 };
+
+/** Admin: assert project exists (no ownership check - admin has full access) */
+async function assertProjectExists(client, projectId) {
+  const r = await client.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+  return r.rows.length > 0;
+}
+
+/**
+ * Admin: get full project by id with all sub-tables
+ * GET /api/admin/projects/:id
+ */
+exports.adminGetById = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        `SELECT p.id, p.owner_usn, p.owner_user_id, p.title, p.short_description, p.description,
+          p.category, p.tags, p.visibility, p.hosted_url, p.github_url, p.mentor_name,
+          p.tech_stack, p.published_at, p.created_at, p.updated_at, p.priority, p.project_status
+         FROM projects p WHERE p.id = $1`,
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const p = projRes.rows[0];
+
+      const [assetsRes, variantsRes, metricsRes, ratingsRes, reviewsRes, shareLinksRes] = await Promise.all([
+        client.query(
+          'SELECT id, asset_type, asset_role, original_url, position, width, height, file_size_kb, mime_type, uploaded_at FROM project_assets WHERE project_id = $1 ORDER BY position',
+          [projectId]
+        ),
+        client.query(
+          `SELECT v.id, v.asset_id, v.variant_type, v.width, v.height, v.quality, v.variant_url, v.file_size_kb, v.created_at
+           FROM project_asset_variants v
+           JOIN project_assets a ON a.id = v.asset_id AND a.project_id = $1
+           ORDER BY v.asset_id, v.variant_type`,
+          [projectId]
+        ),
+        client.query(
+          'SELECT views, likes, favorites, avg_rating, rating_count, comments, last_updated FROM project_metrics WHERE project_id = $1',
+          [projectId]
+        ),
+        client.query(
+          'SELECT user_id, rating, rated_at FROM project_ratings WHERE project_id = $1 ORDER BY rated_at DESC',
+          [projectId]
+        ),
+        client.query(
+          `SELECT r.id, r.reviewer_id, r.owner_id, r.review_text, r.review_created_at, r.reply_text, r.reply_created_at,
+                  u.usn AS reviewer_usn
+           FROM project_reviews r
+           LEFT JOIN user_login u ON u.id = r.reviewer_id
+           WHERE r.project_id = $1 ORDER BY r.review_created_at DESC`,
+          [projectId]
+        ),
+        client.query(
+          'SELECT id, share_token, expires_at, is_active, created_at FROM project_share_links WHERE project_id = $1 ORDER BY created_at DESC',
+          [projectId]
+        ),
+      ]);
+
+      const assets = assetsRes.rows || [];
+      const variants = variantsRes.rows || [];
+      let metrics = metricsRes.rows[0] || null;
+      if (!metrics) {
+        const fallbackRes = await client.query(
+          `SELECT
+            (SELECT COUNT(*)::int FROM project_views WHERE project_id = $1) AS views,
+            (SELECT COUNT(*)::int FROM project_likes WHERE project_id = $1) AS likes,
+            (SELECT COUNT(*)::int FROM project_favorites WHERE project_id = $1) AS favorites,
+            (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1) AS avg_rating,
+            (SELECT COUNT(*)::int FROM project_ratings WHERE project_id = $1) AS rating_count,
+            (SELECT COUNT(*)::int FROM project_reviews WHERE project_id = $1) AS comments`,
+          [projectId]
+        );
+        metrics = { ...(fallbackRes.rows[0] || {}), last_updated: null };
+      }
+      metrics = {
+        views: metrics.views ?? 0,
+        likes: metrics.likes ?? 0,
+        favorites: metrics.favorites ?? 0,
+        avg_rating: Number(metrics.avg_rating ?? 0),
+        rating_count: metrics.rating_count ?? 0,
+        comments: metrics.comments ?? 0,
+        last_updated: metrics.last_updated ?? null,
+      };
+      const ratings = ratingsRes.rows || [];
+      const reviews = reviewsRes.rows || [];
+      const shareLinks = shareLinksRes.rows || [];
+
+      const variantsByAsset = {};
+      variants.forEach((v) => {
+        if (!variantsByAsset[v.asset_id]) variantsByAsset[v.asset_id] = [];
+        variantsByAsset[v.asset_id].push({
+          id: v.id,
+          variant_type: v.variant_type,
+          width: v.width,
+          height: v.height,
+          quality: v.quality,
+          variant_url: v.variant_url,
+          file_size_kb: v.file_size_kb,
+          created_at: v.created_at,
+        });
+      });
+
+      const assetsWithVariants = assets.map((a) => ({
+        id: a.id,
+        asset_type: a.asset_type,
+        asset_role: a.asset_role,
+        original_url: a.original_url,
+        position: a.position,
+        width: a.width,
+        height: a.height,
+        file_size_kb: a.file_size_kb,
+        mime_type: a.mime_type,
+        uploaded_at: a.uploaded_at,
+        variants: variantsByAsset[a.id] || [],
+      }));
+
+      const project_snaps = assets
+        .filter((a) => ['COVER', 'GALLERY'].includes(a.asset_role))
+        .sort((a, b) => a.position - b.position)
+        .map((a) => a.original_url);
+
+      const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
+      const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
+
+      res.json({
+        id: p.id,
+        owner_usn: p.owner_usn,
+        owner_user_id: p.owner_user_id,
+        title: p.title,
+        short_description: p.short_description,
+        description: p.description,
+        category: p.category,
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        visibility: p.visibility || 'PRIVATE',
+        hosted_url: p.hosted_url,
+        github_url: p.github_url,
+        mentor_name: p.mentor_name,
+        tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        published_at: p.published_at,
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+        priority: p.priority,
+        project_status: p.project_status,
+        project_snaps,
+        assets: assetsWithVariants,
+        metrics: {
+          views: metrics.views ?? 0,
+          likes: metrics.likes ?? 0,
+          favorites: metrics.favorites ?? 0,
+          avg_rating: Number(metrics.avg_rating ?? 0),
+          rating_count: metrics.rating_count ?? 0,
+          comments: metrics.comments ?? 0,
+          last_updated: metrics.last_updated,
+        },
+        ratings,
+        admin_rating: adminRating,
+        reviews,
+        share_links: shareLinks,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to fetch project.');
+  }
+};
+
+/**
+ * Admin: delete project and all sub-tables
+ * DELETE /api/admin/projects/:id
+ */
+exports.adminDelete = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const exists = await assertProjectExists(client, projectId);
+      if (!exists) return sendNotFound(res, 'Project not found.');
+
+      await client.query('DELETE FROM project_asset_variants WHERE asset_id IN (SELECT id FROM project_assets WHERE project_id = $1)', [projectId]);
+      await client.query('DELETE FROM project_assets WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_favorites WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_likes WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_ratings WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_reviews WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_share_links WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_views WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM project_metrics WHERE project_id = $1', [projectId]);
+      await client.query('DELETE FROM projects WHERE id = $1', [projectId]);
+
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete project.');
+  }
+};
+
+/**
+ * Admin: add asset to project
+ * POST /api/admin/projects/:id/assets
+ */
+exports.adminAddAsset = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const body = req.body || {};
+    const original_url = (body.original_url || '').trim();
+    if (!original_url) {
+      return sendValidationError(res, 'original_url is required.', { original_url: 'Asset URL is required.' });
+    }
+    const asset_type = (body.asset_type || 'IMAGE').toUpperCase();
+    const asset_role = (body.asset_role || 'GALLERY').toUpperCase();
+    const position = body.position != null ? parseInt(body.position, 10) : 0;
+    const width = body.width != null ? parseInt(body.width, 10) : null;
+    const height = body.height != null ? parseInt(body.height, 10) : null;
+    const file_size_kb = body.file_size_kb != null ? parseInt(body.file_size_kb, 10) : null;
+    const mime_type = (body.mime_type || '').trim() || null;
+
+    if (!VALID_ASSET_TYPES.includes(asset_type)) {
+      return sendValidationError(res, 'Invalid asset_type.', { asset_type: `Must be one of: ${VALID_ASSET_TYPES.join(', ')}` });
+    }
+    if (!VALID_ASSET_ROLES.includes(asset_role)) {
+      return sendValidationError(res, 'Invalid asset_role.', { asset_role: `Must be one of: ${VALID_ASSET_ROLES.join(', ')}` });
+    }
+
+    const client = await pool.connect();
+    try {
+      const exists = await assertProjectExists(client, projectId);
+      if (!exists) return sendNotFound(res, 'Project not found.');
+
+      const insertRes = await client.query(
+        `INSERT INTO project_assets (project_id, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, project_id, asset_type, asset_role, original_url, position`,
+        [projectId, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position]
+      );
+      const asset = insertRes.rows[0];
+      res.status(201).json(asset);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to add asset.');
+  }
+};
+
+/**
+ * Admin: delete asset (and its variants)
+ * DELETE /api/admin/projects/:id/assets/:assetId
+ */
+exports.adminDeleteAsset = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const assetId = parseInt(req.params.assetId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(assetId)) {
+      return sendValidationError(res, 'Invalid project or asset id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const checkRes = await client.query(
+        'SELECT id FROM project_assets WHERE project_id = $1 AND id = $2',
+        [projectId, assetId]
+      );
+      if (!checkRes.rows.length) return sendNotFound(res, 'Asset not found.');
+
+      await client.query('DELETE FROM project_asset_variants WHERE asset_id = $1', [assetId]);
+      await client.query('DELETE FROM project_assets WHERE id = $1', [assetId]);
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete asset.');
+  }
+};
+
+/**
+ * Admin: update asset (position, asset_role)
+ * PATCH /api/admin/projects/:id/assets/:assetId
+ */
+exports.adminUpdateAsset = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const assetId = parseInt(req.params.assetId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(assetId)) {
+      return sendValidationError(res, 'Invalid project or asset id.');
+    }
+
+    const body = req.body || {};
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    if (body.position != null) {
+      updates.push(`position = $${idx}`);
+      values.push(parseInt(body.position, 10));
+      idx++;
+    }
+    if (body.asset_role && VALID_ASSET_ROLES.includes(body.asset_role.toUpperCase())) {
+      updates.push(`asset_role = $${idx}`);
+      values.push(body.asset_role.toUpperCase());
+      idx++;
+    }
+
+    if (updates.length === 0) {
+      return sendValidationError(res, 'No valid fields to update.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const checkRes = await client.query(
+        'SELECT id FROM project_assets WHERE project_id = $1 AND id = $2',
+        [projectId, assetId]
+      );
+      if (!checkRes.rows.length) return sendNotFound(res, 'Asset not found.');
+
+      values.push(assetId);
+      await client.query(
+        `UPDATE project_assets SET ${updates.join(', ')} WHERE id = $${idx}`,
+        values
+      );
+
+      const assetRes = await client.query(
+        'SELECT id, project_id, asset_type, asset_role, original_url, position FROM project_assets WHERE id = $1',
+        [assetId]
+      );
+      res.json(assetRes.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to update asset.');
+  }
+};
+
+/**
+ * Admin: list variants for an asset
+ * GET /api/admin/projects/:id/assets/:assetId/variants
+ */
+exports.adminListVariants = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const assetId = parseInt(req.params.assetId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(assetId)) {
+      return sendValidationError(res, 'Invalid project or asset id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const checkRes = await client.query(
+        'SELECT id FROM project_assets WHERE project_id = $1 AND id = $2',
+        [projectId, assetId]
+      );
+      if (!checkRes.rows.length) return sendNotFound(res, 'Asset not found.');
+
+      const variantsRes = await client.query(
+        'SELECT id, asset_id, variant_type, width, height, quality, variant_url, file_size_kb, created_at FROM project_asset_variants WHERE asset_id = $1 ORDER BY variant_type',
+        [assetId]
+      );
+      res.json(variantsRes.rows || []);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to list variants.');
+  }
+};
+
+/**
+ * Admin: delete a variant
+ * DELETE /api/admin/projects/:id/assets/:assetId/variants/:variantId
+ */
+exports.adminDeleteVariant = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const assetId = parseInt(req.params.assetId, 10);
+    const variantId = parseInt(req.params.variantId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(assetId) || Number.isNaN(variantId)) {
+      return sendValidationError(res, 'Invalid project, asset or variant id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const checkRes = await client.query(
+        'SELECT id FROM project_assets WHERE project_id = $1 AND id = $2',
+        [projectId, assetId]
+      );
+      if (!checkRes.rows.length) return sendNotFound(res, 'Asset not found.');
+
+      const delRes = await client.query(
+        'DELETE FROM project_asset_variants WHERE id = $1 AND asset_id = $2 RETURNING id',
+        [variantId, assetId]
+      );
+      if (!delRes.rows.length) return sendNotFound(res, 'Variant not found.');
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete variant.');
+  }
+};
+
+/**
+ * Admin: list reviews for a project
+ * GET /api/admin/projects/:id/reviews
+ */
+exports.adminListReviews = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const exists = await assertProjectExists(client, projectId);
+      if (!exists) return sendNotFound(res, 'Project not found.');
+
+      const reviewsRes = await client.query(
+        `SELECT r.id, r.reviewer_id, r.owner_id, r.review_text, r.review_created_at, r.reply_text, r.reply_created_at,
+                u.usn AS reviewer_usn
+         FROM project_reviews r
+         LEFT JOIN user_login u ON u.id = r.reviewer_id
+         WHERE r.project_id = $1 ORDER BY r.review_created_at DESC`,
+        [projectId]
+      );
+      res.json(reviewsRes.rows || []);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to list reviews.');
+  }
+};
+
+/**
+ * Admin: add a review to a project
+ * POST /api/admin/projects/:id/reviews
+ */
+exports.adminAddReview = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return sendError(res, 401, 'Authentication required.');
+    }
+
+    const review_text = (req.body?.review_text || '').trim();
+    if (!review_text) {
+      return sendValidationError(res, 'review_text is required.', { review_text: 'Review text is required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const projRes = await client.query(
+        'SELECT id, owner_user_id, project_status FROM projects WHERE id = $1',
+        [projectId]
+      );
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
+      }
+      const ownerUserId = projRes.rows[0].owner_user_id;
+      const projectStatus = projRes.rows[0].project_status;
+      if (projectStatus !== 'approved') {
+        return sendError(res, 400, 'Reviews can only be added when the project is approved.');
+      }
+
+      const insertRes = await client.query(
+        `INSERT INTO project_reviews (project_id, reviewer_id, owner_id, review_text)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, project_id, reviewer_id, review_text, review_created_at, reply_text, reply_created_at`,
+        [projectId, userId, ownerUserId, review_text]
+      );
+
+      const reviewerUsn = req.user?.usn ?? null;
+      const row = insertRes.rows[0];
+      const reviewPayload = row ? { ...row, reviewer_usn: reviewerUsn } : row;
+
+      await client.query(
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
+         VALUES ($1, 0, 0, 0, 0, 0, 1, NOW())
+         ON CONFLICT (project_id) DO UPDATE SET comments = COALESCE(project_metrics.comments, 0) + 1, last_updated = NOW()`,
+        [projectId]
+      );
+
+      res.status(201).json(reviewPayload);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to add review.');
+  }
+};
+
+/**
+ * Admin: delete a review
+ * DELETE /api/admin/projects/:id/reviews/:reviewId
+ */
+exports.adminDeleteReview = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const reviewId = parseInt(req.params.reviewId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(reviewId)) {
+      return sendValidationError(res, 'Invalid project or review id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const delRes = await client.query(
+        'DELETE FROM project_reviews WHERE id = $1 AND project_id = $2 RETURNING id',
+        [reviewId, projectId]
+      );
+      if (!delRes.rows.length) return sendNotFound(res, 'Review not found.');
+      await client.query(
+        `UPDATE project_metrics SET comments = GREATEST(0, comments - 1), last_updated = NOW() WHERE project_id = $1`,
+        [projectId]
+      );
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete review.');
+  }
+};
+
+/**
+ * Admin: list share links for a project
+ * GET /api/admin/projects/:id/share-links
+ */
+exports.adminListShareLinks = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const exists = await assertProjectExists(client, projectId);
+      if (!exists) return sendNotFound(res, 'Project not found.');
+
+      const linksRes = await client.query(
+        'SELECT id, share_token, expires_at, is_active, created_at FROM project_share_links WHERE project_id = $1 ORDER BY created_at DESC',
+        [projectId]
+      );
+      res.json(linksRes.rows || []);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to list share links.');
+  }
+};
+
+/**
+ * Admin: create share link
+ * POST /api/admin/projects/:id/share-links
+ */
+exports.adminCreateShareLink = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (Number.isNaN(projectId)) {
+      return sendValidationError(res, 'Invalid project id.');
+    }
+
+    const expires_in_hours = req.body?.expires_in_hours != null ? parseInt(req.body.expires_in_hours, 10) : 168;
+    const expiresAt = expires_in_hours > 0
+      ? new Date(Date.now() + expires_in_hours * 60 * 60 * 1000)
+      : null;
+
+    const client = await pool.connect();
+    try {
+      const exists = await assertProjectExists(client, projectId);
+      if (!exists) return sendNotFound(res, 'Project not found.');
+
+      const projRes = await client.query('SELECT visibility FROM projects WHERE id = $1', [projectId]);
+      if (projRes.rows.length && projRes.rows[0].visibility !== 'PUBLIC_LINK') {
+        await client.query("UPDATE projects SET visibility = 'PUBLIC_LINK', updated_at = NOW() WHERE id = $1", [projectId]);
+      }
+
+      const shareToken = crypto.randomBytes(24).toString('hex');
+      await client.query(
+        `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active)
+         VALUES ($1, $2, $3, true)`,
+        [projectId, shareToken, expiresAt]
+      );
+
+      const linkRes = await client.query(
+        'SELECT id, share_token, expires_at, is_active, created_at FROM project_share_links WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1',
+        [projectId]
+      );
+      res.status(201).json(linkRes.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to create share link.');
+  }
+};
+
+/**
+ * Admin: delete share link
+ * DELETE /api/admin/projects/:id/share-links/:linkId
+ */
+exports.adminDeleteShareLink = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const linkId = parseInt(req.params.linkId, 10);
+    if (Number.isNaN(projectId) || Number.isNaN(linkId)) {
+      return sendValidationError(res, 'Invalid project or link id.');
+    }
+
+    const client = await pool.connect();
+    try {
+      const delRes = await client.query(
+        'DELETE FROM project_share_links WHERE id = $1 AND project_id = $2 RETURNING id',
+        [linkId, projectId]
+      );
+      if (!delRes.rows.length) return sendNotFound(res, 'Link not found.');
+      res.status(204).send();
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to delete share link.');
+  }
+};
