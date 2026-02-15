@@ -3,20 +3,25 @@ const pool = require('../config/db');
 const logger = require('../utils/logger');
 
 /**
- * Helper: Get company_id from authenticated user
+ * Helper: Get company_id from authenticated user (uses pool = same DB as auth).
  * user_login has company_id linked to companies.id
  */
 async function getCompanyIdFromUser(req) {
-  const userId = req.user?.id;
+  const userId = req.user?.id ?? req.user?.user_id;
   if (!userId) return null;
 
-  const { data } = await supabase
-    .from('user_login')
-    .select('company_id')
-    .eq('id', userId)
-    .single();
-
-  return data?.company_id || null;
+  try {
+    const result = await pool.query(
+      'SELECT company_id FROM user_login WHERE id = $1',
+      [userId]
+    );
+    const row = result.rows[0];
+    const raw = row?.company_id;
+    return raw != null ? Number(raw) : null;
+  } catch (err) {
+    logger.warn('getCompanyIdFromUser error:', err?.message);
+    return null;
+  }
 }
 
 // ============== PROFILE ==============
@@ -232,23 +237,16 @@ exports.deleteContact = async (req, res) => {
  * GET /company/drives
  * Get all placement drives for my company (same shape as placement drives for table UI).
  */
-const DRIVES_SELECT_FULL = `
-  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
-  ctc_structure, stipend_structure, process_rounds, number_of_openings,
-  number_of_registrations, placement_status, last_date_to_registration,
-  event_datetime, onboarded_date, tpo, company_remarks, created_at,
-  eligibility_criteria,
-  company:companies (company_name)
-`;
-const DRIVES_SELECT_MINIMAL = `
-  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
+/* Only select columns that exist on placements_drives (no eligibility_criteria in schema). */
+const DRIVES_SELECT_WITH_COMPANY = `
+  id, company_id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
   ctc_structure, stipend_structure, process_rounds, number_of_openings,
   number_of_registrations, placement_status, last_date_to_registration,
   event_datetime, onboarded_date, tpo, company_remarks, created_at,
   company:companies (company_name)
 `;
 const DRIVES_SELECT_BASE = `
-  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
+  id, company_id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
   ctc_structure, stipend_structure, process_rounds, number_of_openings,
   number_of_registrations, placement_status, last_date_to_registration,
   event_datetime, onboarded_date, tpo, company_remarks, created_at
@@ -258,60 +256,43 @@ exports.getDrives = async (req, res) => {
   let companyId;
   try {
     companyId = await getCompanyIdFromUser(req);
-    if (!companyId) {
+    if (companyId == null || companyId === '') {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
+    const cid = Number(companyId);
 
-    let data;
-    let error;
-    let result = await supabase
-      .from('placements_drives')
-      .select(DRIVES_SELECT_FULL)
-      .eq('company_id', companyId)
-      .order('created_at', { ascending: false });
-    data = result.data;
-    error = result.error;
-
-    if (error) {
-      const msg = (error.message || '').toLowerCase();
-      result = await supabase
-        .from('placements_drives')
-        .select(DRIVES_SELECT_MINIMAL)
-        .eq('company_id', companyId)
-        .order('created_at', { ascending: false });
-      data = result.data;
-      error = result.error;
+    // Prefer pool (same DB as auth) so company drives always match user_login.company_id
+    let rows = [];
+    try {
+      const driveResult = await pool.query(
+        `SELECT pd.id, pd.company_id, pd.academic_year, pd.year, pd.job_type, pd.type_of_hiring,
+                pd.job_description, pd.job_location, pd.ctc_structure, pd.stipend_structure,
+                pd.process_rounds, pd.number_of_openings, pd.number_of_registrations,
+                pd.placement_status, pd.last_date_to_registration, pd.event_datetime,
+                pd.onboarded_date, pd.tpo, pd.company_remarks, pd.created_at,
+                c.company_name
+         FROM placements_drives pd
+         LEFT JOIN companies c ON c.id = pd.company_id
+         WHERE pd.company_id = $1
+         ORDER BY pd.created_at DESC`,
+        [cid]
+      );
+      rows = (driveResult.rows || []).map((r) => {
+        const { company_name, ...rest } = r;
+        return { ...rest, company: company_name != null ? { company_name } : null };
+      });
+    } catch (poolErr) {
+      logger.error('getDrives pool query error:', poolErr);
+      return res.status(500).json({ error: 'Failed to fetch drives', message: poolErr?.message || 'Database error' });
     }
-
-    if (error) {
-      result = await supabase
-        .from('placements_drives')
-        .select(DRIVES_SELECT_BASE)
-        .eq('company_id', companyId)
-        .order('created_at', { ascending: false });
-      data = result.data;
-      error = result.error;
-      if (!error && (data || []).length > 0) {
-        const { data: companyRow } = await supabase
-          .from('companies')
-          .select('company_name')
-          .eq('id', companyId)
-          .single();
-        const companyName = companyRow?.company_name ?? null;
-        data = (data || []).map((d) => ({ ...d, company: { company_name: companyName } }));
-      }
-    }
-    if (error) throw error;
-
-    const rows = data || [];
     const driveIds = (rows || []).map((d) => d.id).filter(Boolean);
     const usnsByDrive = {};
     if (driveIds.length > 0) {
-      const { data: processRows } = await supabase
-        .from('student_placement_process')
-        .select('placement_drive_id, usn')
-        .in('placement_drive_id', driveIds);
-      (processRows || []).forEach((row) => {
+      const processResult = await pool.query(
+        'SELECT placement_drive_id, usn FROM student_placement_process WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != \'\'',
+        [driveIds]
+      );
+      (processResult.rows || []).forEach((row) => {
         const id = row.placement_drive_id;
         if (!usnsByDrive[id]) usnsByDrive[id] = new Set();
         if (row.usn) usnsByDrive[id].add(row.usn);
@@ -320,11 +301,11 @@ exports.getDrives = async (req, res) => {
     const allUsns = [...new Set(Object.values(usnsByDrive).flatMap((s) => [...s]))];
     let studentSchoolProgramMap = {};
     if (allUsns.length > 0) {
-      const { data: studentRows } = await supabase
-        .from('student_basic_details')
-        .select('usn, school_id, program_id')
-        .in('usn', allUsns);
-      studentSchoolProgramMap = (studentRows || []).reduce((acc, s) => {
+      const studentResult = await pool.query(
+        'SELECT usn, school_id, program_id FROM student_basic_details WHERE usn = ANY($1::text[])',
+        [allUsns]
+      );
+      studentSchoolProgramMap = (studentResult.rows || []).reduce((acc, s) => {
         acc[s.usn] = { school_id: s.school_id, program_id: s.program_id };
         return acc;
       }, {});
@@ -343,12 +324,12 @@ exports.getDrives = async (req, res) => {
     let schoolMap = {};
     let programMap = {};
     if (schoolIds.size) {
-      const { data: schools } = await supabase.from('schools').select('id, name').in('id', [...schoolIds]);
-      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
+      const schoolResult = await pool.query('SELECT id, name FROM schools WHERE id = ANY($1::bigint[])', [[...schoolIds]]);
+      schoolMap = (schoolResult.rows || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
     }
     if (programIds.size) {
-      const { data: programs } = await supabase.from('programs').select('id, name, school_id').in('id', [...programIds]);
-      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
+      const programResult = await pool.query('SELECT id, name, school_id FROM programs WHERE id = ANY($1::bigint[])', [[...programIds]]);
+      programMap = (programResult.rows || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
     }
 
     const drives = rows.map((d) => {
@@ -388,7 +369,11 @@ exports.getDrives = async (req, res) => {
     res.json({ data: drives });
   } catch (err) {
     logger.error('getDrives error:', err);
-    return res.json({ data: [] });
+    return res.status(500).json({
+      error: 'Failed to fetch drives',
+      message: err?.message || 'Server error',
+      data: []
+    });
   }
 };
 
@@ -507,15 +492,29 @@ exports.getDriveCandidates = async (req, res) => {
 
     if (error) throw error;
 
-    // Apply search filter if provided
     let candidates = data || [];
     if (search && search.trim()) {
       const searchLower = search.trim().toLowerCase();
-      candidates = candidates.filter(c => 
+      candidates = candidates.filter(c =>
         c.usn?.toLowerCase().includes(searchLower) ||
         c.student_basic_details?.full_name?.toLowerCase().includes(searchLower)
       );
     }
+
+    // Attach school name for process table display
+    const schoolIds = [...new Set(candidates.map(c => c.student_basic_details?.school_id).filter(Boolean))];
+    let schoolMap = {};
+    if (schoolIds.length > 0) {
+      const { data: schools } = await supabase.from('schools').select('id, name').in('id', schoolIds);
+      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
+    }
+    candidates = candidates.map(c => {
+      const schoolId = c.student_basic_details?.school_id;
+      return {
+        ...c,
+        school: schoolId ? (schoolMap[schoolId] || null) : null,
+      };
+    });
 
     res.json({ data: candidates });
   } catch (err) {
@@ -797,7 +796,8 @@ exports.getOffers = async (req, res) => {
 
 /**
  * GET /company/events
- * Get company-relevant events
+ * Returns only events that were sent to companies via notifications (same logic as alumni events).
+ * Notifications where target_type = 'ROLE' and target_role like 'company', or target_type = 'ALL', with an event link.
  */
 exports.getEvents = async (req, res) => {
   try {
@@ -806,18 +806,389 @@ exports.getEvents = async (req, res) => {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    // Get events (pre-placement talks, interview days, etc.)
-    const { data, error } = await supabase
+    const notifRes = await pool.query(
+      `SELECT n.link FROM notifications n
+       WHERE n.is_active = true AND n.link IS NOT NULL AND TRIM(n.link) != ''
+         AND ( (n.target_type = 'ROLE' AND (n.target_role ILIKE '%company%' OR LOWER(TRIM(n.target_role)) = 'company'))
+               OR n.target_type = 'ALL' )`
+    );
+    const eventIds = new Set();
+    for (const row of notifRes.rows || []) {
+      const link = row.link || '';
+      const m = link.match(/event[s]?[\/\-](\d+)/i) || link.match(/[?&]event[=_ ]?(\d+)/i);
+      if (m) eventIds.add(parseInt(m[1], 10));
+    }
+    const ids = [...eventIds];
+    if (ids.length === 0) {
+      return res.json({ data: [] });
+    }
+
+    const { data: events, error } = await supabase
       .from('events')
       .select('*')
-      .order('event_datetime', { ascending: false })
-      .limit(50);
+      .in('id', ids)
+      .order('event_datetime', { ascending: false });
 
     if (error) throw error;
-    res.json({ data });
+
+    const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const withImageUrls = (events || []).map((ev) => ({
+      ...ev,
+      image_url: baseUrl && ev.id
+        ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
+        : null,
+    }));
+    res.json({ data: withImageUrls });
   } catch (err) {
     logger.error('getEvents error:', err);
     res.status(500).json({ error: 'Failed to fetch events' });
+  }
+};
+
+// ============== STUDENT PROJECTS (only students who registered to company's drives) ==============
+
+/**
+ * GET /company/projects
+ * Approved projects from students who have registered to any of this company's placement drives.
+ */
+exports.getProjects = async (req, res) => {
+  try {
+    const companyId = await getCompanyIdFromUser(req);
+    if (!companyId) {
+      return res.status(403).json({ error: 'Company not linked to this account' });
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    const driveIdsRes = await pool.query(
+      'SELECT id FROM placements_drives WHERE company_id = $1',
+      [companyId]
+    );
+    const driveIds = (driveIdsRes.rows || []).map((r) => r.id);
+    if (driveIds.length === 0) {
+      return res.json([]);
+    }
+
+    const usnsRes = await pool.query(
+      `SELECT DISTINCT usn FROM student_placement_process
+       WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != ''`,
+      [driveIds]
+    );
+    const usns = (usnsRes.rows || []).map((r) => r.usn);
+    if (usns.length === 0) {
+      return res.json([]);
+    }
+
+    const projRes = await pool.query(
+      `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility
+       FROM projects p
+       LEFT JOIN project_metrics m ON m.project_id = p.id
+       WHERE LOWER(TRIM(p.project_status::text)) = 'approved'
+         AND p.owner_usn = ANY($1::text[])
+       ORDER BY COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC
+       LIMIT 100`,
+      [usns]
+    );
+    const rows = projRes.rows || [];
+    const projectIds = rows.map((r) => r.id);
+    if (projectIds.length === 0) {
+      return res.json([]);
+    }
+
+    let assetsByProj = {};
+    let likedSet = new Set();
+    let favoritedSet = new Set();
+    const [assetRes, likeRes, favRes] = await Promise.all([
+      pool.query(
+        `SELECT project_id, original_url, position
+         FROM project_assets
+         WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
+         ORDER BY project_id, position`,
+        [projectIds]
+      ),
+      pool.query(
+        'SELECT project_id FROM project_likes WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+        [projectIds, userId]
+      ),
+      pool.query(
+        'SELECT project_id FROM project_favorites WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+        [projectIds, userId]
+      ),
+    ]);
+    (assetRes.rows || []).forEach((a) => {
+      if (!assetsByProj[a.project_id]) assetsByProj[a.project_id] = [];
+      assetsByProj[a.project_id].push(a.original_url);
+    });
+    (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
+    (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
+
+    const metricRes = await pool.query(
+      'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+      [projectIds]
+    );
+    const metricMap = {};
+    (metricRes.rows || []).forEach((m) => { metricMap[m.project_id] = m; });
+
+    const list = rows.map((p) => {
+      const m = metricMap[p.id] || {};
+      return {
+        id: p.id,
+        owner_usn: p.owner_usn,
+        usn: p.owner_usn,
+        title: p.title,
+        short_description: p.short_description,
+        one_line_description: p.short_description,
+        description: p.description,
+        full_description: p.description,
+        category: p.category,
+        genre: p.category,
+        hosted_url: p.hosted_url,
+        hosted_link: p.hosted_url,
+        github_url: p.github_url,
+        github_repo: p.github_url,
+        mentor_name: p.mentor_name,
+        tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        published_at: p.published_at,
+        project_snaps: assetsByProj[p.id] || [],
+        cover_url: (assetsByProj[p.id] && assetsByProj[p.id][0]) || null,
+        views_count: m.views ?? 0,
+        likes_count: m.likes ?? 0,
+        favorites_count: m.favorites ?? 0,
+        is_liked: likedSet.has(p.id),
+        is_favorited: favoritedSet.has(p.id),
+      };
+    });
+
+    res.json(list);
+  } catch (err) {
+    logger.error('getProjects error:', err);
+    res.status(500).json({ error: 'Failed to fetch projects' });
+  }
+};
+
+/**
+ * GET /company/projects/:projectId
+ * Single project detail; only allowed if owner has registered to one of this company's drives.
+ */
+exports.getProjectById = async (req, res) => {
+  try {
+    const companyId = await getCompanyIdFromUser(req);
+    if (!companyId) {
+      return res.status(403).json({ error: 'Company not linked to this account' });
+    }
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const projectId = parseInt(req.params.projectId, 10);
+    if (Number.isNaN(projectId)) {
+      return res.status(400).json({ error: 'Invalid project id' });
+    }
+
+    const driveIdsRes = await pool.query(
+      'SELECT id FROM placements_drives WHERE company_id = $1',
+      [companyId]
+    );
+    const driveIds = (driveIdsRes.rows || []).map((r) => r.id);
+    const usnsRes = await pool.query(
+      `SELECT DISTINCT usn FROM student_placement_process
+       WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != ''`,
+      [driveIds.length ? driveIds : [-1]]
+    );
+    const allowedUsns = new Set((usnsRes.rows || []).map((r) => r.usn));
+
+    const projRes = await pool.query(
+      `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.project_status, p.created_at
+       FROM projects p
+       WHERE p.id = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'`,
+      [projectId]
+    );
+    const p = projRes.rows?.[0];
+    if (!p || !allowedUsns.has(p.owner_usn)) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const [assetRes, likeRes, favRes, metricRes, reviewsRes] = await Promise.all([
+      pool.query(
+        `SELECT project_id, original_url, position FROM project_assets
+         WHERE project_id = $1 AND asset_role IN ('COVER','GALLERY') ORDER BY position`,
+        [projectId]
+      ),
+      pool.query('SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, userId]),
+      pool.query('SELECT 1 FROM project_favorites WHERE project_id = $1 AND user_id = $2', [projectId, userId]),
+      pool.query('SELECT views, likes, favorites FROM project_metrics WHERE project_id = $1', [projectId]),
+      pool.query(
+        `SELECT r.id, r.rating, r.comment, r.created_at, r.reviewer_id
+         FROM project_reviews r WHERE r.project_id = $1 ORDER BY r.created_at DESC LIMIT 50`,
+        [projectId]
+      ),
+    ]);
+    const assets = (assetRes.rows || []).map((a) => a.original_url);
+    const metric = metricRes.rows?.[0] || {};
+    const reviews = reviewsRes.rows || [];
+
+    const project = {
+      id: p.id,
+      owner_usn: p.owner_usn,
+      usn: p.owner_usn,
+      title: p.title,
+      short_description: p.short_description,
+      one_line_description: p.short_description,
+      description: p.description,
+      full_description: p.description,
+      category: p.category,
+      genre: p.category,
+      hosted_url: p.hosted_url,
+      hosted_link: p.hosted_url,
+      github_url: p.github_url,
+      github_repo: p.github_url,
+      mentor_name: p.mentor_name,
+      tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+      technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+      published_at: p.published_at,
+      created_at: p.created_at,
+      project_status: p.project_status,
+      project_snaps: assets,
+      cover_url: assets[0] || null,
+      views_count: metric.views ?? 0,
+      likes_count: metric.likes ?? 0,
+      favorites_count: metric.favorites ?? 0,
+      is_liked: (likeRes.rows || []).length > 0,
+      is_favorited: (favRes.rows || []).length > 0,
+      reviews: reviews.map((r) => ({
+        id: r.id,
+        rating: r.rating,
+        comment: r.comment,
+        created_at: r.created_at,
+        reviewer_id: r.reviewer_id,
+      })),
+    };
+    res.json(project);
+  } catch (err) {
+    logger.error('getProjectById error:', err);
+    res.status(500).json({ error: 'Failed to fetch project' });
+  }
+};
+
+// ============== NOTIFICATIONS ==============
+
+/**
+ * GET /company/notifications
+ * List notifications for the logged-in company user (from notification_nodes).
+ */
+exports.getNotifications = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    const result = await pool.query(
+      `SELECT nn.id, nn.notification_id, nn.is_read, nn.is_archived, nn.is_starred, nn.created_at,
+              n.title, n.message, n.link, n.notification_type
+       FROM notification_nodes nn
+       JOIN notifications n ON n.id = nn.notification_id
+       WHERE nn.user_id = $1 AND n.is_active = true
+       ORDER BY nn.created_at DESC
+       LIMIT 100`,
+      [userId]
+    );
+
+    const data = (result.rows || []).map((row) => ({
+      id: row.id,
+      notificationId: row.notification_id,
+      title: row.title,
+      message: row.message,
+      link: row.link,
+      notificationType: row.notification_type || 'General',
+      isRead: !!row.is_read,
+      isArchived: !!row.is_archived,
+      isStarred: !!row.is_starred,
+      createdAt: row.created_at,
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    logger.error('getNotifications error:', err);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+};
+
+/**
+ * GET /company/notifications/unread-count
+ */
+exports.getNotificationsUnreadCount = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM notification_nodes nn
+       INNER JOIN notifications n ON n.id = nn.notification_id
+       WHERE nn.user_id = $1 AND n.is_active = true AND (nn.is_read IS NULL OR nn.is_read = false)
+         AND (nn.is_archived = false OR nn.is_archived IS NULL)`,
+      [userId]
+    );
+    const count = result.rows?.[0]?.count ?? 0;
+    res.json({ data: { unreadCount: count } });
+  } catch (err) {
+    logger.error('getNotificationsUnreadCount error:', err);
+    res.status(500).json({ error: 'Failed to fetch unread count' });
+  }
+};
+
+/**
+ * PATCH /company/notifications/:nodeId
+ * Update notification node (mark read, archive, star).
+ */
+exports.updateNotificationNode = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { nodeId } = req.params;
+    const { is_read, is_archived, is_starred } = req.body;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    const updates = [];
+    const values = [];
+    let i = 1;
+    if (typeof is_read === 'boolean') {
+      updates.push(`is_read = $${i++}`);
+      values.push(is_read);
+    }
+    if (typeof is_archived === 'boolean') {
+      updates.push(`is_archived = $${i++}`);
+      values.push(is_archived);
+    }
+    if (typeof is_starred === 'boolean') {
+      updates.push(`is_starred = $${i++}`);
+      values.push(is_starred);
+    }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No valid update fields' });
+    }
+    values.push(nodeId, userId);
+    const nodeIdIdx = i++;
+    const userIdIdx = i;
+    const result = await pool.query(
+      `UPDATE notification_nodes SET ${updates.join(', ')} WHERE id = $${nodeIdIdx} AND user_id = $${userIdIdx}
+       RETURNING id, is_read, is_archived, is_starred`,
+      values
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    res.json({ data: result.rows[0] });
+  } catch (err) {
+    logger.error('updateNotificationNode error:', err);
+    res.status(500).json({ error: 'Failed to update notification' });
   }
 };
 

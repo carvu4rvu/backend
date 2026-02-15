@@ -32,6 +32,15 @@ router.get('/offers', ...companyAuth, companyController.getOffers);
 // Events
 router.get('/events', ...companyAuth, companyController.getEvents);
 
+// Student projects (only students who registered to company's drives)
+router.get('/projects', ...companyAuth, companyController.getProjects);
+router.get('/projects/:projectId', ...companyAuth, companyController.getProjectById);
+
+// Notifications
+router.get('/notifications', ...companyAuth, companyController.getNotifications);
+router.get('/notifications/unread-count', ...companyAuth, companyController.getNotificationsUnreadCount);
+router.patch('/notifications/:nodeId', ...companyAuth, companyController.updateNotificationNode);
+
 // Dashboard
 router.get('/dashboard', ...companyAuth, companyController.getDashboardStats);
 
