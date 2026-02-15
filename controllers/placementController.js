@@ -4073,6 +4073,33 @@ exports.getAlumniEvents = async (req, res) => {
 };
 
 /**
+ * GET /placement/vc/events
+ * VC: all events from events table (all that are going to happen + past), ordered by event_datetime.
+ */
+exports.getVcEvents = async (req, res) => {
+  try {
+    const { data: events, error } = await supabase
+      .from('events')
+      .select('*')
+      .order('event_datetime', { ascending: true });
+
+    if (error) throw error;
+
+    const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const withImageUrls = (events || []).map((ev) => ({
+      ...ev,
+      image_url: baseUrl && ev.id
+        ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
+        : null,
+    }));
+    res.json(withImageUrls);
+  } catch (err) {
+    logger.error('getVcEvents:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch events' });
+  }
+};
+
+/**
  * GET /placement/hr-recommendations (admin)
  * Get all HR recommendations for admin review
  */

@@ -115,8 +115,8 @@ router.post('/policies/sync', authenticateToken, placementController.syncPolicie
 router.get('/email-recipients', authenticateToken, emailRecipientsController.getEmailRecipients);
 
 // Projects: alumni feed, view increment, like (alumni or authenticated)
-router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniProjects);
-router.get('/projects/alumni/:projectId', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniProjectById);
+router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniProjects);
+router.get('/projects/alumni/:projectId', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniProjectById);
 router.post('/projects/:id/view', placementController.incrementProjectView);
 router.post('/projects/:id/like', authenticateToken, placementController.toggleProjectLike);
 
@@ -139,10 +139,12 @@ router.delete('/alumni/codes/:id', authenticateToken, placementController.delete
 router.get('/alumni/conversions', authenticateToken, placementController.getAlumniConversions);
 router.get('/alumni/conversion-logs', authenticateToken, authorizeRoles('admin'), placementController.getAlumniConversionLogs);
 router.post('/alumni/convert', authenticateToken, authorizeRoles('admin'), placementController.convertToAlumni);
-router.get('/alumni/events', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniEvents);
-router.get('/alumni/notifications/unread-count', authenticateToken, authorizeRoles('alumni'), studentNotificationController.getUnreadCount);
-router.get('/alumni/notifications', authenticateToken, authorizeRoles('alumni'), studentNotificationController.list);
-router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles('alumni'), studentNotificationController.updateNode);
+router.get('/alumni/events', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniEvents);
+router.get('/alumni/notifications/unread-count', authenticateToken, authorizeRoles('alumni', 'vc'), studentNotificationController.getUnreadCount);
+router.get('/alumni/notifications', authenticateToken, authorizeRoles('alumni', 'vc'), studentNotificationController.list);
+router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles('alumni', 'vc'), studentNotificationController.updateNode);
+// VC: all events (from events table)
+router.get('/vc/events', authenticateToken, authorizeRoles('vc'), placementController.getVcEvents);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
 
