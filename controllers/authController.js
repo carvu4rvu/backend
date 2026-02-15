@@ -1,5 +1,5 @@
 const pool = require('../config/db');
-const transporter = require('../config/smtp');
+const { sendOTPEmail } = require('../services/emailService');
 const bcrypt = require('bcryptjs');
 const generateToken = require('../utils/jwtGenerator');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
@@ -33,17 +33,6 @@ async function getOrCreateRoleId(db, roleName) {
   if (after.rows.length === 0) throw new Error(`Failed to create role: ${role}`);
   return after.rows[0].id;
 }
-
-// Helper to send email
-const sendOTPEmail = async (email, otp, purpose) => {
-  const mailOptions = {
-    from: process.env.SMTP_USER,
-    to: email,
-    subject: `Your OTP for ${purpose} - CarvingYou`,
-    text: `Your OTP for ${purpose} is ${otp}. It expires in 5 minutes.`
-  };
-  await transporter.sendMail(mailOptions);
-};
 
 // Helper to mask email
 const maskEmail = (email) => {

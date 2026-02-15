@@ -30,7 +30,7 @@ const morgan = require('morgan');
 const cors = require('cors');
 const pool = require('./config/db');
 const supabase = require('./config/supabaseClient');
-const transporter = require('./config/smtp');
+const { isUsingSendGrid } = require('./services/emailService');
 
 // hello
 
@@ -198,7 +198,8 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       if (error) throw error;
     });
 
-    if (process.env.NODE_ENV !== 'production') {
+    if (process.env.NODE_ENV !== 'production' && !isUsingSendGrid()) {
+      const transporter = require('./config/smtp');
       await connectWithRetry('smtp', async () => {
         await transporter.verify();
       });
