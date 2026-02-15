@@ -1,6 +1,6 @@
 /**
  * Project routes: /api/projects
- * Student-facing CRUD, feed, assets, share links, reviews, likes, favorites, ratings.
+ * Student-facing CRUD, feed, assets, share links, reviews, likes, favorites.
  */
 
 const express = require('express');
@@ -39,11 +39,10 @@ router.patch('/:id/publish', projectController.publish);
 router.post('/:id/assets', projectController.addAsset);
 router.delete('/:id/assets/:assetId', projectController.deleteAsset);
 
-// Engagement (reviews, like, favorite, rate)
+// Engagement (reviews, like, favorite)
 router.post('/:id/reviews', projectController.addReview);
 router.patch('/:id/reviews/:reviewId', projectController.replyReview);
 router.post('/:id/like', projectController.toggleLike);
 router.post('/:id/favorite', projectController.toggleFavorite);
-router.put('/:id/rate', projectController.rate);
 
 module.exports = router;

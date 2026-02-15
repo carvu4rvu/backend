@@ -4387,7 +4387,7 @@ exports.getAlumniProjects = async (req, res) => {
     }
 
     const metricRes = await pool.query(
-      'SELECT project_id, views, likes, favorites, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+      'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
       [projectIds]
     );
     const metricMap = {};
@@ -4412,7 +4412,6 @@ exports.getAlumniProjects = async (req, res) => {
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
         favorites_count: m.favorites ?? 0,
-        average_rating: Number(m.avg_rating ?? 0),
         is_liked: likedSet.has(p.id),
         is_favorited: favoritedSet.has(p.id),
       };
@@ -4427,7 +4426,8 @@ exports.getAlumniProjects = async (req, res) => {
 
 /**
  * POST /placement/projects/:id/view
- * Increment project view count (public or authenticated).
+ * Record a unique view: one per (project_id, user_id) when logged in, or one per (project_id, ip_address) when anonymous.
+ * Does not insert if this viewer already viewed this project; returns current view count.
  */
 exports.incrementProjectView = async (req, res) => {
   try {
@@ -4444,14 +4444,37 @@ exports.incrementProjectView = async (req, res) => {
       return res.status(404).json({ message: 'Project not found.' });
     }
 
-    await pool.query(
-      'INSERT INTO project_views (project_id, user_id, ip_address) VALUES ($1, $2, $3)',
-      [projectId, userId, ipAddress]
-    );
-    await pool.query(
-      'UPDATE project_metrics SET views = views + 1, last_updated = NOW() WHERE project_id = $1',
-      [projectId]
-    );
+    let alreadyViewed = false;
+    if (userId != null) {
+      const exist = await pool.query(
+        'SELECT 1 FROM project_views WHERE project_id = $1 AND user_id = $2 LIMIT 1',
+        [projectId, userId]
+      );
+      alreadyViewed = exist.rows.length > 0;
+    } else {
+      const exist = await pool.query(
+        'SELECT 1 FROM project_views WHERE project_id = $1 AND user_id IS NULL AND ip_address IS NOT DISTINCT FROM $2 LIMIT 1',
+        [projectId, ipAddress]
+      );
+      alreadyViewed = exist.rows.length > 0;
+    }
+
+    if (!alreadyViewed) {
+      await pool.query(
+        'INSERT INTO project_views (project_id, user_id, ip_address) VALUES ($1, $2, $3)',
+        [projectId, userId, ipAddress]
+      );
+      await pool.query(
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, comments, last_updated)
+         VALUES ($1, 0, 0, 0, 0, NOW())
+         ON CONFLICT (project_id) DO NOTHING`,
+        [projectId]
+      );
+      await pool.query(
+        'UPDATE project_metrics SET views = (SELECT COUNT(*)::int FROM project_views WHERE project_id = $1), last_updated = NOW() WHERE project_id = $1',
+        [projectId]
+      );
+    }
 
     const metricRes = await pool.query('SELECT views FROM project_metrics WHERE project_id = $1', [projectId]);
     res.json({ views: metricRes.rows[0]?.views ?? 0 });
@@ -4484,7 +4507,7 @@ exports.toggleProjectLike = async (req, res) => {
       return res.status(404).json({ message: 'Project not found.' });
     }
     const p = projRes.rows[0];
-    const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
+    const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
     if (!canView) {
       return res.status(404).json({ message: 'Project not found.' });
     }
@@ -4497,8 +4520,8 @@ exports.toggleProjectLike = async (req, res) => {
 
     // Ensure project_metrics row exists (some projects may not have one)
     await pool.query(
-      `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
-       VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())
+      `INSERT INTO project_metrics (project_id, views, likes, favorites, comments, last_updated)
+       VALUES ($1, 0, 0, 0, 0, NOW())
        ON CONFLICT (project_id) DO NOTHING`,
       [projectId]
     );

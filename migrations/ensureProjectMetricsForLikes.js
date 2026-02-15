@@ -10,10 +10,10 @@ async function run() {
   try {
     // Create project_metrics for projects that don't have one, with correct likes from project_likes
     const r = await client.query(`
-      INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
+      INSERT INTO project_metrics (project_id, views, likes, favorites, comments, last_updated)
       SELECT p.id, 0,
         (SELECT COUNT(*)::int FROM project_likes pl WHERE pl.project_id = p.id),
-        0, 0, 0, 0, NOW()
+        0, 0, NOW()
       FROM projects p
       WHERE NOT EXISTS (SELECT 1 FROM project_metrics m WHERE m.project_id = p.id)
       ON CONFLICT (project_id) DO NOTHING

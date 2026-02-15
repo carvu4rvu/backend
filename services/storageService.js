@@ -93,4 +93,28 @@ function isSupabaseUrl(url) {
   return url && (url.includes('supabase.co/storage') || url.startsWith('https://') && url.includes('/storage/'));
 }
 
-module.exports = { upload, getSignedUrl, getBucket, generateRandomFileName, isSupabaseUrl, PUBLIC_BUCKETS, PRIVATE_BUCKETS };
+const PROJECTS_BUCKET = 'projects';
+const VARIANT_FOLDER = 'project-variants';
+
+/**
+ * Upload a project asset variant (resized image) to projects bucket.
+ * Path: project-variants/{assetId}/{variantType}.webp
+ * @param {Buffer} buffer - image buffer (e.g. WebP)
+ * @param {number|string} assetId - project_assets.id
+ * @param {string} variantType - THUMB | SMALL | MEDIUM | LARGE | HD
+ * @returns {{ url: string, path: string }}
+ */
+async function uploadVariant(buffer, assetId, variantType) {
+  const sanitized = String(variantType || 'variant').replace(/[^A-Z0-9_]/gi, '_').toUpperCase() || 'variant';
+  const storagePath = `${VARIANT_FOLDER}/${assetId}/${sanitized}.webp`;
+  const { error } = await supabase.storage.from(PROJECTS_BUCKET).upload(storagePath, buffer, {
+    contentType: 'image/webp',
+    upsert: true,
+  });
+  if (error) throw new Error(`Variant upload failed: ${error.message}`);
+  const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  const publicUrl = `${baseUrl}/storage/v1/object/public/${PROJECTS_BUCKET}/${storagePath}`;
+  return { url: publicUrl, path: storagePath };
+}
+
+module.exports = { upload, getSignedUrl, getBucket, generateRandomFileName, isSupabaseUrl, uploadVariant, PUBLIC_BUCKETS, PRIVATE_BUCKETS };

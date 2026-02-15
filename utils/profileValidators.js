@@ -25,7 +25,7 @@ const RESULT_TYPES = ['PERCENTAGE', 'CGPA'];
 const GAP_TYPES = ['12TH_TO_GRADUATION', 'DIPLOMA_TO_GRADUATION', 'GRADUATION_TO_POST_GRADUATION'];
 
 /** Visibility */
-const VISIBILITY_VALUES = ['PRIVATE', 'PUBLIC', 'PUBLIC_LINK'];
+const VISIBILITY_VALUES = ['PRIVATE', 'PUBLIC'];
 
 const currentYear = new Date().getFullYear();
 

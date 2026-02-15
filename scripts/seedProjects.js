@@ -124,8 +124,8 @@ async function seed() {
     }
 
     await pool.query(
-      `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
-       VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())`,
+      `INSERT INTO project_metrics (project_id, views, likes, favorites, comments, last_updated)
+       VALUES ($1, 0, 0, 0, 0, NOW())`,
       [projectId]
     );
 

@@ -12,7 +12,8 @@
     "seed:placement": "node scripts/seedPlacementData.js",
     "storage:test": "node ../scripts/test-storage-connectivity.js",
     "storage:migrate": "node ../scripts/migrate-to-supabase-storage.js",
-    "storage:verify": "node ../scripts/verify-db-storage-urls.js"
+    "storage:verify": "node ../scripts/verify-db-storage-urls.js",
+    "ensure:project-share-links": "node scripts/ensureProjectShareLinks.js"
   },
   "keywords": [],
   "author": "",
@@ -29,7 +30,8 @@
     "multer": "^2.0.2",
     "node-cron": "^3.0.3",
     "nodemailer": "^7.0.13",
-    "pg": "^8.17.2"
+    "pg": "^8.17.2",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"

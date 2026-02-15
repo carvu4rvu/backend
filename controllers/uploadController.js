@@ -37,6 +37,7 @@ exports.uploadFile = async (req, res) => {
     });
   } catch (err) {
     console.error('Upload controller error:', err);
-    res.status(500).json({ error: 'Server error during upload', details: err.message });
+    const msg = err.message || 'Server error during upload';
+    res.status(500).json({ message: msg, error: msg, details: msg });
   }
 };

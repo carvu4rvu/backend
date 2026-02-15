@@ -1,5 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const { enqueueVariantJob } = require('../services/variantJobProcessor');
+const { ensureShareLink } = require('./projectController');
 const { computeCurrentYearSemester } = require('../utils/studentAcademic');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
@@ -2191,28 +2193,19 @@ exports.getProjects = async (req, res) => {
             const projectIds = rows.map((p) => p.id);
             let assets = [];
             const metricsByProj = {};
-            const ratingsByProj = {};
             if (projectIds.length > 0) {
-                const [assetRows, metricRows, ratingRows] = await Promise.all([
+                const [assetRows, metricRows] = await Promise.all([
                     client.query(
                         'SELECT project_id, original_url, position FROM public.project_assets WHERE project_id = ANY($1::bigint[]) ORDER BY project_id, position',
                         [projectIds]
                     ),
                     client.query(
-                        'SELECT project_id, views, likes, avg_rating FROM public.project_metrics WHERE project_id = ANY($1::bigint[])',
-                        [projectIds]
-                    ),
-                    client.query(
-                        'SELECT project_id, user_id, rating FROM public.project_ratings WHERE project_id = ANY($1::bigint[])',
+                        'SELECT project_id, views, likes FROM public.project_metrics WHERE project_id = ANY($1::bigint[])',
                         [projectIds]
                     ),
                 ]);
                 assets = assetRows.rows || [];
                 (metricRows.rows || []).forEach((m) => { metricsByProj[m.project_id] = m; });
-                (ratingRows.rows || []).forEach((r) => {
-                    if (!ratingsByProj[r.project_id]) ratingsByProj[r.project_id] = [];
-                    ratingsByProj[r.project_id].push({ user_id: r.user_id, rating: r.rating });
-                });
             }
             const byProject = {};
             assets.forEach((a) => {
@@ -2221,10 +2214,6 @@ exports.getProjects = async (req, res) => {
             });
             const legacy = rows.map((p) => {
                 const m = metricsByProj[p.id] || {};
-                const ratings = ratingsByProj[p.id] || [];
-                const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
-                const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
-                const avgRating = adminRating != null ? adminRating : (Number(m.avg_rating) || null);
                 return {
                     id: p.id,
                     usn: p.owner_usn,
@@ -2233,8 +2222,6 @@ exports.getProjects = async (req, res) => {
                     full_description: p.description,
                     genre: p.category,
                     visibility: p.visibility || 'PRIVATE',
-                    admin_rating: adminRating,
-                    average_rating: avgRating,
                     views_count: m.views ?? 0,
                     likes_count: m.likes ?? 0,
                     priority: p.priority,
@@ -2322,7 +2309,6 @@ exports.updateProjects = async (req, res) => {
                     await clientEmpty.query('DELETE FROM public.project_assets WHERE project_id = ANY($1::bigint[])', [projectIds]);
                     await clientEmpty.query('DELETE FROM public.project_favorites WHERE project_id = ANY($1::bigint[])', [projectIds]);
                     await clientEmpty.query('DELETE FROM public.project_likes WHERE project_id = ANY($1::bigint[])', [projectIds]);
-                    await clientEmpty.query('DELETE FROM public.project_ratings WHERE project_id = ANY($1::bigint[])', [projectIds]);
                     await clientEmpty.query('DELETE FROM public.project_reviews WHERE project_id = ANY($1::bigint[])', [projectIds]);
                     await clientEmpty.query('DELETE FROM public.project_share_links WHERE project_id = ANY($1::bigint[])', [projectIds]);
                     await clientEmpty.query('DELETE FROM public.project_views WHERE project_id = ANY($1::bigint[])', [projectIds]);
@@ -2356,7 +2342,10 @@ exports.updateProjects = async (req, res) => {
             const title = item.title ?? '';
             const oneLineDesc = item.one_line_description ?? item.oneLineDescription ?? '';
             const genre = item.genre ?? '';
-            const visibility = (item.visibility ?? 'PRIVATE').toString().toUpperCase().trim();
+            let visibility = (item.visibility ?? 'PRIVATE').toString().toUpperCase().trim();
+            if (!['PRIVATE', 'PUBLIC'].includes(visibility)) {
+                visibility = 'PRIVATE';
+            }
             const priority = item.priority;
             const projectSnaps = item.project_snaps ?? item.projectSnaps ?? [];
             const snapsArr = Array.isArray(projectSnaps)
@@ -2376,9 +2365,7 @@ exports.updateProjects = async (req, res) => {
             const rGenre = validateRequiredString(genre, 'Genre', 1);
             if (!rGenre.valid) fieldErrors[key('genre')] = rGenre.message;
 
-            const rVis = validateVisibility(visibility);
-            if (!rVis.valid) fieldErrors[key('visibility')] = rVis.message;
-            else if (visibility === 'PUBLIC') {
+            if (visibility === 'PUBLIC') {
                 const isApproved = item.is_approved ?? item.isApproved;
                 if (isApproved === false) {
                     fieldErrors[key('visibility')] = 'Project must be approved before it can be set to PUBLIC.';
@@ -2465,12 +2452,7 @@ exports.updateProjects = async (req, res) => {
             full_description: (r.item.full_description ?? r.item.fullDescription ?? '') || null,
             genre: String(r.genre).trim(),
             visibility:
-                r.visibility === 'PUBLIC'
-                    ? 'PUBLIC'
-                    : r.visibility === 'PUBLIC_LINK'
-                        ? 'PUBLIC_LINK'
-                        : 'PRIVATE',
-            admin_rating: r.item.admin_rating ?? r.item.adminRating ?? null,
+                r.visibility === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE',
             priority: r.priority, // null or number; will normalize next
             project_snaps: r.snapsArr,
             hosted_link: r.hostedLink.trim() || null,
@@ -2507,7 +2489,6 @@ exports.updateProjects = async (req, res) => {
                 await dbClient.query('DELETE FROM public.project_assets WHERE project_id = ANY($1::bigint[])', [projectIds]);
                 await dbClient.query('DELETE FROM public.project_favorites WHERE project_id = ANY($1::bigint[])', [projectIds]);
                 await dbClient.query('DELETE FROM public.project_likes WHERE project_id = ANY($1::bigint[])', [projectIds]);
-                await dbClient.query('DELETE FROM public.project_ratings WHERE project_id = ANY($1::bigint[])', [projectIds]);
                 await dbClient.query('DELETE FROM public.project_reviews WHERE project_id = ANY($1::bigint[])', [projectIds]);
                 await dbClient.query('DELETE FROM public.project_share_links WHERE project_id = ANY($1::bigint[])', [projectIds]);
                 await dbClient.query('DELETE FROM public.project_views WHERE project_id = ANY($1::bigint[])', [projectIds]);
@@ -2548,20 +2529,26 @@ exports.updateProjects = async (req, res) => {
                     const url = row.project_snaps[pos];
                     if (url && String(url).trim()) {
                         const assetRole = pos === 0 ? 'COVER' : 'GALLERY';
-                        await dbClient.query(
-                            `INSERT INTO public.project_assets (project_id, asset_type, asset_role, original_url, position) VALUES ($1, 'IMAGE', $2, $3, $4)`,
+                        const assetRes = await dbClient.query(
+                            `INSERT INTO public.project_assets (project_id, asset_type, asset_role, original_url, position) VALUES ($1, 'IMAGE', $2, $3, $4) RETURNING id`,
                             [proj.id, assetRole, String(url).trim(), pos]
                         );
+                        const assetId = assetRes.rows[0]?.id;
+                        if (assetId) {
+                            enqueueVariantJob(assetId, String(url).trim());
+                        }
                     }
                 }
 
                 // Ensure project_metrics row exists (schema: projects + project_metrics + ...)
                 await dbClient.query(
-                    `INSERT INTO public.project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
-                     VALUES ($1, 0, 0, 0, 0, 0, 0, NOW())
+                    `INSERT INTO public.project_metrics (project_id, views, likes, favorites, comments, last_updated)
+                     VALUES ($1, 0, 0, 0, 0, NOW())
                      ON CONFLICT (project_id) DO NOTHING`,
                     [proj.id]
                 );
+
+                await ensureShareLink(dbClient, proj.id);
 
                 inserted.push({
                     id: proj.id,

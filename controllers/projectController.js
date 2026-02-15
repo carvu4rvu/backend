@@ -1,8 +1,8 @@
 /**
  * Project Controller - Student projects API
- * Handles CRUD, feed, assets, share links, reviews, likes, favorites, ratings.
+ * Handles CRUD, feed, assets, share links, reviews, likes, favorites.
  * Tables: projects, project_assets, project_asset_variants, project_metrics,
- * project_ratings, project_likes, project_favorites, project_reviews,
+ * project_likes, project_favorites, project_reviews,
  * project_share_links, project_views.
  */
 
@@ -15,11 +15,34 @@ const {
   sendCaughtError,
 } = require('../utils/apiErrorResponse');
 const crypto = require('crypto');
+const { enqueueVariantJob } = require('../services/variantJobProcessor');
 
-const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC', 'PUBLIC_LINK'];
+const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC'];
 const VALID_ASSET_TYPES = ['IMAGE', 'VIDEO'];
 const VALID_ASSET_ROLES = ['LOGO', 'COVER', 'GALLERY', 'VIDEO'];
 const VALID_PROJECT_STATUS = ['not_approved', 'approved', 'rejected', 'archived'];
+
+/**
+ * Ensure project has exactly one permanent share link (no expiry). Creates one if missing.
+ * @param {object} client - pg client
+ * @param {number} projectId - projects.id
+ * @returns {Promise<{ share_token: string }>}
+ */
+async function ensureShareLink(client, projectId) {
+  const existing = await client.query(
+    `SELECT share_token FROM project_share_links WHERE project_id = $1 AND is_active = true AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY expires_at NULLS FIRST LIMIT 1`,
+    [projectId]
+  );
+  if (existing.rows.length > 0) {
+    return { share_token: existing.rows[0].share_token };
+  }
+  const shareToken = crypto.randomBytes(24).toString('hex');
+  await client.query(
+    `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active) VALUES ($1, $2, NULL, true)`,
+    [projectId, shareToken]
+  );
+  return { share_token: shareToken };
+}
 
 /** Ensure user owns project (by owner_usn or owner_user_id) */
 async function assertOwnership(client, projectId, userId, usn) {
@@ -48,28 +71,22 @@ async function loadProject(client, projectId, options = {}) {
   if (!projRes.rows.length) return null;
   const p = projRes.rows[0];
 
-  const [assetsRes, metricsRes, ratingsRes] = await Promise.all([
+  const [assetsRes, metricsRes] = await Promise.all([
     client.query(
       'SELECT id, asset_type, asset_role, original_url, position FROM project_assets WHERE project_id = $1 ORDER BY position',
       [projectId]
     ),
     client.query(
-      'SELECT views, likes, favorites, avg_rating, rating_count, comments FROM project_metrics WHERE project_id = $1',
-      [projectId]
-    ),
-    client.query(
-      'SELECT user_id, rating FROM project_ratings WHERE project_id = $1',
+      'SELECT views, likes, favorites, comments FROM project_metrics WHERE project_id = $1',
       [projectId]
     ),
   ]);
 
   const assets = assetsRes.rows || [];
-  const metrics = metricsRes.rows[0] || { views: 0, likes: 0, favorites: 0, avg_rating: 0, rating_count: 0, comments: 0 };
-  const ratings = ratingsRes.rows || [];
+  const metrics = metricsRes.rows[0] || { views: 0, likes: 0, favorites: 0, comments: 0 };
 
   let isLiked = false;
   let isFavorited = false;
-  let userRating = null;
   if (forUserId) {
     const [likeRes, favRes] = await Promise.all([
       client.query('SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, forUserId]),
@@ -77,8 +94,6 @@ async function loadProject(client, projectId, options = {}) {
     ]);
     isLiked = !!likeRes.rows.length;
     isFavorited = !!favRes.rows.length;
-    const ur = ratings.find((r) => r.user_id === forUserId);
-    userRating = ur ? ur.rating : null;
   }
 
   const project = {
@@ -110,14 +125,11 @@ async function loadProject(client, projectId, options = {}) {
     views: metrics.views ?? 0,
     likes: metrics.likes ?? 0,
     favorites: metrics.favorites ?? 0,
-    avg_rating: Number(metrics.avg_rating ?? 0),
-    rating_count: metrics.rating_count ?? 0,
     comments: metrics.comments ?? 0,
   };
   if (forUserId) {
     project.is_liked = isLiked;
     project.is_favorited = isFavorited;
-    project.user_rating = userRating;
   }
   return project;
 }
@@ -173,7 +185,7 @@ exports.list = async (req, res) => {
             [projectIds]
           ),
           client.query(
-            'SELECT project_id, views, likes, favorites, avg_rating, rating_count FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+            'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
             [projectIds]
           ),
         ]);
@@ -213,8 +225,6 @@ exports.list = async (req, res) => {
           views: m.views ?? 0,
           likes: m.likes ?? 0,
           favorites: m.favorites ?? 0,
-          avg_rating: Number(m.avg_rating ?? 0),
-          rating_count: m.rating_count ?? 0,
         };
       });
 
@@ -242,7 +252,7 @@ exports.feed = async (req, res) => {
       if (sort === 'newest') {
         orderBy = 'p.published_at DESC NULLS LAST, p.id DESC';
       } else if (sort === 'popular') {
-        orderBy = 'COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC, COALESCE(m.avg_rating, 0) DESC';
+        orderBy = 'COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC';
       }
       // score = blueprint-style discovery (default: views + likes weighted)
 
@@ -291,7 +301,7 @@ exports.feed = async (req, res) => {
 
       // Attach metrics for each
       const metricRes = await client.query(
-        'SELECT project_id, views, likes, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+        'SELECT project_id, views, likes FROM project_metrics WHERE project_id = ANY($1::bigint[])',
         [projectIds]
       );
       const metricMap = {};
@@ -302,7 +312,6 @@ exports.feed = async (req, res) => {
         const m = metricMap[f.id] || {};
         f.views = m.views ?? 0;
         f.likes = m.likes ?? 0;
-        f.avg_rating = Number(m.avg_rating ?? 0);
       });
 
       res.json(feed);
@@ -430,11 +439,13 @@ exports.create = async (req, res) => {
       const proj = insertRes.rows[0];
 
       await client.query(
-        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
-         VALUES ($1, 0, 0, 0, 0, 0, 0)
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, comments)
+         VALUES ($1, 0, 0, 0, 0)
          ON CONFLICT (project_id) DO NOTHING`,
         [proj.id]
       );
+
+      await ensureShareLink(client, proj.id);
 
       res.status(201).json({
         id: proj.id,
@@ -565,7 +576,6 @@ exports.delete = async (req, res) => {
       await client.query('DELETE FROM project_assets WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_favorites WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_likes WHERE project_id = $1', [projectId]);
-      await client.query('DELETE FROM project_ratings WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_reviews WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_share_links WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_views WHERE project_id = $1', [projectId]);
@@ -726,6 +736,9 @@ exports.addAsset = async (req, res) => {
         [projectId, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position]
       );
       const asset = insertRes.rows[0];
+      if (asset_type === 'IMAGE') {
+        enqueueVariantJob(asset.id, original_url);
+      }
       res.status(201).json(asset);
     } finally {
       client.release();
@@ -780,65 +793,45 @@ exports.deleteAsset = async (req, res) => {
 };
 
 /**
- * Create share link
+ * Create share link (get-or-create: each project has one permanent link, no expiry)
  * POST /api/projects/:id/share
  */
 exports.createShareLink = async (req, res) => {
-  console.log('[createShareLink] ENTRY', { params: req.params, body: req.body, path: req.path, originalUrl: req.originalUrl });
   try {
     const projectId = parseInt(req.params.id, 10);
     if (Number.isNaN(projectId)) {
-      console.log('[createShareLink] Invalid projectId:', req.params.id);
       return sendValidationError(res, 'Invalid project id.');
     }
     const userId = req.user?.id ?? req.user?.user_id;
-    console.log('[createShareLink] projectId=', projectId, 'userId=', userId, 'usn=', req.user?.usn);
     const usn = req.user?.usn;
     if (!userId && !usn) {
-      console.log('[createShareLink] No auth:', { userId, usn });
       return sendError(res, 401, 'Authentication required.');
     }
-
-    const expires_in_hours = req.body?.expires_in_hours != null ? parseInt(req.body.expires_in_hours, 10) : 168; // 7 days default
-    const expiresAt = expires_in_hours > 0
-      ? new Date(Date.now() + expires_in_hours * 60 * 60 * 1000)
-      : null;
 
     const client = await pool.connect();
     try {
       const ownership = await assertOwnership(client, projectId, userId, usn);
       if (!ownership.ok) {
-        console.log('[createShareLink] Ownership failed:', ownership);
         if (ownership.error === 'not_found') return sendNotFound(res, 'Project not found.');
         return sendAccessDenied(res, 'Only owner can create share links.');
       }
 
-      const projRes = await client.query('SELECT visibility FROM projects WHERE id = $1', [projectId]);
-      const visibility = projRes.rows[0]?.visibility;
-      console.log('[createShareLink] visibility=', visibility, 'required=PUBLIC_LINK');
-      if (projRes.rows.length && visibility !== 'PUBLIC_LINK') {
-        return sendValidationError(res, 'Share links are only available for projects with visibility PUBLIC_LINK (Public + Shareable Link).');
+      const projRes = await client.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+      if (!projRes.rows.length) {
+        return sendNotFound(res, 'Project not found.');
       }
 
-      const shareToken = crypto.randomBytes(24).toString('hex');
-      await client.query(
-        `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active)
-         VALUES ($1, $2, $3, true)`,
-        [projectId, shareToken, expiresAt]
-      );
-
+      const { share_token: shareToken } = await ensureShareLink(client, projectId);
       const path = `/projects/share/${shareToken}`;
-      console.log('[createShareLink] SUCCESS', { projectId, shareToken, path });
-      res.status(201).json({
+      res.status(200).json({
         share_token: shareToken,
         url: path,
-        expires_at: expiresAt ? expiresAt.toISOString() : null,
+        expires_at: null,
       });
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('[createShareLink] error:', error?.message || error, error?.stack);
     return sendCaughtError(res, error, 'Failed to create share link.');
   }
 };
@@ -919,7 +912,7 @@ exports.addReview = async (req, res) => {
       }
       const p = projRes.rows[0];
 
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1018,7 +1011,7 @@ exports.toggleLike = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1031,8 +1024,8 @@ exports.toggleLike = async (req, res) => {
 
       // Ensure project_metrics row exists (some projects may not have one)
       await client.query(
-        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
-         VALUES ($1, 0, 0, 0, 0, 0, 0)
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, comments)
+         VALUES ($1, 0, 0, 0, 0)
          ON CONFLICT (project_id) DO NOTHING`,
         [projectId]
       );
@@ -1095,7 +1088,7 @@ exports.toggleFavorite = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
+      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
       if (!canView) {
         return sendNotFound(res, 'Project not found.');
       }
@@ -1108,8 +1101,8 @@ exports.toggleFavorite = async (req, res) => {
 
       // Ensure project_metrics row exists (some projects may not have one)
       await client.query(
-        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments)
-         VALUES ($1, 0, 0, 0, 0, 0, 0)
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, comments)
+         VALUES ($1, 0, 0, 0, 0)
          ON CONFLICT (project_id) DO NOTHING`,
         [projectId]
       );
@@ -1144,71 +1137,6 @@ exports.toggleFavorite = async (req, res) => {
     }
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to toggle favorite.');
-  }
-};
-
-/**
- * Rate project (1-5)
- * PUT /api/projects/:id/rate
- */
-exports.rate = async (req, res) => {
-  try {
-    const projectId = parseInt(req.params.id, 10);
-    if (Number.isNaN(projectId)) {
-      return sendValidationError(res, 'Invalid project id.');
-    }
-    const userId = req.user?.id ?? req.user?.user_id;
-    if (!userId) {
-      return sendError(res, 401, 'Authentication required.');
-    }
-
-    const rating = req.body?.rating != null ? parseInt(req.body.rating, 10) : null;
-    if (rating == null || rating < 1 || rating > 5) {
-      return sendValidationError(res, 'Rating must be between 1 and 5.', { rating: 'Rating must be 1-5.' });
-    }
-
-    const client = await pool.connect();
-    try {
-      const projRes = await client.query(
-        'SELECT id, visibility, project_status FROM projects WHERE id = $1',
-        [projectId]
-      );
-      if (!projRes.rows.length) {
-        return sendNotFound(res, 'Project not found.');
-      }
-      const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.visibility === 'PUBLIC_LINK' || p.project_status === 'approved';
-      if (!canView) {
-        return sendNotFound(res, 'Project not found.');
-      }
-
-      await client.query(
-        `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
-         ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
-        [projectId, userId, rating]
-      );
-
-      const aggRes = await client.query(
-        `UPDATE project_metrics SET
-          avg_rating = (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1),
-          rating_count = (SELECT COUNT(*) FROM project_ratings WHERE project_id = $1),
-          last_updated = NOW()
-         WHERE project_id = $1
-         RETURNING avg_rating, rating_count`,
-        [projectId]
-      );
-      const agg = aggRes.rows[0] || { avg_rating: 0, rating_count: 0 };
-
-      res.json({
-        rating,
-        avg_rating: Number(agg.avg_rating),
-        rating_count: agg.rating_count,
-      });
-    } finally {
-      client.release();
-    }
-  } catch (error) {
-    return sendCaughtError(res, error, 'Failed to rate project.');
   }
 };
 
@@ -1250,7 +1178,6 @@ exports.adminList = async (req, res) => {
 
       let assets = [];
       let metricsByProj = {};
-      let ratingsByProj = {};
       let likedProjectIds = new Set();
       let favoritedProjectIds = new Set();
       const userId = req.user?.id ?? req.user?.user_id;
@@ -1262,11 +1189,7 @@ exports.adminList = async (req, res) => {
             [projectIds]
           ),
           client.query(
-            'SELECT project_id, views, likes, favorites, avg_rating FROM project_metrics WHERE project_id = ANY($1::bigint[])',
-            [projectIds]
-          ),
-          client.query(
-            'SELECT project_id, user_id, rating FROM project_ratings WHERE project_id = ANY($1::bigint[])',
+            'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
             [projectIds]
           ),
         ];
@@ -1287,15 +1210,11 @@ exports.adminList = async (req, res) => {
         (results[1].rows || []).forEach((m) => {
           metricsByProj[m.project_id] = m;
         });
-        (results[2].rows || []).forEach((r) => {
-          if (!ratingsByProj[r.project_id]) ratingsByProj[r.project_id] = [];
-          ratingsByProj[r.project_id].push({ user_id: r.user_id, rating: r.rating });
-        });
-        if (userId && results[3]) {
-          (results[3].rows || []).forEach((r) => likedProjectIds.add(r.project_id));
+        if (userId && results[2]) {
+          (results[2].rows || []).forEach((r) => likedProjectIds.add(r.project_id));
         }
-        if (userId && results[4]) {
-          (results[4].rows || []).forEach((r) => favoritedProjectIds.add(r.project_id));
+        if (userId && results[3]) {
+          (results[3].rows || []).forEach((r) => favoritedProjectIds.add(r.project_id));
         }
       }
 
@@ -1307,12 +1226,6 @@ exports.adminList = async (req, res) => {
 
       const list = rows.map((p) => {
         const m = metricsByProj[p.id] || {};
-        const ratings = ratingsByProj[p.id] || [];
-        const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
-        const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
-        // Only show rating when admin has rated; avoid showing stale/default values
-        const avgRating = adminRating != null ? adminRating : null;
-
         return {
           id: p.id,
           usn: p.usn,
@@ -1332,8 +1245,6 @@ exports.adminList = async (req, res) => {
           favorites_count: m.favorites ?? 0,
           is_liked: likedProjectIds.has(p.id),
           is_favorited: favoritedProjectIds.has(p.id),
-          average_rating: avgRating,
-          admin_rating: adminRating,
           is_approved: p.project_status === 'approved',
         };
       });
@@ -1348,7 +1259,7 @@ exports.adminList = async (req, res) => {
 };
 
 /**
- * Admin: update project (status, admin_rating)
+ * Admin: update project (status)
  * PATCH /api/admin/projects/:id
  */
 exports.adminUpdate = async (req, res) => {
@@ -1367,7 +1278,6 @@ exports.adminUpdate = async (req, res) => {
     if (projectStatus === undefined && body.is_approved !== undefined) {
       projectStatus = body.is_approved ? 'approved' : 'rejected';
     }
-    const adminRating = body.admin_rating != null ? Math.min(5, Math.max(1, Math.round(Number(body.admin_rating)))) : null;
 
     const client = await pool.connect();
     try {
@@ -1378,28 +1288,11 @@ exports.adminUpdate = async (req, res) => {
       if (!projRes.rows.length) {
         return sendNotFound(res, 'Project not found.');
       }
-      const p = projRes.rows[0];
 
       if (projectStatus && VALID_PROJECT_STATUS.includes(projectStatus)) {
         await client.query(
           'UPDATE projects SET project_status = $1, updated_at = NOW() WHERE id = $2',
           [projectStatus, projectId]
-        );
-      }
-
-      if (adminRating != null) {
-        await client.query(
-          `INSERT INTO project_ratings (project_id, user_id, rating) VALUES ($1, $2, $3)
-           ON CONFLICT (project_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, rated_at = NOW()`,
-          [projectId, userId, adminRating]
-        );
-        await client.query(
-          `UPDATE project_metrics SET
-            avg_rating = (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1),
-            rating_count = (SELECT COUNT(*) FROM project_ratings WHERE project_id = $1),
-            last_updated = NOW()
-           WHERE project_id = $1`,
-          [projectId]
         );
       }
 
@@ -1444,7 +1337,7 @@ exports.adminGetById = async (req, res) => {
       }
       const p = projRes.rows[0];
 
-      const [assetsRes, variantsRes, metricsRes, ratingsRes, reviewsRes, shareLinksRes] = await Promise.all([
+      const [assetsRes, variantsRes, metricsRes, reviewsRes, shareLinksRes] = await Promise.all([
         client.query(
           'SELECT id, asset_type, asset_role, original_url, position, width, height, file_size_kb, mime_type, uploaded_at FROM project_assets WHERE project_id = $1 ORDER BY position',
           [projectId]
@@ -1457,11 +1350,7 @@ exports.adminGetById = async (req, res) => {
           [projectId]
         ),
         client.query(
-          'SELECT views, likes, favorites, avg_rating, rating_count, comments, last_updated FROM project_metrics WHERE project_id = $1',
-          [projectId]
-        ),
-        client.query(
-          'SELECT user_id, rating, rated_at FROM project_ratings WHERE project_id = $1 ORDER BY rated_at DESC',
+          'SELECT views, likes, favorites, comments, last_updated FROM project_metrics WHERE project_id = $1',
           [projectId]
         ),
         client.query(
@@ -1487,8 +1376,6 @@ exports.adminGetById = async (req, res) => {
             (SELECT COUNT(*)::int FROM project_views WHERE project_id = $1) AS views,
             (SELECT COUNT(*)::int FROM project_likes WHERE project_id = $1) AS likes,
             (SELECT COUNT(*)::int FROM project_favorites WHERE project_id = $1) AS favorites,
-            (SELECT COALESCE(AVG(rating)::numeric, 0) FROM project_ratings WHERE project_id = $1) AS avg_rating,
-            (SELECT COUNT(*)::int FROM project_ratings WHERE project_id = $1) AS rating_count,
             (SELECT COUNT(*)::int FROM project_reviews WHERE project_id = $1) AS comments`,
           [projectId]
         );
@@ -1498,12 +1385,9 @@ exports.adminGetById = async (req, res) => {
         views: metrics.views ?? 0,
         likes: metrics.likes ?? 0,
         favorites: metrics.favorites ?? 0,
-        avg_rating: Number(metrics.avg_rating ?? 0),
-        rating_count: metrics.rating_count ?? 0,
         comments: metrics.comments ?? 0,
         last_updated: metrics.last_updated ?? null,
       };
-      const ratings = ratingsRes.rows || [];
       const reviews = reviewsRes.rows || [];
       const shareLinks = shareLinksRes.rows || [];
 
@@ -1541,9 +1425,6 @@ exports.adminGetById = async (req, res) => {
         .sort((a, b) => a.position - b.position)
         .map((a) => a.original_url);
 
-      const adminRatings = ratings.filter((r) => r.user_id !== p.owner_user_id);
-      const adminRating = adminRatings.length > 0 ? adminRatings[0].rating : null;
-
       res.json({
         id: p.id,
         owner_usn: p.owner_usn,
@@ -1569,13 +1450,9 @@ exports.adminGetById = async (req, res) => {
           views: metrics.views ?? 0,
           likes: metrics.likes ?? 0,
           favorites: metrics.favorites ?? 0,
-          avg_rating: Number(metrics.avg_rating ?? 0),
-          rating_count: metrics.rating_count ?? 0,
           comments: metrics.comments ?? 0,
           last_updated: metrics.last_updated,
         },
-        ratings,
-        admin_rating: adminRating,
         reviews,
         share_links: shareLinks,
       });
@@ -1607,7 +1484,6 @@ exports.adminDelete = async (req, res) => {
       await client.query('DELETE FROM project_assets WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_favorites WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_likes WHERE project_id = $1', [projectId]);
-      await client.query('DELETE FROM project_ratings WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_reviews WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_share_links WHERE project_id = $1', [projectId]);
       await client.query('DELETE FROM project_views WHERE project_id = $1', [projectId]);
@@ -1666,6 +1542,9 @@ exports.adminAddAsset = async (req, res) => {
         [projectId, asset_type, asset_role, original_url, width, height, file_size_kb, mime_type, position]
       );
       const asset = insertRes.rows[0];
+      if (asset_type === 'IMAGE') {
+        enqueueVariantJob(asset.id, original_url);
+      }
       res.status(201).json(asset);
     } finally {
       client.release();
@@ -1913,8 +1792,8 @@ exports.adminAddReview = async (req, res) => {
       const reviewPayload = row ? { ...row, reviewer_usn: reviewerUsn } : row;
 
       await client.query(
-        `INSERT INTO project_metrics (project_id, views, likes, favorites, avg_rating, rating_count, comments, last_updated)
-         VALUES ($1, 0, 0, 0, 0, 0, 1, NOW())
+        `INSERT INTO project_metrics (project_id, views, likes, favorites, comments, last_updated)
+         VALUES ($1, 0, 0, 0, 1, NOW())
          ON CONFLICT (project_id) DO UPDATE SET comments = COALESCE(project_metrics.comments, 0) + 1, last_updated = NOW()`,
         [projectId]
       );
@@ -2010,11 +1889,6 @@ exports.adminCreateShareLink = async (req, res) => {
       const exists = await assertProjectExists(client, projectId);
       if (!exists) return sendNotFound(res, 'Project not found.');
 
-      const projRes = await client.query('SELECT visibility FROM projects WHERE id = $1', [projectId]);
-      if (projRes.rows.length && projRes.rows[0].visibility !== 'PUBLIC_LINK') {
-        await client.query("UPDATE projects SET visibility = 'PUBLIC_LINK', updated_at = NOW() WHERE id = $1", [projectId]);
-      }
-
       const shareToken = crypto.randomBytes(24).toString('hex');
       await client.query(
         `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active)
@@ -2062,3 +1936,5 @@ exports.adminDeleteShareLink = async (req, res) => {
     return sendCaughtError(res, error, 'Failed to delete share link.');
   }
 };
+
+exports.ensureShareLink = ensureShareLink;

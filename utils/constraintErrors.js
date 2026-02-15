@@ -32,7 +32,7 @@ const CONSTRAINT_MESSAGES = {
 
   // projects
   projects_visibility_check:
-    'Visibility must be PRIVATE, PUBLIC, or PUBLIC_LINK.',
+    'Visibility must be PRIVATE or PUBLIC.',
 
   // student_publications
   student_publications_author_count_check:
