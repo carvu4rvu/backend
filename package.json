@@ -13,7 +13,8 @@
     "storage:test": "node ../scripts/test-storage-connectivity.js",
     "storage:migrate": "node ../scripts/migrate-to-supabase-storage.js",
     "storage:verify": "node ../scripts/verify-db-storage-urls.js",
-    "ensure:project-share-links": "node scripts/ensureProjectShareLinks.js"
+    "ensure:project-share-links": "node scripts/ensureProjectShareLinks.js",
+    "upload:event-images": "node scripts/uploadEventImagesToSystemAssets.js"
   },
   "keywords": [],
   "author": "",

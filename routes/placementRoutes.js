@@ -6,6 +6,7 @@ const emailRecipientsController = require('../controllers/emailRecipientsControl
 const violationsController = require('../controllers/violationsController');
 const studentEditControlController = require('../controllers/studentEditControlController');
 const semesterUnlockRequestController = require('../controllers/semesterUnlockRequestController');
+const studentNotificationController = require('../controllers/studentNotificationController');
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 
 // Validate critical middleware/handlers (avoids cryptic "argument handler must be a function" crash)
@@ -115,6 +116,7 @@ router.get('/email-recipients', authenticateToken, emailRecipientsController.get
 
 // Projects: alumni feed, view increment, like (alumni or authenticated)
 router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniProjects);
+router.get('/projects/alumni/:projectId', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniProjectById);
 router.post('/projects/:id/view', placementController.incrementProjectView);
 router.post('/projects/:id/like', authenticateToken, placementController.toggleProjectLike);
 
@@ -137,6 +139,10 @@ router.delete('/alumni/codes/:id', authenticateToken, placementController.delete
 router.get('/alumni/conversions', authenticateToken, placementController.getAlumniConversions);
 router.get('/alumni/conversion-logs', authenticateToken, authorizeRoles('admin'), placementController.getAlumniConversionLogs);
 router.post('/alumni/convert', authenticateToken, authorizeRoles('admin'), placementController.convertToAlumni);
+router.get('/alumni/events', authenticateToken, authorizeRoles('alumni'), placementController.getAlumniEvents);
+router.get('/alumni/notifications/unread-count', authenticateToken, authorizeRoles('alumni'), studentNotificationController.getUnreadCount);
+router.get('/alumni/notifications', authenticateToken, authorizeRoles('alumni'), studentNotificationController.list);
+router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles('alumni'), studentNotificationController.updateNode);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
 

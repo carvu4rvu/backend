@@ -4022,6 +4022,57 @@ exports.getMyHrRecommendations = async (req, res) => {
 };
 
 /**
+ * GET /placement/alumni/events
+ * Returns events that were sent to alumni (any notification targeting alumni role or ALL with an event link).
+ * All alumni see the same set of "alumni events".
+ */
+exports.getAlumniEvents = async (req, res) => {
+  try {
+    const userId = req.user?.id ?? req.user?.user_id;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required.' });
+    }
+
+    const notifRes = await pool.query(
+      `SELECT n.link FROM notifications n
+       WHERE n.is_active = true AND n.link IS NOT NULL AND TRIM(n.link) != ''
+         AND ( (n.target_type = 'ROLE' AND (n.target_role ILIKE '%alumni%' OR LOWER(TRIM(n.target_role)) = 'alumni'))
+               OR n.target_type = 'ALL' )`
+    );
+    const eventIds = new Set();
+    for (const row of notifRes.rows || []) {
+      const link = row.link || '';
+      const m = link.match(/event[s]?[\/\-](\d+)/i) || link.match(/[?&]event[=_ ]?(\d+)/i);
+      if (m) eventIds.add(parseInt(m[1], 10));
+    }
+    const ids = [...eventIds];
+    if (ids.length === 0) {
+      return res.json([]);
+    }
+
+    const { data: events, error } = await supabase
+      .from('events')
+      .select('*')
+      .in('id', ids)
+      .order('event_datetime', { ascending: true });
+
+    if (error) throw error;
+
+    const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const withImageUrls = (events || []).map((ev) => ({
+      ...ev,
+      image_url: baseUrl && ev.id
+        ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
+        : null,
+    }));
+    res.json(withImageUrls);
+  } catch (err) {
+    logger.error('getAlumniEvents:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch events' });
+  }
+};
+
+/**
  * GET /placement/hr-recommendations (admin)
  * Get all HR recommendations for admin review
  */
@@ -4089,15 +4140,84 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       .eq('usn', usn)
       .single();
 
-    // Get projects (only PUBLIC and approved) from projects table
+    // Get all approved projects for this student (use student.usn for exact match; status case-insensitive)
+    const ownerUsn = student.usn || usn;
     const projRes = await pool.query(
-      `SELECT p.*, m.views, m.likes FROM projects p
-       LEFT JOIN project_metrics m ON m.project_id = p.id
-       WHERE p.owner_usn = $1 AND p.visibility = 'PUBLIC' AND p.project_status = 'approved'
-       ORDER BY p.priority ASC NULLS LAST`,
-      [usn]
+      `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.priority
+       FROM projects p
+       WHERE p.owner_usn = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'
+       ORDER BY p.priority ASC NULLS LAST, p.id ASC`,
+      [ownerUsn]
     );
-    const projects = projRes.rows || [];
+    const projectRows = projRes.rows || [];
+    const projectIds = projectRows.map((r) => r.id);
+
+    let assetsByProj = {};
+    let metricsByProj = {};
+    let likedSet = new Set();
+    let favoritedSet = new Set();
+    const userId = req.user ? (req.user.id || req.user.user_id) : null;
+
+    if (projectIds.length > 0) {
+      const [assetRes, metricRes, likeRes, favRes] = await Promise.all([
+        pool.query(
+          `SELECT project_id, original_url, position
+           FROM project_assets
+           WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
+           ORDER BY project_id, position`,
+          [projectIds]
+        ),
+        pool.query(
+          'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+          [projectIds]
+        ),
+        userId ? pool.query(
+          'SELECT project_id FROM project_likes WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+          [projectIds, userId]
+        ) : { rows: [] },
+        userId ? pool.query(
+          'SELECT project_id FROM project_favorites WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
+          [projectIds, userId]
+        ) : { rows: [] },
+      ]);
+      (assetRes.rows || []).forEach((a) => {
+        if (!assetsByProj[a.project_id]) assetsByProj[a.project_id] = [];
+        assetsByProj[a.project_id].push(a.original_url);
+      });
+      (metricRes.rows || []).forEach((m) => { metricsByProj[m.project_id] = m; });
+      (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
+      (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
+    }
+
+    const projects = projectRows.map((p) => {
+      const m = metricsByProj[p.id] || {};
+      return {
+        id: p.id,
+        owner_usn: p.owner_usn,
+        usn: p.owner_usn,
+        title: p.title,
+        short_description: p.short_description,
+        one_line_description: p.short_description,
+        description: p.description,
+        full_description: p.description,
+        category: p.category,
+        genre: p.category,
+        hosted_url: p.hosted_url,
+        hosted_link: p.hosted_url,
+        github_url: p.github_url,
+        github_repo: p.github_url,
+        mentor_name: p.mentor_name,
+        tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        project_snaps: assetsByProj[p.id] || [],
+        views_count: m.views ?? 0,
+        likes_count: m.likes ?? 0,
+        favorites_count: m.favorites ?? 0,
+        is_liked: likedSet.has(p.id),
+        is_favorited: favoritedSet.has(p.id),
+      };
+    });
 
     // Get education history
     const { data: education } = await supabase
@@ -4339,7 +4459,7 @@ exports.updateAlumniConnectionRequest = async (req, res) => {
 
 /**
  * GET /placement/projects/alumni
- * Alumni: get approved public projects with like status for current user.
+ * Alumni: get all approved projects with like/favorite status for current user (same set as admin showcase).
  */
 exports.getAlumniProjects = async (req, res) => {
   try {
@@ -4350,23 +4470,23 @@ exports.getAlumniProjects = async (req, res) => {
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
-        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility
        FROM projects p
        LEFT JOIN project_metrics m ON m.project_id = p.id
-       WHERE p.visibility = 'PUBLIC' AND p.project_status = 'approved' AND p.published_at IS NOT NULL
+       WHERE LOWER(TRIM(p.project_status::text)) = 'approved'
        ORDER BY COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC
        LIMIT 100`
     );
     const rows = projRes.rows || [];
     const projectIds = rows.map((r) => r.id);
 
-    let coverByProj = {};
+    let assetsByProj = {};
     let likedSet = new Set();
     let favoritedSet = new Set();
     if (projectIds.length > 0) {
       const [assetRes, likeRes, favRes] = await Promise.all([
         pool.query(
-          `SELECT DISTINCT ON (project_id) project_id, original_url
+          `SELECT project_id, original_url, position
            FROM project_assets
            WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
            ORDER BY project_id, position`,
@@ -4381,7 +4501,10 @@ exports.getAlumniProjects = async (req, res) => {
           [projectIds, userId]
         ),
       ]);
-      (assetRes.rows || []).forEach((a) => { coverByProj[a.project_id] = a.original_url; });
+      (assetRes.rows || []).forEach((a) => {
+        if (!assetsByProj[a.project_id]) assetsByProj[a.project_id] = [];
+        assetsByProj[a.project_id].push(a.original_url);
+      });
       (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
       (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
     }
@@ -4398,17 +4521,24 @@ exports.getAlumniProjects = async (req, res) => {
       return {
         id: p.id,
         owner_usn: p.owner_usn,
+        usn: p.owner_usn,
         title: p.title,
         short_description: p.short_description,
+        one_line_description: p.short_description,
         description: p.description,
+        full_description: p.description,
         category: p.category,
+        genre: p.category,
         hosted_url: p.hosted_url,
+        hosted_link: p.hosted_url,
         github_url: p.github_url,
+        github_repo: p.github_url,
         mentor_name: p.mentor_name,
         tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+        technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
         published_at: p.published_at,
-        project_snaps: coverByProj[p.id] ? [coverByProj[p.id]] : [],
-        cover_url: coverByProj[p.id] || null,
+        project_snaps: assetsByProj[p.id] || [],
+        cover_url: (assetsByProj[p.id] && assetsByProj[p.id][0]) || null,
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
         favorites_count: m.favorites ?? 0,
@@ -4421,6 +4551,111 @@ exports.getAlumniProjects = async (req, res) => {
   } catch (err) {
     logger.error('getAlumniProjects:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to fetch projects') });
+  }
+};
+
+/**
+ * GET /placement/projects/alumni/:projectId
+ * Alumni: get single approved project by id (full detail like admin view – overview + reviews).
+ */
+exports.getAlumniProjectById = async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.projectId, 10);
+    if (Number.isNaN(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id.' });
+    }
+    const userId = req.user ? (req.user.id || req.user.user_id) : null;
+    if (!userId) {
+      return res.status(401).json({ message: 'Authentication required.' });
+    }
+
+    const projRes = await pool.query(
+      `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.project_status, p.created_at
+       FROM projects p
+       WHERE p.id = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'`,
+      [projectId]
+    );
+    if (!projRes.rows.length) {
+      return res.status(404).json({ message: 'Project not found.' });
+    }
+    const p = projRes.rows[0];
+
+    const [assetRes, metricRes, reviewsRes, likeRes, favRes] = await Promise.all([
+      pool.query(
+        `SELECT project_id, original_url, position
+         FROM project_assets
+         WHERE project_id = $1 AND asset_role IN ('COVER','GALLERY')
+         ORDER BY position`,
+        [projectId]
+      ),
+      pool.query(
+        'SELECT views, likes, favorites FROM project_metrics WHERE project_id = $1',
+        [projectId]
+      ),
+      pool.query(
+        `SELECT r.id, r.review_text, r.review_created_at, r.reply_text, r.reply_created_at, u.usn AS reviewer_usn
+         FROM project_reviews r
+         LEFT JOIN user_login u ON u.id = r.reviewer_id
+         WHERE r.project_id = $1 ORDER BY r.review_created_at DESC`,
+        [projectId]
+      ),
+      pool.query(
+        'SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2',
+        [projectId, userId]
+      ),
+      pool.query(
+        'SELECT 1 FROM project_favorites WHERE project_id = $1 AND user_id = $2',
+        [projectId, userId]
+      ),
+    ]);
+
+    const assets = assetRes.rows || [];
+    const metrics = metricRes.rows[0] || {};
+    const reviews = (reviewsRes.rows || []).map((r) => ({
+      id: r.id,
+      reviewer_usn: r.reviewer_usn,
+      review_text: r.review_text,
+      review_created_at: r.review_created_at,
+      reply_text: r.reply_text,
+      reply_created_at: r.reply_created_at,
+    }));
+    const project_snaps = assets.map((a) => a.original_url);
+
+    res.json({
+      id: p.id,
+      owner_usn: p.owner_usn,
+      title: p.title,
+      short_description: p.short_description,
+      description: p.description,
+      category: p.category,
+      hosted_url: p.hosted_url,
+      github_url: p.github_url,
+      mentor_name: p.mentor_name,
+      tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+      tags: Array.isArray(p.tech_stack) ? p.tech_stack : [],
+      project_status: p.project_status,
+      created_at: p.created_at,
+      project_snaps,
+      assets: [],
+      metrics: {
+        views: metrics.views ?? 0,
+        likes: metrics.likes ?? 0,
+        favorites: metrics.favorites ?? 0,
+        comments: reviews.length,
+        last_updated: null,
+      },
+      reviews,
+      share_links: [],
+      views_count: metrics.views ?? 0,
+      likes_count: metrics.likes ?? 0,
+      favorites_count: metrics.favorites ?? 0,
+      is_liked: (likeRes.rows || []).length > 0,
+      is_favorited: (favRes.rows || []).length > 0,
+    });
+  } catch (err) {
+    logger.error('getAlumniProjectById:', err);
+    res.status(500).json({ message: apiMessage(err, 'Failed to fetch project') });
   }
 };
 

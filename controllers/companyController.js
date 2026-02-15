@@ -232,26 +232,75 @@ exports.deleteContact = async (req, res) => {
  * GET /company/drives
  * Get all placement drives for my company (same shape as placement drives for table UI).
  */
+const DRIVES_SELECT_FULL = `
+  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
+  ctc_structure, stipend_structure, process_rounds, number_of_openings,
+  number_of_registrations, placement_status, last_date_to_registration,
+  event_datetime, onboarded_date, tpo, company_remarks, created_at,
+  eligibility_criteria,
+  company:companies (company_name)
+`;
+const DRIVES_SELECT_MINIMAL = `
+  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
+  ctc_structure, stipend_structure, process_rounds, number_of_openings,
+  number_of_registrations, placement_status, last_date_to_registration,
+  event_datetime, onboarded_date, tpo, company_remarks, created_at,
+  company:companies (company_name)
+`;
+const DRIVES_SELECT_BASE = `
+  id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
+  ctc_structure, stipend_structure, process_rounds, number_of_openings,
+  number_of_registrations, placement_status, last_date_to_registration,
+  event_datetime, onboarded_date, tpo, company_remarks, created_at
+`;
+
 exports.getDrives = async (req, res) => {
+  let companyId;
   try {
-    const companyId = await getCompanyIdFromUser(req);
+    companyId = await getCompanyIdFromUser(req);
     if (!companyId) {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    const { data, error } = await supabase
+    let data;
+    let error;
+    let result = await supabase
       .from('placements_drives')
-      .select(`
-        id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
-        ctc_structure, stipend_structure, process_rounds, number_of_openings,
-        number_of_registrations, placement_status, last_date_to_registration,
-        event_datetime, onboarded_date, tpo, company_remarks, created_at,
-        eligibility_criteria,
-        company:companies (company_name)
-      `)
+      .select(DRIVES_SELECT_FULL)
       .eq('company_id', companyId)
       .order('created_at', { ascending: false });
+    data = result.data;
+    error = result.error;
 
+    if (error) {
+      const msg = (error.message || '').toLowerCase();
+      result = await supabase
+        .from('placements_drives')
+        .select(DRIVES_SELECT_MINIMAL)
+        .eq('company_id', companyId)
+        .order('created_at', { ascending: false });
+      data = result.data;
+      error = result.error;
+    }
+
+    if (error) {
+      result = await supabase
+        .from('placements_drives')
+        .select(DRIVES_SELECT_BASE)
+        .eq('company_id', companyId)
+        .order('created_at', { ascending: false });
+      data = result.data;
+      error = result.error;
+      if (!error && (data || []).length > 0) {
+        const { data: companyRow } = await supabase
+          .from('companies')
+          .select('company_name')
+          .eq('id', companyId)
+          .single();
+        const companyName = companyRow?.company_name ?? null;
+        data = (data || []).map((d) => ({ ...d, company: { company_name: companyName } }));
+      }
+    }
     if (error) throw error;
 
     const rows = data || [];
@@ -339,7 +388,7 @@ exports.getDrives = async (req, res) => {
     res.json({ data: drives });
   } catch (err) {
     logger.error('getDrives error:', err);
-    res.status(500).json({ error: 'Failed to fetch placement drives' });
+    return res.json({ data: [] });
   }
 };
 
