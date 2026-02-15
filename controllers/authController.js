@@ -391,19 +391,39 @@ exports.login = async (req, res) => {
 
 exports.forgotPasswordInitiate = async (req, res) => {
   const { email } = req.body;
+  if (!email || typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({ message: 'Email is required.' });
+  }
+  const emailTrimmed = email.trim();
   try {
-     const userResult = await pool.query('SELECT usn FROM user_login WHERE email_id = $1 AND is_active = true', [email]);
-     if (userResult.rows.length === 0) return res.status(404).json({ message: "User not found." });
+    const userResult = await pool.query('SELECT usn FROM user_login WHERE email_id = $1 AND is_active = true', [emailTrimmed]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
 
-     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-     const otpHash = await bcrypt.hash(otp, 10);
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpHash = await bcrypt.hash(otp, 10);
 
-     await pool.query(`INSERT INTO user_otp_verification (identifier, otp_hash, purpose, expires_at) VALUES ($1, $2, 'PASSWORD_RESET', NOW() + INTERVAL '5 minutes')`, [email, otpHash]);
-     await sendOTPEmail(email, otp, 'PASSWORD RESET');
-     res.json({ message: "OTP sent to your email." });
+    await pool.query(
+      `INSERT INTO user_otp_verification (identifier, otp_hash, purpose, expires_at) VALUES ($1, $2, 'PASSWORD_RESET', NOW() + INTERVAL '5 minutes')`,
+      [emailTrimmed, otpHash]
+    );
+
+    try {
+      await sendOTPEmail(emailTrimmed, otp, 'PASSWORD RESET');
+    } catch (emailErr) {
+      console.error('[forgotPasswordInitiate] Email send failed:', emailErr?.code || '', emailErr?.message || emailErr);
+      return res.status(503).json({
+        message: emailErr?.message && !emailErr.message.includes('emailService.sendEmail')
+          ? emailErr.message
+          : 'Unable to send email right now. Please try again in a few minutes or contact support.',
+      });
+    }
+
+    res.json({ message: 'OTP sent to your email.' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
+    console.error('[forgotPasswordInitiate] Error:', err?.message || err);
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
   }
 };
 
