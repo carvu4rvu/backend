@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const studentDb = require('../db/studentDb');
 
 /**
  * GET /api/placement/email-recipients
@@ -116,12 +117,12 @@ exports.getEmailRecipients = async (req, res) => {
 
       let list = parentRows || [];
       if (schoolId != null && !Number.isNaN(schoolId)) {
-        const { data: studentsInSchool } = await supabase.from('student_basic_details').select('usn').eq('school_id', schoolId);
+        const studentsInSchool = await studentDb.getUsnsBySchoolId(schoolId);
         const usns = new Set((studentsInSchool || []).map((s) => s.usn));
         list = list.filter((p) => usns.has(p.usn));
       }
       if (programId != null && !Number.isNaN(programId)) {
-        const { data: studentsInProgram } = await supabase.from('student_basic_details').select('usn').eq('program_id', programId);
+        const studentsInProgram = await studentDb.getUsnsByProgramId(programId);
         const usns = new Set((studentsInProgram || []).map((s) => s.usn));
         list = list.filter((p) => usns.has(p.usn));
       }

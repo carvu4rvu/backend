@@ -1,4 +1,5 @@
 const storageService = require('../services/storageService');
+const { StorageError } = require('../services/storageService');
 
 exports.uploadFile = async (req, res) => {
   try {
@@ -37,7 +38,16 @@ exports.uploadFile = async (req, res) => {
     });
   } catch (err) {
     console.error('Upload controller error:', err);
+    if (err instanceof StorageError) {
+      const status = err.code === 'AUTH' ? 503 : err.retryable ? 503 : 400;
+      return res.status(status).json({
+        message: err.userMessage,
+        error: err.userMessage,
+        code: err.code,
+        retryable: err.retryable,
+      });
+    }
     const msg = err.message || 'Server error during upload';
-    res.status(500).json({ message: msg, error: msg, details: msg });
+    res.status(500).json({ message: msg, error: msg, code: 'UNKNOWN' });
   }
 };

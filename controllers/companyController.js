@@ -1,4 +1,5 @@
-const supabase = require('../config/supabaseClient');
+const catalogDb = require('../db/catalogDb');
+const placementDb = require('../db/placementDb');
 const pool = require('../config/db');
 const logger = require('../utils/logger');
 
@@ -37,14 +38,9 @@ exports.getMyProfile = async (req, res) => {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    const { data, error } = await supabase
-      .from('companies')
-      .select('*')
-      .eq('id', companyId)
-      .single();
-
-    if (error) throw error;
-    res.json({ data });
+    const { rows } = await pool.query('SELECT * FROM companies WHERE id = $1', [companyId]);
+    if (!rows[0]) return res.status(404).json({ error: 'Company not found' });
+    res.json({ data: rows[0] });
   } catch (err) {
     logger.error('getMyProfile error:', err);
     res.status(500).json({ error: 'Failed to fetch company profile' });
@@ -75,15 +71,15 @@ exports.updateProfile = async (req, res) => {
     if (address !== undefined) updateData.address = address;
     if (company_logo_link !== undefined) updateData.company_logo_link = company_logo_link;
 
-    const { data, error } = await supabase
-      .from('companies')
-      .update(updateData)
-      .eq('id', companyId)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ data, message: 'Profile updated successfully' });
+    const keys = Object.keys(updateData);
+    const sets = keys.map((k, i) => `${k} = $${i + 2}`);
+    const values = [companyId, ...keys.map((k) => updateData[k])];
+    const { rows } = await pool.query(
+      `UPDATE companies SET ${sets.join(', ')} WHERE id = $1 RETURNING *`,
+      values
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Company not found' });
+    res.json({ data: rows[0], message: 'Profile updated successfully' });
   } catch (err) {
     logger.error('updateProfile error:', err);
     res.status(500).json({ error: 'Failed to update company profile' });
@@ -103,14 +99,11 @@ exports.getContacts = async (req, res) => {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .eq('company_id', companyId)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-    res.json({ data });
+    const { rows } = await pool.query(
+      'SELECT * FROM contacts WHERE company_id = $1 ORDER BY created_at DESC NULLS LAST',
+      [companyId]
+    );
+    res.json({ data: rows });
   } catch (err) {
     logger.error('getContacts error:', err);
     res.status(500).json({ error: 'Failed to fetch contacts' });
@@ -134,21 +127,12 @@ exports.addContact = async (req, res) => {
       return res.status(400).json({ error: 'Contact name is required' });
     }
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .insert({
-        company_id: companyId,
-        contact_name,
-        email: email || null,
-        phone_number: phone_number || null,
-        role_title: role_title || null,
-        remarks: remarks || null,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json({ data, message: 'Contact added successfully' });
+    const { rows } = await pool.query(
+      `INSERT INTO contacts (company_id, contact_name, email, phone_number, role_title, remarks)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [companyId, contact_name, email || null, phone_number || null, role_title || null, remarks || null]
+    );
+    res.status(201).json({ data: rows[0], message: 'Contact added successfully' });
   } catch (err) {
     logger.error('addContact error:', err);
     res.status(500).json({ error: 'Failed to add contact' });
@@ -170,14 +154,11 @@ exports.updateContact = async (req, res) => {
     const { contact_name, email, phone_number, role_title, remarks } = req.body;
 
     // Verify contact belongs to this company
-    const { data: existing } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .single();
-
-    if (!existing) {
+    const existingRes = await pool.query(
+      'SELECT id FROM contacts WHERE id = $1 AND company_id = $2',
+      [id, companyId]
+    );
+    if (!existingRes.rows[0]) {
       return res.status(404).json({ error: 'Contact not found' });
     }
 
@@ -188,16 +169,14 @@ exports.updateContact = async (req, res) => {
     if (role_title !== undefined) updateData.role_title = role_title;
     if (remarks !== undefined) updateData.remarks = remarks;
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .update(updateData)
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ data, message: 'Contact updated successfully' });
+    const keys = Object.keys(updateData);
+    const sets = keys.map((k, i) => `${k} = $${i + 3}`);
+    const values = [id, companyId, ...keys.map((k) => updateData[k])];
+    const { rows } = await pool.query(
+      `UPDATE contacts SET ${sets.join(', ')} WHERE id = $1 AND company_id = $2 RETURNING *`,
+      values
+    );
+    res.json({ data: rows[0], message: 'Contact updated successfully' });
   } catch (err) {
     logger.error('updateContact error:', err);
     res.status(500).json({ error: 'Failed to update contact' });
@@ -217,13 +196,11 @@ exports.deleteContact = async (req, res) => {
 
     const { id } = req.params;
 
-    const { error } = await supabase
-      .from('contacts')
-      .delete()
-      .eq('id', id)
-      .eq('company_id', companyId);
-
-    if (error) throw error;
+    const { rowCount } = await pool.query(
+      'DELETE FROM contacts WHERE id = $1 AND company_id = $2',
+      [id, companyId]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'Contact not found' });
     res.json({ message: 'Contact deleted successfully' });
   } catch (err) {
     logger.error('deleteContact error:', err);
@@ -390,22 +367,16 @@ exports.getDriveById = async (req, res) => {
 
     const { id } = req.params;
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select(`
-        *,
-        company:companies (company_name)
-      `)
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Drive not found' });
-    }
-
-    const drive = { ...data, company_name: data.company?.company_name ?? null };
-    res.json({ data: drive });
+    const { rows } = await pool.query(
+      `SELECT pd.*, c.company_name
+       FROM placements_drives pd
+       LEFT JOIN companies c ON c.id = pd.company_id
+       WHERE pd.id = $1 AND pd.company_id = $2`,
+      [id, companyId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Drive not found' });
+    const { company_name, ...rest } = rows[0];
+    res.json({ data: { ...rest, company: company_name != null ? { company_name } : null, company_name } });
   } catch (err) {
     logger.error('getDriveById error:', err);
     res.status(500).json({ error: 'Failed to fetch drive details' });
@@ -425,16 +396,12 @@ exports.getDriveEligibility = async (req, res) => {
 
     const { id } = req.params;
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select('eligibility_criteria')
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Drive not found' });
-    res.json({ data: data.eligibility_criteria || null });
+    const { rows } = await pool.query(
+      'SELECT eligibility_criteria FROM placements_drives WHERE id = $1 AND company_id = $2',
+      [id, companyId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Drive not found' });
+    res.json({ data: rows[0].eligibility_criteria || null });
   } catch (err) {
     logger.error('getDriveEligibility error:', err);
     res.status(500).json({ error: 'Failed to fetch eligibility criteria' });
@@ -456,43 +423,65 @@ exports.getDriveCandidates = async (req, res) => {
     const { status, search } = req.query;
 
     // First verify the drive belongs to this company
-    const { data: drive } = await supabase
-      .from('placements_drives')
-      .select('id')
-      .eq('id', id)
-      .eq('company_id', companyId)
-      .single();
-
-    if (!drive) {
+    const driveCheck = await pool.query(
+      'SELECT id FROM placements_drives WHERE id = $1 AND company_id = $2',
+      [id, companyId]
+    );
+    if (!driveCheck.rows[0]) {
       return res.status(404).json({ error: 'Drive not found' });
     }
 
-    let query = supabase
-      .from('student_placement_process')
-      .select(`
-        id, usn, is_eligible, registration_status, approved_status,
-        oa_status, gd_status, technical_round_status, interview_status,
-        hr_round_status, final_select_status, malpractice, remarks, attendance,
-        created_at, updated_at,
-        student_basic_details (
-          usn, full_name, college_email,
-          school_id, program_id, current_year, current_semester
-        )
-      `)
-      .eq('placement_drive_id', id);
-
-    // Filter by status if provided
+    const params = [id];
+    let statusFilter = '';
     if (status === 'registered') {
-      query = query.eq('registration_status', 'registered');
+      statusFilter = " AND spp.registration_status = 'registered'";
     } else if (status === 'selected') {
-      query = query.eq('final_select_status', true);
+      statusFilter = ' AND spp.final_select_status = true';
     }
 
-    const { data, error } = await query.order('created_at', { ascending: false });
+    const candRes = await pool.query(
+      `SELECT spp.id, spp.usn, spp.is_eligible, spp.registration_status, spp.approved_status,
+              spp.oa_status, spp.gd_status, spp.technical_round_status, spp.interview_status,
+              spp.hr_round_status, spp.final_select_status, spp.malpractice, spp.remarks, spp.attendance,
+              spp.created_at, spp.updated_at,
+              sbd.usn AS student_usn, sbd.full_name, sbd.college_email,
+              sbd.school_id, sbd.program_id, sbd.current_year, sbd.current_semester
+       FROM student_placement_process spp
+       LEFT JOIN student_basic_details sbd ON sbd.usn = spp.usn
+       WHERE spp.placement_drive_id = $1${statusFilter}
+       ORDER BY spp.created_at DESC NULLS LAST`,
+      params
+    );
 
-    if (error) throw error;
-
-    let candidates = data || [];
+    let candidates = (candRes.rows || []).map((r) => ({
+      id: r.id,
+      usn: r.usn,
+      is_eligible: r.is_eligible,
+      registration_status: r.registration_status,
+      approved_status: r.approved_status,
+      oa_status: r.oa_status,
+      gd_status: r.gd_status,
+      technical_round_status: r.technical_round_status,
+      interview_status: r.interview_status,
+      hr_round_status: r.hr_round_status,
+      final_select_status: r.final_select_status,
+      malpractice: r.malpractice,
+      remarks: r.remarks,
+      attendance: r.attendance,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+      student_basic_details: r.student_usn
+        ? {
+            usn: r.student_usn,
+            full_name: r.full_name,
+            college_email: r.college_email,
+            school_id: r.school_id,
+            program_id: r.program_id,
+            current_year: r.current_year,
+            current_semester: r.current_semester,
+          }
+        : null,
+    }));
     if (search && search.trim()) {
       const searchLower = search.trim().toLowerCase();
       candidates = candidates.filter(c =>
@@ -505,7 +494,7 @@ exports.getDriveCandidates = async (req, res) => {
     const schoolIds = [...new Set(candidates.map(c => c.student_basic_details?.school_id).filter(Boolean))];
     let schoolMap = {};
     if (schoolIds.length > 0) {
-      const { data: schools } = await supabase.from('schools').select('id, name').in('id', schoolIds);
+      const schools = await catalogDb.getSchoolsByIds(schoolIds);
       schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
     }
     candidates = candidates.map(c => {
@@ -542,14 +531,11 @@ exports.updateCandidateStatus = async (req, res) => {
     } = req.body;
 
     // Verify the drive belongs to this company
-    const { data: drive } = await supabase
-      .from('placements_drives')
-      .select('id')
-      .eq('id', driveId)
-      .eq('company_id', companyId)
-      .single();
-
-    if (!drive) {
+    const driveCheck = await pool.query(
+      'SELECT id FROM placements_drives WHERE id = $1 AND company_id = $2',
+      [driveId, companyId]
+    );
+    if (!driveCheck.rows[0]) {
       return res.status(404).json({ error: 'Drive not found' });
     }
 
@@ -565,16 +551,16 @@ exports.updateCandidateStatus = async (req, res) => {
     if (remarks !== undefined) updateData.remarks = remarks;
     if (attendance !== undefined) updateData.attendance = attendance;
 
-    const { data, error } = await supabase
-      .from('student_placement_process')
-      .update(updateData)
-      .eq('placement_drive_id', driveId)
-      .eq('usn', usn)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ data, message: 'Candidate status updated' });
+    const keys = Object.keys(updateData);
+    const sets = keys.map((k, i) => `${k} = $${i + 3}`);
+    const values = [driveId, usn, ...keys.map((k) => updateData[k])];
+    const { rows } = await pool.query(
+      `UPDATE student_placement_process SET ${sets.join(', ')}
+       WHERE placement_drive_id = $1 AND usn = $2 RETURNING *`,
+      values
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Candidate not found' });
+    res.json({ data: rows[0], message: 'Candidate status updated' });
   } catch (err) {
     logger.error('updateCandidateStatus error:', err);
     res.status(500).json({ error: 'Failed to update candidate status' });
@@ -598,37 +584,36 @@ exports.getStudentProfile = async (req, res) => {
     const { usn } = req.params;
 
     // Basic details (including mandatory fields for company view)
-    const { data: student, error: studentError } = await supabase
-      .from('student_basic_details')
-      .select(`
-        usn, full_name, college_email,
-        school_id, program_id, major_id, specialization_id,
-        year_of_joining, current_year, current_semester,
-        profile_image, gender, date_of_birth,
-        personal_email, phone_country_code, phone_number
-      `)
-      .eq('usn', usn)
-      .single();
-
-    if (studentError || !student) {
+    const studentRes = await pool.query(
+      `SELECT usn, full_name, college_email,
+              school_id, program_id, major_id, specialization_id,
+              year_of_joining, current_year, current_semester,
+              profile_image, gender, date_of_birth,
+              personal_email, phone_country_code, phone_number
+       FROM student_basic_details WHERE usn = $1`,
+      [usn]
+    );
+    const student = studentRes.rows[0];
+    if (!student) {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    // Profile details (resume for company view)
-    const { data: profile } = await supabase
-      .from('student_profile_details')
-      .select('brief_summary, key_expertise, career_objective, resume_file')
-      .eq('usn', usn)
-      .single();
+    const profileRes = await pool.query(
+      `SELECT brief_summary, key_expertise, career_objective, resume_file
+       FROM student_profile_details WHERE usn = $1`,
+      [usn]
+    );
+    const profile = profileRes.rows[0] || null;
 
-    // Latest semester academics (current aggregate & live backlogs)
-    const { data: semesterRows } = await supabase
-      .from('student_semester_academics')
-      .select('academic_year, semester, result_in_sgpa, live_backlogs')
-      .eq('usn', usn)
-      .order('academic_year', { ascending: false })
-      .order('semester', { ascending: false })
-      .limit(1);
+    const semesterRes = await pool.query(
+      `SELECT academic_year, semester, result_in_sgpa, live_backlogs
+       FROM student_semester_academics
+       WHERE usn = $1
+       ORDER BY academic_year DESC NULLS LAST, semester DESC NULLS LAST
+       LIMIT 1`,
+      [usn]
+    );
+    const semesterRows = semesterRes.rows;
 
     // Public projects only (projects table)
     const projRes = await pool.query(
@@ -665,52 +650,27 @@ exports.getStudentProfile = async (req, res) => {
       mentor_name: p.mentor_name,
     }));
 
-    // Internships
-    const { data: internships } = await supabase
-      .from('student_internships')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
-
-    // Summer internships
-    const { data: summerInternships } = await supabase
-      .from('student_summer_internship')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
-
-    // Capstone
-    const { data: capstone } = await supabase
-      .from('capstone')
-      .select('*')
-      .eq('usn', usn);
-
-    // Education history
-    const { data: education } = await supabase
-      .from('student_education_history')
-      .select('*')
-      .eq('usn', usn)
-      .order('end_year', { ascending: false });
-
-    // Certifications
-    const { data: certifications } = await supabase
-      .from('student_certifications')
-      .select('*')
-      .eq('usn', usn)
-      .order('issue_date', { ascending: false });
+    const [internRes, summerRes, capstoneRes, eduRes, certRes] = await Promise.all([
+      pool.query('SELECT * FROM student_internships WHERE usn = $1 ORDER BY start_date DESC NULLS LAST', [usn]),
+      pool.query('SELECT * FROM student_summer_internship WHERE usn = $1 ORDER BY start_date DESC NULLS LAST', [usn]),
+      pool.query('SELECT * FROM capstone WHERE usn = $1', [usn]),
+      pool.query('SELECT * FROM student_education_history WHERE usn = $1 ORDER BY end_year DESC NULLS LAST', [usn]),
+      pool.query('SELECT * FROM student_certifications WHERE usn = $1 ORDER BY issue_date DESC NULLS LAST', [usn]),
+    ]);
+    const internships = internRes.rows;
+    const summerInternships = summerRes.rows;
+    const capstone = capstoneRes.rows;
+    const education = eduRes.rows;
+    const certifications = certRes.rows;
 
     // Lookup tables for names
-    const [schoolsRes, programsRes, majorsRes, specializationsRes] = await Promise.all([
-      supabase.from('schools').select('id, name'),
-      supabase.from('programs').select('id, name'),
-      supabase.from('majors').select('id, name'),
-      supabase.from('specializations').select('id, name'),
-    ]);
+    const { schools: schoolsList, programs: programsList, majors: majorsList, specializations: specsList } =
+      await catalogDb.getCatalogLookupMaps();
 
-    const schools = Object.fromEntries((schoolsRes.data || []).map(s => [s.id, s.name]));
-    const programs = Object.fromEntries((programsRes.data || []).map(p => [p.id, p.name]));
-    const majors = Object.fromEntries((majorsRes.data || []).map(m => [m.id, m.name]));
-    const specializations = Object.fromEntries((specializationsRes.data || []).map(s => [s.id, s.name]));
+    const schools = Object.fromEntries((schoolsList || []).map(s => [s.id, s.name]));
+    const programs = Object.fromEntries((programsList || []).map(p => [p.id, p.name]));
+    const majors = Object.fromEntries((majorsList || []).map(m => [m.id, m.name]));
+    const specializations = Object.fromEntries((specsList || []).map(s => [s.id, s.name]));
 
     const eduList = education || [];
     const tenthEdu = eduList.find(e => (e.education_level || '').toUpperCase() === '10TH');
@@ -775,16 +735,27 @@ exports.getOffers = async (req, res) => {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    const { data, error } = await supabase
-      .from('offers')
-      .select(`
-        id, student_id, job_type, academic_year, remarks, is_accepted, created_at,
-        student_basic_details (usn, full_name, college_email, current_year)
-      `)
-      .eq('company_id', companyId)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
+    const { rows } = await pool.query(
+      `SELECT o.id, o.student_id, o.job_type, o.academic_year, o.remarks, o.is_accepted, o.created_at,
+              sbd.usn, sbd.full_name, sbd.college_email, sbd.current_year
+       FROM offers o
+       LEFT JOIN student_basic_details sbd ON sbd.usn = o.student_id
+       WHERE o.company_id = $1
+       ORDER BY o.created_at DESC NULLS LAST`,
+      [companyId]
+    );
+    const data = rows.map((r) => ({
+      id: r.id,
+      student_id: r.student_id,
+      job_type: r.job_type,
+      academic_year: r.academic_year,
+      remarks: r.remarks,
+      is_accepted: r.is_accepted,
+      created_at: r.created_at,
+      student_basic_details: r.usn
+        ? { usn: r.usn, full_name: r.full_name, college_email: r.college_email, current_year: r.current_year }
+        : null,
+    }));
     res.json({ data });
   } catch (err) {
     logger.error('getOffers error:', err);
@@ -823,13 +794,7 @@ exports.getEvents = async (req, res) => {
       return res.json({ data: [] });
     }
 
-    const { data: events, error } = await supabase
-      .from('events')
-      .select('*')
-      .in('id', ids)
-      .order('event_datetime', { ascending: false });
-
-    if (error) throw error;
+    const events = await placementDb.getEventsByIds(ids);
 
     const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
     const withImageUrls = (events || []).map((ev) => ({
@@ -1205,19 +1170,18 @@ exports.getDashboardStats = async (req, res) => {
       return res.status(403).json({ error: 'Company not linked to this account' });
     }
 
-    // Get company info
-    const { data: company } = await supabase
-      .from('companies')
-      .select('company_name, company_logo_link, company_type')
-      .eq('id', companyId)
-      .single();
+    const companyRes = await pool.query(
+      'SELECT company_name, company_logo_link, company_type FROM companies WHERE id = $1',
+      [companyId]
+    );
+    const company = companyRes.rows[0] || null;
 
-    // Get drives (include job_type for chart labels)
-    const { data: drives } = await supabase
-      .from('placements_drives')
-      .select('id, placement_status, number_of_registrations, job_type, academic_year')
-      .eq('company_id', companyId)
-      .order('id', { ascending: false });
+    const drivesRes = await pool.query(
+      `SELECT id, placement_status, number_of_registrations, job_type, academic_year
+       FROM placements_drives WHERE company_id = $1 ORDER BY id DESC`,
+      [companyId]
+    );
+    const drives = drivesRes.rows;
 
     const activeDrives = (drives || []).filter(d =>
       d.placement_status && !['completed', 'cancelled'].includes(d.placement_status.toLowerCase())
@@ -1231,11 +1195,11 @@ exports.getDashboardStats = async (req, res) => {
       registrations: d.number_of_registrations || 0,
     }));
 
-    // Get offers
-    const { data: offers } = await supabase
-      .from('offers')
-      .select('id, is_accepted')
-      .eq('company_id', companyId);
+    const offersRes = await pool.query(
+      'SELECT id, is_accepted FROM offers WHERE company_id = $1',
+      [companyId]
+    );
+    const offers = offersRes.rows;
 
     const totalOffers = (offers || []).length;
     const acceptedOffers = (offers || []).filter(o => o.is_accepted === true).length;
@@ -1252,20 +1216,20 @@ exports.getDashboardStats = async (req, res) => {
     let recentActivity = [];
     
     if (driveIds.length > 0) {
-      const { data: recentRegistrations } = await supabase
-        .from('student_placement_process')
-        .select(`
-          id, usn, registration_status, created_at,
-          student_basic_details (full_name)
-        `)
-        .in('placement_drive_id', driveIds)
-        .eq('registration_status', 'registered')
-        .order('created_at', { ascending: false })
-        .limit(10);
+      const recentRes = await pool.query(
+        `SELECT spp.id, spp.usn, spp.registration_status, spp.created_at, sbd.full_name
+         FROM student_placement_process spp
+         LEFT JOIN student_basic_details sbd ON sbd.usn = spp.usn
+         WHERE spp.placement_drive_id = ANY($1::bigint[])
+           AND spp.registration_status = 'registered'
+         ORDER BY spp.created_at DESC NULLS LAST
+         LIMIT 10`,
+        [driveIds]
+      );
 
-      recentActivity = (recentRegistrations || []).map(r => ({
+      recentActivity = (recentRes.rows || []).map((r) => ({
         type: 'registration',
-        student_name: r.student_basic_details?.full_name || r.usn,
+        student_name: r.full_name || r.usn,
         usn: r.usn,
         timestamp: r.created_at,
       }));

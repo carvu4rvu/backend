@@ -1,23 +1,20 @@
-const supabase = require('../config/supabaseClient');
+const { pool, queryOne, queryMany } = require('../db/query');
 
 /**
  * List events. Optional ?status=scheduled|ongoing|completed|failed
  */
 exports.list = async (req, res) => {
   try {
-    let query = supabase
-      .from('events')
-      .select('*')
-      .order('event_datetime', { ascending: true });
-
     const { status } = req.query;
+    let sql = 'SELECT * FROM events';
+    const params = [];
     if (status && ['scheduled', 'ongoing', 'completed', 'failed'].includes(status)) {
-      query = query.eq('status', status);
+      sql += ' WHERE status = $1';
+      params.push(status);
     }
-
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json(data || []);
+    sql += ' ORDER BY event_datetime ASC';
+    const rows = await queryMany(sql, params);
+    res.json(rows);
   } catch (err) {
     console.error('Events list error:', err);
     res.status(500).json({ message: err.message || 'Failed to list events' });
@@ -30,10 +27,9 @@ exports.list = async (req, res) => {
  */
 exports.getNotificationStats = async (req, res) => {
   try {
-    const { data: notifications } = await supabase
-      .from('notifications')
-      .select('id, link')
-      .eq('is_active', true);
+    const notifications = await queryMany(
+      'SELECT id, link FROM notifications WHERE is_active = true'
+    );
     const stats = {};
     for (const n of notifications || []) {
       const m = (n.link || '').match(/event[s]?[\/\-](\d+)/i) || (n.link || '').match(/\?.*event[=_]?(\d+)/i);
@@ -42,9 +38,7 @@ exports.getNotificationStats = async (req, res) => {
         stats[eventId] = { notificationId: n.id, sent: 0, read: 0 };
       }
     }
-    const { data: nodes } = await supabase
-      .from('notification_nodes')
-      .select('notification_id, is_read');
+    const nodes = await queryMany('SELECT notification_id, is_read FROM notification_nodes');
     for (const node of nodes || []) {
       const n = (notifications || []).find((x) => x.id === node.notification_id);
       if (n) {
@@ -68,15 +62,8 @@ exports.getNotificationStats = async (req, res) => {
 exports.getById = async (req, res) => {
   try {
     const { id } = req.params;
-    const { data, error } = await supabase
-      .from('events')
-      .select('*')
-      .eq('id', id)
-      .single();
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ message: 'Event not found' });
-      throw error;
-    }
+    const data = await queryOne('SELECT * FROM events WHERE id = $1', [id]);
+    if (!data) return res.status(404).json({ message: 'Event not found' });
     res.json(data);
   } catch (err) {
     console.error('Events getById error:', err);
@@ -102,13 +89,13 @@ exports.create = async (req, res) => {
       attachments: attachments || [],
       status: status || 'scheduled',
     };
-    const { data, error } = await supabase
-      .from('events')
-      .insert(payload)
-      .select()
-      .single();
-    if (error) throw error;
-    res.status(201).json(data);
+    const keys = Object.keys(payload);
+    const placeholders = keys.map((_, i) => `$${i + 1}`);
+    const { rows } = await pool.query(
+      `INSERT INTO events (${keys.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+      keys.map((k) => payload[k])
+    );
+    res.status(201).json(rows[0]);
   } catch (err) {
     console.error('Events create error:', err);
     res.status(500).json({ message: err.message || 'Failed to create event' });
@@ -132,14 +119,14 @@ exports.update = async (req, res) => {
     if (status !== undefined) updates.status = status;
     updates.updated_at = new Date().toISOString();
 
-    const { data, error } = await supabase
-      .from('events')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(data);
+    const keys = Object.keys(updates);
+    const setClause = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
+    const { rows } = await pool.query(
+      `UPDATE events SET ${setClause} WHERE id = $1 RETURNING *`,
+      [id, ...keys.map((k) => updates[k])]
+    );
+    if (!rows[0]) return res.status(404).json({ message: 'Event not found' });
+    res.json(rows[0]);
   } catch (err) {
     console.error('Events update error:', err);
     res.status(500).json({ message: err.message || 'Failed to update event' });
@@ -152,8 +139,7 @@ exports.update = async (req, res) => {
 exports.remove = async (req, res) => {
   try {
     const { id } = req.params;
-    const { error } = await supabase.from('events').delete().eq('id', id);
-    if (error) throw error;
+    await pool.query('DELETE FROM events WHERE id = $1', [id]);
     res.status(200).json({ deleted: true });
   } catch (err) {
     console.error('Events delete error:', err);

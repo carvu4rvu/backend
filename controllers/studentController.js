@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const studentDb = require('../db/studentDb');
 const studentProfileController = require('./studentProfileController');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
@@ -103,9 +104,9 @@ exports.getProfile = async (req, res) => {
         { data: summerInternship },
         { data: capstone }
     ] = await Promise.all([
-        supabase.from('student_education_history').select('*').eq('usn', usn),
-        supabase.from('student_education_gaps').select('*').eq('usn', usn),
-        supabase.from('student_semester_academics').select('*').eq('usn', usn).order('semester', { ascending: true }),
+        studentDb.selectByUsn('student_education_history', usn),
+        studentDb.selectByUsn('student_education_gaps', usn),
+        studentDb.selectByUsn('student_semester_academics', usn, { orderBy: 'semester' }),
         (async () => {
             const projRes = await pool.query(
                 'SELECT id, owner_usn as usn, title, short_description as one_line_description, description as full_description, category as genre, visibility, hosted_url as hosted_link, github_url as github_repo, mentor_name, tech_stack as technologies, project_status, priority, updated_at FROM public.projects WHERE owner_usn = $1 ORDER BY priority ASC NULLS LAST, created_at DESC',
@@ -131,17 +132,31 @@ exports.getProfile = async (req, res) => {
             }
             return { data: rows, error: null };
         })(),
-        supabase.from('student_internships').select('*').eq('usn', usn),
-        supabase.from('student_trainings').select('*').eq('usn', usn),
-        supabase.from('student_certifications').select('*').eq('usn', usn),
-        supabase.from('student_publications').select('*').eq('usn', usn),
-        supabase.from('student_extra_curricular_activities').select('*').eq('usn', usn),
-        supabase.from('student_other_experiences').select('*').eq('usn', usn),
-        supabase.from('student_parent_details').select('*').eq('usn', usn),
-        supabase.from('student_profile_details').select('*').eq('usn', usn).single(),
-        supabase.from('student_summer_immersion').select('*').eq('usn', usn),
-        supabase.from('student_summer_internship').select('*').eq('usn', usn),
-        supabase.from('capstone').select('*').eq('usn', usn).single()
+        studentDb.selectByUsn('student_internships', usn),
+        studentDb.selectByUsn('student_trainings', usn),
+        studentDb.selectByUsn('student_certifications', usn),
+        studentDb.selectByUsn('student_publications', usn),
+        studentDb.selectByUsn('student_extra_curricular_activities', usn),
+        studentDb.selectByUsn('student_other_experiences', usn),
+        studentDb.selectByUsn('student_parent_details', usn),
+        (async () => {
+            try {
+                const row = await studentDb.selectOneByUsn('student_profile_details', usn);
+                return { data: row, error: null };
+            } catch (error) {
+                return { data: null, error };
+            }
+        })(),
+        studentDb.selectByUsn('student_summer_immersion', usn),
+        studentDb.selectByUsn('student_summer_internship', usn),
+        (async () => {
+            try {
+                const row = await studentDb.selectOneByUsn('capstone', usn);
+                return { data: row, error: null };
+            } catch (error) {
+                return { data: null, error };
+            }
+        })()
     ]);
 
     // Construct response matching frontend expectations
@@ -256,8 +271,8 @@ exports.getProfileSection = async (req, res) => {
 
         case 'education':
             const [eduRes, gapsRes] = await Promise.all([
-              supabase.from('student_education_history').select('*').eq('usn', usn),
-              supabase.from('student_education_gaps').select('*').eq('usn', usn)
+              studentDb.selectByUsn('student_education_history', usn),
+              studentDb.selectByUsn('student_education_gaps', usn)
             ]);
             if (eduRes.error) {
                 console.log("[Education-Backend] getProfileSection education_history ERROR", { usn, error: eduRes.error.message });
@@ -530,14 +545,24 @@ exports.updateProfileSection = async (req, res) => {
              };
              delete capstoneUpdate.id; 
              
-             const { data: existingCapstone } = await supabase.from('capstone').select('id').eq('usn', usn).single();
+             const existingCapstone = await studentDb.selectOneByUsn('capstone', usn);
              
              if (existingCapstone) {
-                 const { data: uc, error: uce } = await supabase.from('capstone').update(capstoneUpdate).eq('id', existingCapstone.id).select();
+                 const keys = Object.keys(capstoneUpdate);
+                 const setClause = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
+                 const { rows: uc, error: uce } = await pool.query(
+                     `UPDATE capstone SET ${setClause} WHERE id = $1 RETURNING *`,
+                     [existingCapstone.id, ...keys.map((k) => capstoneUpdate[k])]
+                 ).then((r) => ({ rows: r.rows, error: null })).catch((error) => ({ rows: null, error }));
                  if (uce) throw uce;
                  result = uc;
              } else {
-                 const { data: ic, error: ice } = await supabase.from('capstone').insert(capstoneUpdate).select();
+                 const keys = Object.keys(capstoneUpdate);
+                 const placeholders = keys.map((_, i) => `$${i + 1}`);
+                 const { rows: ic, error: ice } = await pool.query(
+                     `INSERT INTO capstone (${keys.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+                     keys.map((k) => capstoneUpdate[k])
+                 ).then((r) => ({ rows: r.rows, error: null })).catch((error) => ({ rows: null, error }));
                  if (ice) throw ice;
                  result = ic;
              }

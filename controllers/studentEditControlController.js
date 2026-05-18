@@ -46,58 +46,91 @@ const ALLOWED_FIELDS = new Set([
 
 /**
  * GET /placement/students/profile-locks
- * Returns all students with their student_edit_control row (if present).
+ * Returns students with their student_edit_control row with pagination and search.
  */
 exports.getProfileLocks = async (req, res) => {
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(
-      `
-        SELECT
-          s.usn,
-          s.full_name,
-          s.college_email,
-          u.is_active AS login_is_active,
-          c.is_basic_info_locked,
-          c.is_contacts_locked,
-          c.is_profile_details_locked,
-          c.is_social_links_locked,
-          c.is_parent_details_locked,
-          c.is_education_history_locked,
-          c.is_education_gaps_locked,
-          c.is_course_academics_locked,
-          c.is_extra_curricular_locked,
-          c.is_projects_locked,
-          c.is_certifications_locked,
-          c.is_internships_locked,
-          c.is_trainings_locked,
-          c.is_other_experiences_locked,
-          c.is_publications_locked,
-          c.is_placements_locked,
-          c.is_sem1_locked,
-          c.is_sem2_locked,
-          c.is_sem3_locked,
-          c.is_sem4_locked,
-          c.is_sem5_locked,
-          c.is_sem6_locked,
-          c.is_sem7_locked,
-          c.is_sem8_locked,
-          c.locked_by,
-          COALESCE(ap.full_name, ul.email_id::text) AS locked_by_name,
-          c.lock_reason
-        FROM public.student_basic_details s
-        LEFT JOIN public.student_edit_control c
-          ON c.usn = s.usn
-        LEFT JOIN public.user_login u
-          ON u.usn = s.usn
-        LEFT JOIN public.user_login ul
-          ON ul.id = c.locked_by
-        LEFT JOIN public.admin_profiles ap
-          ON ap.user_login_id = ul.id
-        ORDER BY s.usn ASC
-      `
-    );
-    return res.json({ rows });
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 25;
+    const offset = (page - 1) * limit;
+    const search = (req.query.search || '').trim().toLowerCase();
+
+    let whereClause = '';
+    const queryParams = [];
+    if (search) {
+      whereClause = `
+        WHERE s.usn ILIKE $1 
+           OR s.full_name ILIKE $1 
+           OR s.college_email ILIKE $1
+      `;
+      queryParams.push(`%${search}%`);
+    }
+
+    const countQuery = `
+      SELECT COUNT(*) 
+      FROM public.student_basic_details s
+      ${whereClause}
+    `;
+    const { rows: countRows } = await client.query(countQuery, queryParams);
+    const total = parseInt(countRows[0].count, 10);
+
+    const dataQuery = `
+      SELECT
+        s.usn,
+        s.full_name,
+        s.college_email,
+        u.is_active AS login_is_active,
+        c.is_basic_info_locked,
+        c.is_contacts_locked,
+        c.is_profile_details_locked,
+        c.is_social_links_locked,
+        c.is_parent_details_locked,
+        c.is_education_history_locked,
+        c.is_education_gaps_locked,
+        c.is_course_academics_locked,
+        c.is_extra_curricular_locked,
+        c.is_projects_locked,
+        c.is_certifications_locked,
+        c.is_internships_locked,
+        c.is_trainings_locked,
+        c.is_other_experiences_locked,
+        c.is_publications_locked,
+        c.is_placements_locked,
+        c.is_sem1_locked,
+        c.is_sem2_locked,
+        c.is_sem3_locked,
+        c.is_sem4_locked,
+        c.is_sem5_locked,
+        c.is_sem6_locked,
+        c.is_sem7_locked,
+        c.is_sem8_locked,
+        c.locked_by,
+        COALESCE(ap.full_name, ul.email_id::text) AS locked_by_name,
+        c.lock_reason
+      FROM public.student_basic_details s
+      LEFT JOIN public.student_edit_control c
+        ON c.usn = s.usn
+      LEFT JOIN public.user_login u
+        ON u.usn = s.usn
+      LEFT JOIN public.user_login ul
+        ON ul.id = c.locked_by
+      LEFT JOIN public.admin_profiles ap
+        ON ap.user_login_id = ul.id
+      ${whereClause}
+      ORDER BY s.usn ASC
+      LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+    `;
+
+    queryParams.push(limit, offset);
+    const { rows } = await client.query(dataQuery, queryParams);
+
+    return res.json({ 
+      rows,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit)
+    });
   } catch (err) {
     return sendCaughtError(res, err, 'Failed to fetch profile locks.');
   } finally {
@@ -312,21 +345,127 @@ exports.getOwnEditControl = async (req, res) => {
 };
 
 /**
- * Guard helper for student-side edits.
- * Used by other controllers to block edits when a semester is locked.
+ * GET /placement/students/profile-locks/batch-count
+ * Returns the count of students matching the batch filters.
  */
-exports.assertSemesterNotLocked = async (client, usn, semester, res) => {
-  const semNum = Number(semester);
-  if (!usn || !semNum || semNum < 1 || semNum > 8) return true;
-  const field = `is_sem${semNum}_locked`;
-  const { rows } = await client.query(
-    `SELECT ${field} AS locked FROM public.student_edit_control WHERE usn = $1`,
-    [String(usn).toUpperCase()]
-  );
-  if (rows?.[0]?.locked === true) {
-    sendLocked(res, `Semester ${semNum} is locked. You have view-only access.`);
-    return false;
+exports.getBatchLockCount = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { school_id, program_id, year_of_joining, major_id, specialization_id, minor_id } = req.query;
+
+    let whereParts = [];
+    const params = [];
+    let idx = 1;
+
+    if (school_id) { whereParts.push(`school_id = $${idx++}`); params.push(school_id); }
+    if (program_id) { whereParts.push(`program_id = $${idx++}`); params.push(program_id); }
+    if (year_of_joining) { whereParts.push(`year_of_joining = $${idx++}`); params.push(year_of_joining); }
+    if (major_id) { whereParts.push(`major_id = $${idx++}`); params.push(major_id); }
+    if (specialization_id) { whereParts.push(`specialization_id = $${idx++}`); params.push(specialization_id); }
+    if (minor_id) { whereParts.push(`minor_id = $${idx++}`); params.push(minor_id); }
+
+    const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const { rows } = await client.query(`SELECT COUNT(*) FROM public.student_basic_details ${whereClause}`, params);
+
+    return res.json({ count: parseInt(rows[0].count, 10) });
+  } catch (err) {
+    return sendCaughtError(res, err, 'Failed to fetch batch count.');
+  } finally {
+    client.release();
   }
-  return true;
+};
+
+/**
+ * POST /placement/students/profile-locks/batch-update
+ * Updates lock flags for a batch of students matching the filters.
+ */
+exports.batchUpdateProfileLocks = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { filters, locks } = req.body;
+    if (!locks || typeof locks !== 'object') return sendValidationError(res, 'No lock fields provided.');
+
+    const { school_id, program_id, year_of_joining, major_id, specialization_id, minor_id } = filters || {};
+
+    let whereParts = [];
+    const whereParams = [];
+    let wIdx = 1;
+
+    if (school_id) { whereParts.push(`school_id = $${wIdx++}`); whereParams.push(school_id); }
+    if (program_id) { whereParts.push(`program_id = $${wIdx++}`); whereParams.push(program_id); }
+    if (year_of_joining) { whereParts.push(`year_of_joining = $${wIdx++}`); whereParams.push(year_of_joining); }
+    if (major_id) { whereParts.push(`major_id = $${wIdx++}`); whereParams.push(major_id); }
+    if (specialization_id) { whereParts.push(`specialization_id = $${wIdx++}`); whereParams.push(specialization_id); }
+    if (minor_id) { whereParts.push(`minor_id = $${wIdx++}`); whereParams.push(minor_id); }
+
+    const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    // 1. Identify target USNs
+    const { rows: targetStudents } = await client.query(
+      `SELECT usn FROM public.student_basic_details ${whereClause}`,
+      whereParams
+    );
+    const usns = targetStudents.map(s => s.usn);
+    if (usns.length === 0) return res.json({ updated: 0 });
+
+    // 2. Ensure control rows exist for all target USNs
+    await client.query(
+      `
+        INSERT INTO public.student_edit_control (usn)
+        SELECT unnest($1::text[])
+        ON CONFLICT (usn) DO NOTHING
+      `,
+      [usns]
+    );
+
+    // 3. Build Update Query
+    const patch = {};
+    let loginActive = null;
+    for (const [k, v] of Object.entries(locks)) {
+      if (!ALLOWED_FIELDS.has(k)) continue;
+      if (k === 'login_is_active') { loginActive = !!v; continue; }
+      if (k === 'lock_reason') { patch[k] = v == null ? null : String(v); }
+      else { patch[k] = !!v; }
+    }
+
+    const setParts = [];
+    const updateParams = [usns];
+    let uIdx = 2;
+
+    for (const [k, v] of Object.entries(patch)) {
+      setParts.push(`${k} = $${uIdx++}`);
+      updateParams.push(v);
+    }
+
+    // Audit
+    const adminId = req.user?.id ?? null;
+    setParts.push(`locked_by = $${uIdx++}`);
+    updateParams.push(adminId);
+
+    await client.query('BEGIN');
+    try {
+      if (setParts.length > 0) {
+        await client.query(
+          `UPDATE public.student_edit_control SET ${setParts.join(', ')} WHERE usn = ANY($1)`,
+          updateParams
+        );
+      }
+      if (loginActive !== null) {
+        await client.query(
+          `UPDATE public.user_login SET is_active = $2 WHERE usn = ANY($1)`,
+          [usns, loginActive]
+        );
+      }
+      await client.query('COMMIT');
+      return res.json({ updated: usns.length });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    }
+  } catch (err) {
+    return sendCaughtError(res, err, 'Failed to batch update profile locks.');
+  } finally {
+    client.release();
+  }
 };
 

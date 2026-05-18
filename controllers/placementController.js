@@ -1,5 +1,9 @@
-const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const placementDb = require('../db/placementDb');
+const catalogDb = require('../db/catalogDb');
+const policiesDb = require('../db/policiesDb');
+const alumniDb = require('../db/alumniDb');
+const studentDb = require('../db/studentDb');
 const logger = require('../utils/logger');
 const { createAndSendToUsns } = require('../utils/notificationHelper');
 
@@ -7,14 +11,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 /** Fetch drive details for notifications: company_name, job_description, last_date_to_registration, event_datetime */
 async function getDriveForNotification(driveId) {
-  const { data, error } = await supabase
-    .from('placements_drives')
-    .select('job_description, last_date_to_registration, event_datetime, company:companies(company_name)')
-    .eq('id', driveId)
-    .maybeSingle();
-  if (error || !data) return null;
+  const data = await placementDb.getDriveForNotification(driveId);
+  if (!data) return null;
   return {
-    company_name: data.company?.company_name || 'Company',
+    company_name: data.company_name || 'Company',
     job_description: data.job_description || '',
     last_date_to_registration: data.last_date_to_registration,
     event_datetime: data.event_datetime,
@@ -63,36 +63,288 @@ function apiMessage(err, fallback = 'Server error') {
   return fallback;
 }
 
-/** Get latest academic metrics per student from student_semester_academics. */
+const PG_ARRAY_CHUNK = 400;
+
+function chunkArray(arr, size = PG_ARRAY_CHUNK) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+/** Single drive + company via PG (avoids Supabase REST timeouts). */
+async function fetchPlacementsDriveByIdPg(id) {
+  const { rows } = await pool.query(
+    `SELECT pd.*, row_to_json(c.*) AS company
+     FROM placements_drives pd
+     LEFT JOIN companies c ON c.id = pd.company_id
+     WHERE pd.id = $1`,
+    [id]
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    ...row,
+    company: row.company && typeof row.company === 'object' ? row.company : null,
+  };
+}
+
+async function fetchSchoolNamePg(schoolId) {
+  if (schoolId == null) return null;
+  const { rows } = await pool.query('SELECT name FROM schools WHERE id = $1', [schoolId]);
+  return rows[0]?.name ?? null;
+}
+
+async function fetchProgramNamePg(programId) {
+  if (programId == null) return null;
+  const { rows } = await pool.query('SELECT name FROM programs WHERE id = $1', [programId]);
+  return rows[0]?.name ?? null;
+}
+
+let academicsTableSource = null;
+
+/** Prefer student_semester_records (current schema); fall back to legacy table or Supabase. */
+async function resolveAcademicsTableSource() {
+  if (academicsTableSource) return academicsTableSource;
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_schema = 'public' AND table_name = 'student_semester_records'
+         ) AS has_records,
+         EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_schema = 'public' AND table_name = 'student_semester_academics'
+         ) AS has_legacy`
+    );
+    const { has_records, has_legacy } = rows[0] || {};
+    if (has_records) academicsTableSource = 'records';
+    else if (has_legacy) academicsTableSource = 'legacy';
+    else academicsTableSource = 'legacy';
+  } catch {
+    academicsTableSource = 'legacy';
+  }
+  return academicsTableSource;
+}
+
+async function fetchEducationHistoryChunk(chunk) {
+  try {
+    const eduRes = await pool.query(
+      `SELECT usn, education_level, result, result_type
+       FROM student_education_history
+       WHERE usn = ANY($1::text[])
+         AND education_level IN ('10TH', '12TH', 'DIPLOMA')`,
+      [chunk]
+    );
+    return eduRes.rows || [];
+  } catch (err) {
+    if (err.code === '42P01') return [];
+    throw err;
+  }
+}
+
+function applyEducationRows(map, educationRows) {
+  educationRows.forEach((row) => {
+    const student = map.get(row.usn) || {
+      latest_sgpa: null,
+      live_backlogs: 0,
+      closed_backlogs: 0,
+      latest_academic_year: null,
+    };
+    if (!map.has(row.usn)) map.set(row.usn, student);
+
+    const resultVal = parseFloat(row.result);
+    if (!Number.isNaN(resultVal)) {
+      if (row.education_level === '10TH') {
+        student.percent_10th = row.result_type === 'CGPA' ? resultVal * 9.5 : resultVal;
+      } else if (row.education_level === '12TH') {
+        student.percent_12th = row.result_type === 'CGPA' ? resultVal * 9.5 : resultVal;
+      } else if (row.education_level === 'DIPLOMA') {
+        student.percent_diploma = row.result_type === 'CGPA' ? resultVal * 9.5 : resultVal;
+      }
+    }
+  });
+}
+
+/** Get latest academic metrics per student (PG pool — avoids Supabase timeouts on large USN lists). */
 async function getStudentAcademicsMap(usns) {
   if (!usns || usns.length === 0) return new Map();
-  const { data: academics, error } = await supabase
-    .from('student_semester_academics')
-    .select('usn, academic_year, semester, result_in_sgpa, live_backlogs, closed_backlogs')
-    .in('usn', usns)
-    .order('academic_year', { ascending: false })
-    .order('semester', { ascending: false });
-  if (error || !academics) return new Map();
   const map = new Map();
-  const seen = new Set();
   const totalByUsn = {};
-  for (const row of academics) {
-    if (!row.usn) continue;
-    if (!seen.has(row.usn)) {
-      seen.add(row.usn);
+  const source = await resolveAcademicsTableSource();
+
+  const useRecords = source === 'records';
+  const tableName = useRecords ? 'student_semester_records' : 'student_semester_academics';
+  const latestSgpaExpr = useRecords ? 'COALESCE(cgpa, sgpa)' : 'result_in_sgpa';
+  const liveBacklogsExpr = useRecords ? 'COALESCE(active_backlogs, 0)' : 'COALESCE(live_backlogs, 0)';
+  const closedBacklogsExpr = useRecords ? 'COALESCE(cleared_backlogs, 0)' : 'COALESCE(closed_backlogs, 0)';
+  const sumClosedExpr = useRecords ? 'cleared_backlogs' : 'closed_backlogs';
+
+  for (const chunk of chunkArray(usns)) {
+    const [acadRes, histRes, eduRows] = await Promise.all([
+      pool.query(
+        `SELECT DISTINCT ON (usn)
+           usn, academic_year, semester,
+           ${latestSgpaExpr} AS latest_sgpa,
+           ${liveBacklogsExpr} AS live_backlogs,
+           ${closedBacklogsExpr} AS closed_backlogs
+         FROM public.${tableName}
+         WHERE usn = ANY($1::text[])
+         ORDER BY usn, academic_year DESC NULLS LAST, semester DESC NULLS LAST`,
+        [chunk]
+      ),
+      pool.query(
+        `SELECT usn, COALESCE(SUM(${sumClosedExpr}), 0)::int AS total_closed
+         FROM public.${tableName}
+         WHERE usn = ANY($1::text[])
+         GROUP BY usn`,
+        [chunk]
+      ),
+      fetchEducationHistoryChunk(chunk),
+    ]);
+
+    (histRes.rows || []).forEach((row) => {
+      totalByUsn[row.usn] = row.total_closed ?? 0;
+    });
+
+    (acadRes.rows || []).forEach((row) => {
+      if (!row.usn) return;
       map.set(row.usn, {
-        latest_sgpa: row.result_in_sgpa != null ? parseFloat(row.result_in_sgpa) : null,
+        latest_sgpa: row.latest_sgpa != null ? parseFloat(row.latest_sgpa) : null,
         live_backlogs: row.live_backlogs != null ? parseInt(row.live_backlogs, 10) : 0,
         closed_backlogs: row.closed_backlogs != null ? parseInt(row.closed_backlogs, 10) : 0,
         latest_academic_year: row.academic_year,
       });
-    }
-    totalByUsn[row.usn] = (totalByUsn[row.usn] || 0) + (row.closed_backlogs != null ? parseInt(row.closed_backlogs, 10) : 0);
+    });
+
+    applyEducationRows(map, eduRows);
   }
+
   for (const [usn, m] of map) {
-    m.total_backlog_history = totalByUsn[usn] || 0;
+    m.total_backlog_history = totalByUsn[usn] ?? m.closed_backlogs ?? 0;
   }
   return map;
+}
+
+/**
+ * Attach offers, CTC, violations, disciplinary, and profile lock for client-side filters.
+ * Uses PG pool with chunked ANY($1) — Supabase .in() fails/truncates with 2000+ USNs.
+ */
+async function attachPlacementStats(list, usns) {
+  if (!list?.length || !usns?.length) return list;
+  const perUsn = {};
+  usns.forEach((u) => {
+    perUsn[u] = {
+      offers_count: 0,
+      max_ctc_lpa: null,
+      has_placement_from_drive: false,
+      placement_violations: 0,
+      disciplinary: 0,
+    };
+  });
+
+  for (const chunk of chunkArray(usns)) {
+    const queries = [
+      pool.query(
+        `SELECT usn, COUNT(*)::int AS cnt FROM student_placement_violations
+         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
+        [chunk]
+      ),
+      pool.query(
+        `SELECT usn, COUNT(*)::int AS cnt FROM student_disciplinary_records
+         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
+        [chunk]
+      ),
+      pool.query(
+        `SELECT student_id, placement_id, capstone_id FROM offers WHERE student_id = ANY($1::text[])`,
+        [chunk]
+      ),
+      pool.query(
+        `SELECT student_id, ctc_min_lpa, ctc_max_lpa FROM placement WHERE student_id = ANY($1::text[])`,
+        [chunk]
+      ),
+    ];
+
+    const [violRes, discRes, offersRes, plcRes] = await Promise.all(queries);
+
+    (violRes.rows || []).forEach((v) => {
+      if (perUsn[v.usn]) perUsn[v.usn].placement_violations = v.cnt;
+    });
+    (discRes.rows || []).forEach((d) => {
+      if (perUsn[d.usn]) perUsn[d.usn].disciplinary = d.cnt;
+    });
+    (offersRes.rows || []).forEach((off) => {
+      const o = perUsn[off.student_id];
+      if (!o) return;
+      o.offers_count += 1;
+      if (off.placement_id) o.has_placement_from_drive = true;
+    });
+    (plcRes.rows || []).forEach((pl) => {
+      const o = perUsn[pl.student_id];
+      if (!o) return;
+      const ctc = pl.ctc_max_lpa != null ? pl.ctc_max_lpa : pl.ctc_min_lpa;
+      if (ctc != null && (o.max_ctc_lpa == null || Number(ctc) > o.max_ctc_lpa)) o.max_ctc_lpa = Number(ctc);
+    });
+  }
+
+  return list.map((s) => {
+    const agg = perUsn[s.usn] || {};
+    const offersCount = agg.offers_count ?? 0;
+    return {
+      ...s,
+      offers_count: offersCount,
+      max_ctc_lpa: agg.max_ctc_lpa != null ? agg.max_ctc_lpa : null,
+      is_placed: offersCount > 0,
+      is_placed_off_campus: offersCount > 0 && !agg.has_placement_from_drive,
+      placement_violations: agg.placement_violations ?? 0,
+      disciplinary: agg.disciplinary ?? 0,
+    };
+  });
+}
+
+/** Attach active placement-violation and disciplinary counts per USN (for process list highlighting). */
+async function attachComplianceFlags(rows) {
+  if (!rows?.length) return rows;
+  const usns = [...new Set(rows.map((r) => r.usn).filter(Boolean))];
+  if (!usns.length) return rows;
+
+  const perUsn = {};
+  usns.forEach((u) => {
+    perUsn[u] = { placement_violations: 0, disciplinary: 0 };
+  });
+
+  for (const chunk of chunkArray(usns)) {
+    const [violRes, discRes] = await Promise.all([
+      pool.query(
+        `SELECT usn, COUNT(*)::int AS cnt FROM student_placement_violations
+         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
+        [chunk]
+      ),
+      pool.query(
+        `SELECT usn, COUNT(*)::int AS cnt FROM student_disciplinary_records
+         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
+        [chunk]
+      ),
+    ]);
+    (violRes.rows || []).forEach((v) => {
+      if (perUsn[v.usn]) perUsn[v.usn].placement_violations = v.cnt;
+    });
+    (discRes.rows || []).forEach((d) => {
+      if (perUsn[d.usn]) perUsn[d.usn].disciplinary = d.cnt;
+    });
+  }
+
+  return rows.map((row) => {
+    const agg = perUsn[row.usn] || { placement_violations: 0, disciplinary: 0 };
+    const placementViolations = agg.placement_violations ?? 0;
+    const disciplinary = agg.disciplinary ?? 0;
+    return {
+      ...row,
+      placement_violations: placementViolations,
+      disciplinary,
+      has_compliance_issue: placementViolations > 0 || disciplinary > 0,
+    };
+  });
 }
 
 /** Evaluate student against eligibility_criteria rules (from placements_drives). */
@@ -132,6 +384,38 @@ function evaluateEligibility(student, eligibility, opts = {}) {
   if (eligibility.allowed_specialization_ids?.length && student.specialization_id != null && !inIntArray(eligibility.allowed_specialization_ids, student.specialization_id)) reasons.push(`Specialization not in allowed list`);
   if (eligibility.joining_years?.length && !inIntArray(eligibility.joining_years, student.year_of_joining)) reasons.push(`Joining year ${student.year_of_joining} not in allowed list`);
   if (eligibility.graduation_years?.length && student.graduation_year != null && !inIntArray(eligibility.graduation_years, student.graduation_year)) reasons.push(`Graduation year not in allowed list`);
+
+  // New filters
+  if (eligibility.allowed_genders?.length) {
+    const genders = (eligibility.allowed_genders || []).map(g => String(g).toLowerCase());
+    if (!genders.includes(String(student.gender || '').toLowerCase())) reasons.push(`Gender ${student.gender || 'Unknown'} not in allowed list`);
+  }
+  if (eligibility.allowed_years?.length && !inIntArray(eligibility.allowed_years, student.current_year)) {
+    reasons.push(`Current year ${student.current_year} not in allowed list`);
+  }
+  if (eligibility.allowed_semesters?.length && !inIntArray(eligibility.allowed_semesters, student.current_semester)) {
+    reasons.push(`Current semester ${student.current_semester} not in allowed list`);
+  }
+  if (eligibility.allowed_sections?.length) {
+    const sections = (eligibility.allowed_sections || []).map(s => String(s).toUpperCase());
+    if (!sections.includes(String(student.section || '').toUpperCase())) reasons.push(`Section ${student.section || 'Unknown'} not in allowed list`);
+  }
+  if (eligibility.min_10th_percent != null && student.percent_10th != null) {
+    const val = parseFloat(student.percent_10th);
+    const min = parseFloat(eligibility.min_10th_percent);
+    if (!isNaN(val) && !isNaN(min) && val < min) reasons.push(`10th % ${val} below min ${min}`);
+  }
+  if (eligibility.min_12th_percent != null && student.percent_12th != null) {
+    const val = parseFloat(student.percent_12th);
+    const min = parseFloat(eligibility.min_12th_percent);
+    if (!isNaN(val) && !isNaN(min) && val < min) reasons.push(`12th % ${val} below min ${min}`);
+  }
+  if (eligibility.min_diploma_percent != null && student.percent_diploma != null) {
+    const val = parseFloat(student.percent_diploma);
+    const min = parseFloat(eligibility.min_diploma_percent);
+    if (!isNaN(val) && !isNaN(min) && val < min) reasons.push(`Diploma % ${val} below min ${min}`);
+  }
+
   const isEligible = reasons.length === 0 || adminOverride;
   return { isEligible, rejectionReasons: reasons };
 }
@@ -145,26 +429,11 @@ exports.applyToDrive = async (req, res) => {
     const driveIdNum = parseInt(driveId, 10);
     if (isNaN(driveIdNum)) return res.status(400).json({ message: 'Invalid drive ID' });
 
-    // Server-side: verify student is opted in to placement (never trust client/cache)
-    const { data: studentRow, error: studentErr } = await supabase
-      .from('student_basic_details')
-      .select(`
-        opt_in, school_id, program_id, major_id, specialization_id,
-        year_of_joining, current_year, current_semester,
-        schools ( id ),
-        programs ( id, max_duration_years )
-      `)
-      .eq('usn', usn)
-      .maybeSingle();
-    if (studentErr || !studentRow) return res.status(403).json({ message: 'Student record not found' });
+    const studentRow = await placementDb.getStudentForApply(usn);
+    if (!studentRow) return res.status(403).json({ message: 'Student record not found' });
     if (studentRow.opt_in !== true) return res.status(403).json({ message: 'You must opt in to placement from your Personal profile before applying to drives' });
 
-    const { data: existing } = await supabase
-      .from('student_placement_process')
-      .select('*')
-      .eq('usn', usn)
-      .eq('placement_drive_id', driveIdNum)
-      .maybeSingle();
+    const existing = await placementDb.getProcessByDriveAndUsn(driveIdNum, usn);
 
     const isSelfRegistration = req.user?.usn && String(req.user.usn).toLowerCase() === String(usn).toLowerCase();
 
@@ -172,15 +441,9 @@ exports.applyToDrive = async (req, res) => {
       if (isSelfRegistration) {
         const currentStatus = String(existing.registration_status || '').toUpperCase();
         if (currentStatus !== 'REGISTERED') {
-          const { data: updated, error: updateErr } = await supabase
-            .from('student_placement_process')
-            .update({ registration_status: 'REGISTERED' })
-            .eq('id', existing.id)
-            .select()
-            .single();
-          if (updateErr) {
-            logger.error('Apply to drive (update status):', apiMessage(updateErr, 'Update failed'));
-            return res.status(400).json({ message: apiMessage(updateErr, 'Update failed') });
+          const updated = await placementDb.updateProcessById(existing.id, { registration_status: 'REGISTERED' });
+          if (!updated) {
+            return res.status(400).json({ message: 'Update failed' });
           }
           return res.status(200).json(updated);
         }
@@ -192,19 +455,13 @@ exports.applyToDrive = async (req, res) => {
     // Self-registration (student applying) = Registered; admin adding students = Pending
     const registrationStatus = isSelfRegistration ? 'REGISTERED' : 'Pending';
 
-    // Check eligibility_criteria on drive when admin adds (or self-registers)
-    const { data: driveRow } = await supabase
-      .from('placements_drives')
-      .select('eligibility_criteria')
-      .eq('id', driveIdNum)
-      .maybeSingle();
-    const eligibility = driveRow?.eligibility_criteria || null;
+    const eligibility = await placementDb.getDriveEligibilityCriteria(driveIdNum);
 
     let isEligible = true;
     if (eligibility) {
       const academicsMap = await getStudentAcademicsMap([usn]);
       const ac = academicsMap.get(usn) || {};
-      const maxYears = studentRow.programs?.max_duration_years ?? 4;
+      const maxYears = studentRow.max_duration_years ?? 4;
       const gradYear = studentRow.year_of_joining != null ? studentRow.year_of_joining + maxYears : null;
       const studentForEval = {
         ...studentRow,
@@ -226,18 +483,15 @@ exports.applyToDrive = async (req, res) => {
       }
     }
 
-    const { data: inserted, error } = await supabase
-      .from('student_placement_process')
-      .insert({
+    let inserted;
+    try {
+      inserted = await placementDb.insertProcess({
         usn,
         placement_drive_id: driveIdNum,
         is_eligible: isEligible,
-        registration_status: registrationStatus
-      })
-      .select()
-      .single();
-
-    if (error) {
+        registration_status: registrationStatus,
+      });
+    } catch (error) {
       logger.error('Apply to drive:', apiMessage(error, 'Apply failed'));
       return res.status(400).json({ message: apiMessage(error, 'Apply failed') });
     }
@@ -276,51 +530,11 @@ exports.getStudentApplications = async (req, res) => {
     if (String(authUsn).toLowerCase() !== String(usn).toLowerCase()) {
       return res.status(403).json({ message: 'You can only view your own applications' });
     }
-    const { data: studentRow, error: studentErr } = await supabase
-      .from('student_basic_details')
-      .select('opt_in')
-      .eq('usn', usn)
-      .maybeSingle();
-    if (studentErr || !studentRow) return res.status(403).json({ message: 'Student record not found' });
+    const studentRow = await placementDb.getStudentOptIn(usn);
+    if (!studentRow) return res.status(403).json({ message: 'Student record not found' });
     if (studentRow.opt_in !== true) return res.status(403).json({ message: 'You must opt in to placement to view applications' });
 
-    // Fetch applications with drive and company details
-    // Assuming tables: placements_drives (id, ...), companies (id, company_name, ...)
-    // And FKs: student_placement_process.placement_drive_id -> placements_drives.id
-    //          placements_drives.company_id -> companies.id
-    
-    const { data, error } = await supabase
-      .from('student_placement_process')
-      .select(`
-        *,
-        drive:placements_drives (
-          *,
-          company:companies (*)
-        )
-      `)
-      .eq('usn', usn)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-        logger.error('Supabase error fetching applications:', apiMessage(error));
-        const { data: simpleData, error: simpleError } = await supabase
-            .from('student_placement_process')
-            .select('*')
-            .eq('usn', usn);
-        if (simpleError) throw simpleError;
-        return res.json(simpleData || []);
-    }
-
-    // Map data to match frontend expectations if necessary
-    // Frontend expects: app.company.company_name, app.drive.job_type
-    // The query structure returns: app.drive.company.company_name
-    
-    const formattedData = data.map(app => ({
-        ...app,
-        company: app.drive?.company || {},
-        drive: app.drive || {}
-    }));
-
+    const formattedData = await placementDb.getStudentApplications(usn);
     res.json(formattedData);
   } catch (error) {
     logger.error('Error fetching student applications:', error);
@@ -339,58 +553,28 @@ exports.getStudentOffers = async (req, res) => {
     if (String(authUsn).toLowerCase() !== String(usn).toLowerCase()) {
       return res.status(403).json({ message: 'You can only view your own offers' });
     }
-    const { data: studentRow, error: studentErr } = await supabase
-      .from('student_basic_details')
-      .select('opt_in')
-      .eq('usn', usn)
-      .maybeSingle();
-    if (studentErr || !studentRow) return res.status(403).json({ message: 'Student record not found' });
+    const studentRow = await placementDb.getStudentOptIn(usn);
+    if (!studentRow) return res.status(403).json({ message: 'Student record not found' });
     if (studentRow.opt_in !== true) return res.status(403).json({ message: 'You must opt in to placement to view job offers' });
 
-    const { data: placements, error } = await supabase
-      .from('placement')
-      .select(`
-        id,
-        student_id,
-        company_id,
-        designation,
-        offer_letter_status,
-        ctc_min_lpa,
-        ctc_max_lpa,
-        type_of_hiring,
-        academic_year,
-        remarks,
-        company:companies(company_name)
-      `)
-      .eq('student_id', usn)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.error('Error fetching student offers:', error);
-      return res.status(500).json({ message: apiMessage(error, 'Server error') });
-    }
-
-    const placementIds = (placements || []).map((p) => p.id).filter(Boolean);
+    const placements = await placementDb.getStudentPlacements(usn);
+    const placementIds = placements.map((p) => p.id).filter(Boolean);
     let offerByPlacementId = {};
     if (placementIds.length > 0) {
-      const { data: offerRows } = await supabase
-        .from('offers')
-        .select('id, placement_id, is_accepted, remarks')
-        .eq('student_id', usn)
-        .in('placement_id', placementIds);
-      (offerRows || []).forEach((o) => {
+      const offerRows = await placementDb.getOffersByStudentAndPlacements(usn, placementIds);
+      offerRows.forEach((o) => {
         if (o.placement_id != null) offerByPlacementId[o.placement_id] = o;
       });
     }
 
-    const list = (placements || []).map((p) => {
+    const list = placements.map((p) => {
       const offer = offerByPlacementId[p.id];
       return {
         id: p.id,
         offer_id: offer?.id ?? null,
         student_id: p.student_id,
         usn: p.student_id,
-        company_name: p.company?.company_name,
+        company_name: p.company_name,
         designation: p.designation,
         offer_letter_status: p.offer_letter_status,
         ctc_min_lpa: p.ctc_min_lpa,
@@ -421,43 +605,29 @@ exports.submitOfferDecision = async (req, res) => {
     if (!authUsn) return res.status(401).json({ message: 'Unauthorized' });
     if (!offer_id) return res.status(400).json({ message: 'Offer ID required' });
 
-    const { data: offerRow, error: offerErr } = await supabase
-      .from('offers')
-      .select('*, placement:placement(*, company:companies(company_name))')
-      .eq('id', offer_id)
-      .single();
-
-    if (offerErr || !offerRow) return res.status(404).json({ message: 'Offer not found' });
+    const offerRow = await placementDb.getOfferWithPlacement(offer_id);
+    if (!offerRow) return res.status(404).json({ message: 'Offer not found' });
     if (String(offerRow.student_id) !== String(authUsn)) return res.status(403).json({ message: 'Not your offer' });
 
     const placementRow = offerRow.placement;
-    const companyName = placementRow?.company?.company_name;
+    const companyName = offerRow.placement_company_name || placementRow?.company_name;
     const isAccepted = is_accepted === true || String(is_accepted) === 'true';
 
-    const { error: updateErr } = await supabase
-        .from('offers')
-        .update({ is_accepted: isAccepted, updated_at: new Date().toISOString() })
-        .eq('id', offer_id);
+    await placementDb.updateOffer(offer_id, { is_accepted: isAccepted });
 
-    if (updateErr) throw updateErr;
-
-    if (isAccepted) {
-      const { data: capstoneRow, error: capErr } = await supabase
-        .from('capstone')
-        .insert({
-          usn: authUsn,
-          company_name: companyName || 'Company',
-          designation: placementRow.designation || null,
-          offer_letter_status: 'Accepted',
-          internship_stipend_min: placementRow.ctc_min_lpa || null,
-          internship_stipend_max: placementRow.ctc_max_lpa || null,
-          academic_year: placementRow.academic_year || null,
-          remarks: placementRow.remarks || null,
-        })
-        .select('id')
-        .single();
-      if (!capErr && capstoneRow) {
-        await supabase.from('offers').update({ capstone_id: capstoneRow.id, updated_at: new Date().toISOString() }).eq('id', offerRow.id);
+    if (isAccepted && placementRow) {
+      const capstoneRow = await placementDb.insertCapstone({
+        usn: authUsn,
+        company_name: companyName || 'Company',
+        designation: placementRow.designation || null,
+        offer_letter_status: 'Accepted',
+        internship_stipend_min: placementRow.ctc_min_lpa || null,
+        internship_stipend_max: placementRow.ctc_max_lpa || null,
+        academic_year: placementRow.academic_year || null,
+        remarks: placementRow.remarks || null,
+      });
+      if (capstoneRow?.id) {
+        await placementDb.updateOffer(offer_id, { capstone_id: capstoneRow.id });
       }
     }
 
@@ -474,41 +644,15 @@ exports.submitOfferDecision = async (req, res) => {
  */
 exports.getAllProcessList = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('student_placement_process')
-      .select(`
-        *,
-        drive:placements_drives (
-          id,
-          job_type,
-          type_of_hiring,
-          event_datetime,
-          placement_status,
-          process_rounds,
-          company:companies (company_name)
-        ),
-        student:student_basic_details (usn, full_name)
-      `)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.error('getAllProcessList:', apiMessage(error));
-      const { data: simpleData, error: simpleError } = await supabase
-        .from('student_placement_process')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (simpleError) throw simpleError;
-      return res.json(simpleData || []);
-    }
-
-    const rows = (data || []).map((row) => ({
+    const data = await placementDb.getAllProcessListRows();
+    const rows = data.map((row) => ({
       ...row,
-      company_name: row.drive?.company?.company_name || '-',
-      drive_id: row.drive?.id,
-      job_type: row.drive?.job_type,
-      event_datetime: row.drive?.event_datetime,
-      placement_status: row.drive?.placement_status,
-      student_name: row.student?.full_name || '-',
+      company_name: row.company_name || '-',
+      drive_id: row.drive_id,
+      job_type: row.job_type,
+      event_datetime: row.event_datetime,
+      placement_status: row.placement_status,
+      student_name: row.student_full_name || '-',
     }));
     res.json(rows);
   } catch (error) {
@@ -518,91 +662,52 @@ exports.getAllProcessList = async (req, res) => {
 };
 
 exports.getAllDrives = async (req, res) => {
+  const routeStart = Date.now();
   try {
     // For students: verify opt-in on every request (never trust client/cache)
     const role = (req.user?.role || '').toString().toLowerCase();
     if (role === 'student' && req.user?.usn) {
-      const { data: studentRow } = await supabase.from('student_basic_details').select('opt_in').eq('usn', req.user.usn).maybeSingle();
+      const studentRow = await placementDb.getStudentOptIn(req.user.usn);
       if (!studentRow || studentRow.opt_in !== true) {
         return res.status(403).json({ message: 'You must opt in to placement from your Personal profile to view drives' });
       }
     }
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select(`
-        *,
-        company:companies (*)
-      `)
-      .order('created_at', { ascending: false });
+    const data = await placementDb.fetchAllDrivesRows();
+    const driveIds = data.map((d) => d.id).filter(Boolean);
+    const [{ counts: registeredCountByDrive }, pairsByDrive] = await Promise.all([
+      placementDb.getRegistrationCountsByDrive(driveIds),
+      placementDb.getSchoolProgramPairsByDriveIds(driveIds),
+    ]);
 
-    if (error) throw error;
-    const driveIds = (data || []).map((d) => d.id).filter(Boolean);
-    let registeredCountByDrive = {};
-    const usnsByDrive = {};
-    if (driveIds.length > 0) {
-      const { data: processRows } = await supabase
-        .from('student_placement_process')
-        .select('placement_drive_id, usn')
-        .in('placement_drive_id', driveIds);
-      (processRows || []).forEach((row) => {
-        const id = row.placement_drive_id;
-        registeredCountByDrive[id] = (registeredCountByDrive[id] || 0) + 1;
-        if (!usnsByDrive[id]) usnsByDrive[id] = new Set();
-        if (row.usn) usnsByDrive[id].add(row.usn);
-      });
-    }
-    // Schools/programs from process table (students registered in each drive)
-    const allUsns = [...new Set(Object.values(usnsByDrive).flatMap((s) => [...s]))];
-    let studentSchoolProgramMap = {};
-    if (allUsns.length > 0) {
-      const { data: studentRows } = await supabase
-        .from('student_basic_details')
-        .select('usn, school_id, program_id')
-        .in('usn', allUsns);
-      studentSchoolProgramMap = (studentRows || []).reduce((acc, s) => {
-        acc[s.usn] = { school_id: s.school_id, program_id: s.program_id };
-        return acc;
-      }, {});
-    }
-
-    // Use eligibility_criteria from each drive (stored in placements_drives) + school/program IDs from process
     const schoolIds = new Set();
     const programIds = new Set();
-    (data || []).forEach((d) => {
+    data.forEach((d) => {
       const elig = d.eligibility_criteria || null;
       if (elig && Array.isArray(elig.allowed_school_ids)) elig.allowed_school_ids.forEach((id) => schoolIds.add(id));
       if (elig && Array.isArray(elig.allowed_program_ids)) elig.allowed_program_ids.forEach((id) => programIds.add(id));
       if (!elig && d.eligibility_academics?.school_id) schoolIds.add(d.eligibility_academics.school_id);
       if (!elig && d.eligibility_academics?.program_id) programIds.add(d.eligibility_academics.program_id);
     });
-    // Add school/program IDs from registered students
-    Object.values(studentSchoolProgramMap).forEach(({ school_id, program_id }) => {
-      if (school_id != null) schoolIds.add(school_id);
-      if (program_id != null) programIds.add(program_id);
-    });
-    let schoolMap = {};
-    let programMap = {};
-    if (schoolIds.size) {
-      const { data: schools } = await supabase.from('schools').select('id, name').in('id', [...schoolIds]);
-      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
-    }
-    if (programIds.size) {
-      const { data: programs } = await supabase.from('programs').select('id, name, school_id').in('id', [...programIds]);
-      programMap = (programs || []).reduce((acc, p) => { acc[p.id] = p; return acc; }, {});
-      (programs || []).forEach((p) => { if (p.school_id) schoolIds.add(p.school_id); });
-    }
-    if (schoolIds.size && Object.keys(schoolMap).length === 0) {
-      const { data: schools } = await supabase.from('schools').select('id, name').in('id', [...schoolIds]);
-      schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
-    } else if (schoolIds.size) {
-      const missing = [...schoolIds].filter((id) => !schoolMap[id]);
-      if (missing.length) {
-        const { data: schools } = await supabase.from('schools').select('id, name').in('id', missing);
-        (schools || []).forEach((s) => { schoolMap[s.id] = s.name; });
-      }
-    }
-    const drives = (data || []).map((d) => {
+
+    const [schools, programs] = await Promise.all([
+      catalogDb.getSchoolsByIds([...schoolIds]),
+      catalogDb.getProgramsByIds([...programIds]),
+    ]);
+    programs.forEach((p) => { if (p.school_id) schoolIds.add(p.school_id); });
+    const extraSchools = await catalogDb.getSchoolsByIds(
+      [...schoolIds].filter((id) => !schools.some((s) => s.id === id))
+    );
+    const schoolMap = [...schools, ...extraSchools].reduce((acc, s) => {
+      acc[s.id] = s.name;
+      return acc;
+    }, {});
+    const programMap = programs.reduce((acc, p) => {
+      acc[p.id] = p;
+      return acc;
+    }, {});
+
+    const drives = data.map((d) => {
       const elig = d.eligibility_criteria || null;
       let sid = elig && Array.isArray(elig.allowed_school_ids) && elig.allowed_school_ids.length > 0
         ? elig.allowed_school_ids[0] : d.eligibility_academics?.school_id;
@@ -611,23 +716,7 @@ exports.getAllDrives = async (req, res) => {
       if (!sid && pid && programMap[pid]?.school_id) sid = programMap[pid].school_id;
       const prog = pid && programMap[pid] ? programMap[pid] : null;
 
-      // School-program pairs from process table; only include when program belongs to that school
-      const driveUsns = usnsByDrive[d.id] ? [...usnsByDrive[d.id]] : [];
-      const pairKeys = new Set();
-      const schoolProgramPairs = [];
-      driveUsns.forEach((usn) => {
-        const sp = studentSchoolProgramMap[usn];
-        if (!sp?.school_id || !sp?.program_id) return;
-        const prog = programMap[sp.program_id];
-        if (!prog || (typeof prog === 'object' && prog.school_id !== sp.school_id)) return;
-        const schoolName = schoolMap[sp.school_id];
-        const programName = typeof prog === 'object' ? prog.name : prog;
-        if (!schoolName || !programName) return;
-        const key = `${schoolName}|${programName}`;
-        if (pairKeys.has(key)) return;
-        pairKeys.add(key);
-        schoolProgramPairs.push({ school: schoolName, program: programName });
-      });
+      const schoolProgramPairs = pairsByDrive[d.id] || [];
       const eligibility_display = schoolProgramPairs.map((p) => `${p.school} - ${p.program}`).join(', ');
 
       return {
@@ -644,6 +733,10 @@ exports.getAllDrives = async (req, res) => {
         eligibility_display: eligibility_display || null,
       };
     });
+    const elapsed = Date.now() - routeStart;
+    if (elapsed >= 500) {
+      logger.info(`[placement] getAllDrives ${elapsed}ms drives=${drives.length}`);
+    }
     res.json(drives);
   } catch (error) {
     logger.error('Error fetching drives:', error);
@@ -665,8 +758,8 @@ function derivePlacementStatus(lastDateToReg, eventDatetime) {
   if (regEnd && !isNaN(regEnd.getTime())) {
     const str = String(lastDateToReg).trim();
     const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str) || (!str.includes('T') && str.length <= 10);
-    const midnight = regEnd.getUTCHours() === 0 && regEnd.getUTCMinutes() === 0 && regEnd.getUTCSeconds() === 0;
-    if (dateOnly || midnight) regEnd.setUTCHours(23, 59, 59, 999);
+    const midnight = regEnd.getHours() === 0 && regEnd.getMinutes() === 0 && regEnd.getSeconds() === 0;
+    if (dateOnly || midnight) regEnd.setHours(23, 59, 59, 999);
   }
   if (!eventStart || isNaN(eventStart.getTime())) return 'Scheduled';
   if (!regEnd || isNaN(regEnd.getTime())) return now < eventStart ? 'Scheduled' : 'Completed';
@@ -682,25 +775,18 @@ function derivePlacementStatus(lastDateToReg, eventDatetime) {
  */
 exports.syncDriveStatuses = async (req, res) => {
   try {
-    const { data: drives, error } = await supabase
-      .from('placements_drives')
-      .select('id, placement_status, last_date_to_registration, event_datetime');
-
-    if (error) throw error;
+    const drives = await placementDb.syncDriveStatusesRows();
     const manualStatuses = ['cancelled', 'postponed'];
     let updated = 0;
-    for (const d of drives || []) {
+    for (const d of drives) {
       const current = String(d.placement_status || '').toLowerCase();
       if (manualStatuses.includes(current)) continue;
       const newStatus = derivePlacementStatus(d.last_date_to_registration, d.event_datetime);
       if (newStatus === (d.placement_status || '')) continue;
-      const { error: updateErr } = await supabase
-        .from('placements_drives')
-        .update({ placement_status: newStatus, updated_at: new Date().toISOString() })
-        .eq('id', d.id);
-      if (!updateErr) updated++;
+      await placementDb.updateDriveStatus(d.id, newStatus);
+      updated++;
     }
-    res.json({ updated, total: (drives || []).length });
+    res.json({ updated, total: drives.length });
   } catch (err) {
     logger.error('syncDriveStatuses:', err);
     res.status(500).json({ message: apiMessage(err, 'Server error') });
@@ -716,32 +802,16 @@ exports.getDriveById = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid drive id' });
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select(`
-        *,
-        company:companies (*)
-      `)
-      .eq('id', id)
-      .single();
+    const data = await fetchPlacementsDriveByIdPg(id);
+    if (!data) return res.status(404).json({ message: 'Drive not found' });
 
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ message: 'Drive not found' });
-      throw error;
-    }
     const elig = data.eligibility_criteria || null;
     const sid = elig?.allowed_school_ids?.[0] ?? data.eligibility_academics?.school_id;
     const pid = elig?.allowed_program_ids?.[0] ?? data.eligibility_academics?.program_id;
-    let school = null;
-    let program = null;
-    if (sid) {
-      const { data: s } = await supabase.from('schools').select('name').eq('id', sid).maybeSingle();
-      school = s?.name ?? null;
-    }
-    if (pid) {
-      const { data: p } = await supabase.from('programs').select('name').eq('id', pid).maybeSingle();
-      program = p?.name ?? null;
-    }
+    const [school, program] = await Promise.all([
+      fetchSchoolNamePg(sid),
+      fetchProgramNamePg(pid),
+    ]);
     const drive = {
       ...data,
       process_rounds: sanitizeProcessRounds(data.process_rounds),
@@ -769,44 +839,69 @@ exports.getDriveRegistrations = async (req, res) => {
     const driveId = parseInt(req.params.driveId, 10);
     if (Number.isNaN(driveId)) return res.status(400).json({ message: 'Invalid drive ID' });
 
-    // Auto-expire: set Pending -> Not Registered when deadline has passed
-    const { data: driveRow } = await supabase
-      .from('placements_drives')
-      .select('last_date_to_registration')
-      .eq('id', driveId)
-      .maybeSingle();
-    const deadline = driveRow?.last_date_to_registration;
-    if (deadline && new Date(deadline) < new Date()) {
-      const updatePayload = { registration_status: 'Not Registered', updated_at: new Date().toISOString() };
-      await supabase.from('student_placement_process').update(updatePayload).eq('placement_drive_id', driveId).eq('registration_status', 'Pending');
-      await supabase.from('student_placement_process').update(updatePayload).eq('placement_drive_id', driveId).is('registration_status', null);
+    if (req.query.usns_only === '1' || req.query.usns_only === 'true') {
+      const { rows } = await pool.query(
+        'SELECT usn FROM student_placement_process WHERE placement_drive_id = $1',
+        [driveId]
+      );
+      return res.json({ usns: (rows || []).map((r) => r.usn).filter(Boolean) });
     }
 
-    const { data, error } = await supabase
-      .from('student_placement_process')
-      .select(`
-        *,
-        drive:placements_drives ( id, job_type, process_rounds, placement_status ),
-        student:student_basic_details ( usn, full_name )
-      `)
-      .eq('placement_drive_id', driveId)
-      .order('created_at', { ascending: false });
+    const { rows: driveMeta } = await pool.query(
+      'SELECT id, job_type, process_rounds, placement_status, last_date_to_registration FROM placements_drives WHERE id = $1',
+      [driveId]
+    );
+    const driveRow = driveMeta[0];
+    if (!driveRow) return res.status(404).json({ message: 'Drive not found' });
 
-    if (error) {
-      logger.error('getDriveRegistrations:', apiMessage(error));
-      const { data: simple, error: simpleErr } = await supabase
-        .from('student_placement_process')
-        .select('*')
-        .eq('placement_drive_id', driveId)
-        .order('created_at', { ascending: false });
-      if (simpleErr) return res.status(400).json({ message: simpleErr.message || 'Failed to fetch registrations' });
-      return res.json(simple || []);
+    const deadlineStr = driveRow.last_date_to_registration;
+    if (deadlineStr) {
+      const deadline = new Date(deadlineStr);
+      const str = String(deadlineStr).trim();
+      const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str) || (!str.includes('T') && str.length <= 10);
+      const midnight = deadline.getHours() === 0 && deadline.getMinutes() === 0 && deadline.getSeconds() === 0;
+      if (dateOnly || midnight) deadline.setHours(23, 59, 59, 999);
+      if (deadline < new Date()) {
+        await pool.query(
+          `UPDATE student_placement_process
+           SET registration_status = 'Not Registered', updated_at = NOW()
+           WHERE placement_drive_id = $1
+             AND (registration_status = 'Pending' OR registration_status IS NULL)`,
+          [driveId]
+        );
+      }
     }
 
-    const rows = (data || []).map((row) => ({
-      ...row,
-      student_name: row.student?.full_name ?? null,
-    }));
+    const { rows: processRows } = await pool.query(
+      `SELECT spp.id, spp.usn, spp.placement_drive_id, spp.registration_status, spp.approved_status,
+              spp.is_eligible, spp.oa_status, spp.gd_status, spp.technical_round_status,
+              spp.interview_status, spp.hr_round_status, spp.final_select_status,
+              spp.malpractice, spp.remarks, spp.attendance, spp.created_at, spp.updated_at,
+              sbd.full_name AS student_full_name
+       FROM student_placement_process spp
+       LEFT JOIN student_basic_details sbd ON sbd.usn = spp.usn
+       WHERE spp.placement_drive_id = $1
+       ORDER BY spp.created_at DESC NULLS LAST`,
+      [driveId]
+    );
+
+    const driveSnippet = {
+      id: driveRow.id,
+      job_type: driveRow.job_type,
+      process_rounds: sanitizeProcessRounds(driveRow.process_rounds),
+      placement_status: driveRow.placement_status,
+    };
+
+    let rows = (processRows || []).map((row) => {
+      const { student_full_name, ...rest } = row;
+      return {
+        ...rest,
+        student_name: student_full_name ?? null,
+        student: student_full_name != null ? { usn: row.usn, full_name: student_full_name } : null,
+        drive: driveSnippet,
+      };
+    });
+    rows = await attachComplianceFlags(rows);
     res.json(rows);
   } catch (err) {
     logger.error('getDriveRegistrations:', err);
@@ -827,16 +922,7 @@ exports.getDriveExportData = async (req, res) => {
     const stage = (req.query.stage || 'approved').toLowerCase();
     const columns = req.query.columns ? String(req.query.columns).split(',').map((c) => c.trim()).filter(Boolean) : null;
 
-    // Fetch process records
-    const { data: processRows, error: procErr } = await supabase
-      .from('student_placement_process')
-      .select('*')
-      .eq('placement_drive_id', driveId)
-      .order('created_at', { ascending: false });
-
-    if (procErr) return res.status(400).json({ message: procErr.message || 'Failed to fetch registrations' });
-
-    let processes = processRows || [];
+    let processes = await placementDb.getExportProcessRows(driveId);
     if (stage === 'approved') {
       processes = processes.filter((p) => String(p.registration_status || '').toLowerCase() === 'registered');
     }
@@ -844,44 +930,23 @@ exports.getDriveExportData = async (req, res) => {
     const usns = [...new Set(processes.map((p) => p.usn).filter(Boolean))];
     if (usns.length === 0) return res.json({ data: [], columns: [] });
 
-    // Fetch student basic details
-    const { data: basics } = await supabase
-      .from('student_basic_details')
-      .select('usn, full_name, college_email, personal_email, phone_country_code, phone_number, year_of_joining, current_year, current_semester, section, gender, school_id, program_id, major_id, specialization_id')
-      .in('usn', usns);
+    const basics = await placementDb.getStudentsBasicByUsns(usns);
+    const basicMap = new Map(basics.map((b) => [b.usn, b]));
 
-    const basicMap = new Map((basics || []).map((b) => [b.usn, b]));
+    const schoolIds = [...new Set(basics.map((b) => b.school_id).filter(Boolean))];
+    const programIds = [...new Set(basics.map((b) => b.program_id).filter(Boolean))];
+    const majorIds = [...new Set(basics.map((b) => b.major_id).filter(Boolean))];
+    const specIds = [...new Set(basics.map((b) => b.specialization_id).filter(Boolean))];
 
-    // Fetch school, program, major, specialization names
-    const schoolIds = [...new Set((basics || []).map((b) => b.school_id).filter(Boolean))];
-    const programIds = [...new Set((basics || []).map((b) => b.program_id).filter(Boolean))];
-    const majorIds = [...new Set((basics || []).map((b) => b.major_id).filter(Boolean))];
-    const specIds = [...new Set((basics || []).map((b) => b.specialization_id).filter(Boolean))];
+    const { schoolMap, programMap, majorMap, specMap } = await catalogDb.getNameMaps({
+      schoolIds,
+      programIds,
+      majorIds,
+      specIds,
+    });
 
-    const [
-      { data: schools },
-      { data: programs },
-      { data: majors },
-      { data: specializations },
-    ] = await Promise.all([
-      schoolIds.length ? supabase.from('schools').select('id, name').in('id', schoolIds) : { data: [] },
-      programIds.length ? supabase.from('programs').select('id, name').in('id', programIds) : { data: [] },
-      majorIds.length ? supabase.from('majors').select('id, name').in('id', majorIds) : { data: [] },
-      specIds.length ? supabase.from('specializations').select('id, name').in('id', specIds) : { data: [] },
-    ]);
-
-    const schoolMap = new Map((schools || []).map((s) => [s.id, s.name]));
-    const programMap = new Map((programs || []).map((p) => [p.id, p.name]));
-    const majorMap = new Map((majors || []).map((m) => [m.id, m.name]));
-    const specMap = new Map((specializations || []).map((s) => [s.id, s.name]));
-
-    // Fetch profile (resume, career)
-    const { data: profiles } = await supabase
-      .from('student_profile_details')
-      .select('usn, resume_file, brief_summary, key_expertise, career_objective')
-      .in('usn', usns);
-
-    const profileMap = new Map((profiles || []).map((p) => [p.usn, p]));
+    const profiles = await placementDb.getProfilesByUsns(usns);
+    const profileMap = new Map(profiles.map((p) => [p.usn, p]));
 
     // Fetch projects (titles) from projects table
     const projRes = await pool.query(
@@ -895,41 +960,27 @@ exports.getDriveExportData = async (req, res) => {
       projectByUsn[p.usn].push(p.title || '');
     });
 
-    // Fetch education (10th, 12th, graduation)
-    const { data: education } = await supabase
-      .from('student_education_history')
-      .select('usn, education_level, institute_name, end_year, result, result_type')
-      .in('usn', usns);
-
+    const education = await placementDb.getEducationHistoryByUsns(usns);
     const eduByUsn = {};
-    (education || []).forEach((e) => {
+    education.forEach((e) => {
       if (!eduByUsn[e.usn]) eduByUsn[e.usn] = [];
       eduByUsn[e.usn].push(`${e.education_level}: ${e.institute_name || ''} (${e.end_year || ''})`);
     });
 
-    // Fetch academics (CGPA, backlogs)
-    const { data: academics } = await supabase
-      .from('student_semester_academics')
-      .select('usn, academic_year, semester, result_in_sgpa, live_backlogs, closed_backlogs')
-      .in('usn', usns)
-      .order('academic_year', { ascending: false })
-      .order('semester', { ascending: false });
-
+    const academics = await placementDb.getAcademicsByUsns(usns);
     const acadByUsn = {};
-    (academics || []).forEach((a) => {
+    const seenAcad = new Set();
+    academics.forEach((a) => {
+      if (seenAcad.has(a.usn)) return;
+      seenAcad.add(a.usn);
       if (!acadByUsn[a.usn]) {
         acadByUsn[a.usn] = { latest_sgpa: a.result_in_sgpa, live_backlogs: a.live_backlogs || 0, closed_backlogs: a.closed_backlogs || 0 };
       }
     });
 
-    // Fetch internships (for experience)
-    const { data: internships } = await supabase
-      .from('student_internships')
-      .select('usn, job_role, organization, duration_months')
-      .in('usn', usns);
-
+    const internships = await placementDb.getInternshipsByUsns(usns);
     const intByUsn = {};
-    (internships || []).forEach((i) => {
+    internships.forEach((i) => {
       if (!intByUsn[i.usn]) intByUsn[i.usn] = [];
       intByUsn[i.usn].push(`${i.job_role || ''} at ${i.organization || ''} (${i.duration_months || 0}mo)`);
     });
@@ -961,7 +1012,7 @@ exports.getDriveExportData = async (req, res) => {
         personal_email: basic.personal_email || null,
         phone_number: phone || null,
         school: basic.school_id ? schoolMap.get(basic.school_id) || null : null,
-        program: basic.program_id ? programMap.get(basic.program_id) || null : null,
+        program: basic.program_id ? (programMap.get(basic.program_id)?.name ?? programMap.get(basic.program_id)) || null : null,
         major: basic.major_id ? majorMap.get(basic.major_id) || null : null,
         specialization: basic.specialization_id ? specMap.get(basic.specialization_id) || null : null,
         year_of_joining: basic.year_of_joining ?? null,
@@ -1016,18 +1067,7 @@ exports.removeFromProcess = async (req, res) => {
       return res.status(400).json({ message: 'Invalid drive ID or USN' });
     }
 
-    const { data: deleted, error } = await supabase
-      .from('student_placement_process')
-      .delete()
-      .eq('placement_drive_id', driveId)
-      .eq('usn', usn)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
-      logger.error('removeFromProcess:', apiMessage(error));
-      return res.status(400).json({ message: apiMessage(error, 'Failed to remove from process') });
-    }
+    const deleted = await placementDb.deleteProcessByDriveAndUsn(driveId, usn);
     if (!deleted) {
       return res.status(404).json({ message: 'Registration not found for this drive and USN' });
     }
@@ -1054,23 +1094,16 @@ exports.updateProcessStatus = async (req, res) => {
       'oa_status', 'gd_status', 'technical_round_status', 'interview_status', 'hr_round_status',
       'final_select_status', 'malpractice', 'remarks'
     ];
-    const payload = { updated_at: new Date().toISOString() };
+    const payload = {};
     allowed.forEach((key) => {
       if (body[key] !== undefined) payload[key] = body[key];
     });
 
-    if (Object.keys(payload).length <= 1) {
+    if (!Object.keys(payload).length) {
       return res.status(400).json({ message: 'No valid fields to update' });
     }
 
-    const { data, error } = await supabase
-      .from('student_placement_process')
-      .update(payload)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) return res.status(400).json({ message: apiMessage(error, 'Update failed') });
+    const data = await placementDb.updateProcessStatusById(id, payload);
     if (!data) return res.status(404).json({ message: 'Process record not found' });
 
     const driveId = data.placement_drive_id;
@@ -1151,13 +1184,10 @@ exports.addPlacementDrive = async (req, res) => {
       company_remarks: body.company_remarks || null,
     };
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .insert(row)
-      .select()
-      .single();
-
-    if (error) {
+    let data;
+    try {
+      data = await placementDb.insertPlacementDrive(row);
+    } catch (error) {
       logger.error('Add placement drive:', apiMessage(error, 'Failed to create drive'));
       const msg = error.code === '23503' ? 'Invalid company reference.' : apiMessage(error, 'Failed to create drive');
       return res.status(400).json({ message: msg });
@@ -1207,19 +1237,14 @@ exports.updatePlacementDrive = async (req, res) => {
       onboarded_date: body.onboarded_date || null,
       tpo: body.tpo || null,
       company_remarks: body.company_remarks || null,
-      updated_at: new Date().toISOString(),
     };
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .update(row)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
+    let data;
+    try {
+      data = await placementDb.updatePlacementDrive(id, row);
+    } catch (error) {
       logger.error('Update placement drive:', apiMessage(error, 'Failed to update drive'));
-      const msg = error.code === 'PGRST116' ? 'Drive not found.' : (error.code === '23503' ? 'Invalid company reference.' : apiMessage(error, 'Failed to update drive'));
+      const msg = error.code === '23503' ? 'Invalid company reference.' : apiMessage(error, 'Failed to update drive');
       return res.status(400).json({ message: msg });
     }
     if (!data) return res.status(404).json({ message: 'Drive not found' });
@@ -1243,20 +1268,7 @@ exports.patchPlacementDrive = async (req, res) => {
     if (!newStatus) {
       return res.status(400).json({ message: 'placement_status is required' });
     }
-    const updates = {
-      placement_status: newStatus,
-      updated_at: new Date().toISOString(),
-    };
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) {
-      logger.error('Patch placement drive:', apiMessage(error, 'Failed to update drive'));
-      return res.status(400).json({ message: error.code === 'PGRST116' ? 'Drive not found.' : apiMessage(error, 'Failed to update drive') });
-    }
+    const data = await placementDb.patchPlacementDrive(id, { placement_status: newStatus });
     if (!data) return res.status(404).json({ message: 'Drive not found' });
     res.json(data);
   } catch (err) {
@@ -1281,23 +1293,11 @@ exports.updatePlacementDriveStatusOnly = async (req, res) => {
     if (!placement_status) {
       return res.status(400).json({ message: 'placement_status is required' });
     }
-    const now = new Date().toISOString();
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .update({ placement_status, updated_at: now })
-      .eq('id', id)
-      .select('id, placement_status, updated_at')
-      .single();
-    if (error) {
-      logger.error('Update placement drive status:', apiMessage(error, 'Failed to update'));
-      return res.status(400).json({
-        message: error.code === 'PGRST116' ? 'Drive not found.' : (error.message || 'Failed to update placement status'),
-      });
-    }
+    const data = await placementDb.patchPlacementDrive(id, { placement_status });
     if (!data) {
       return res.status(404).json({ message: 'Drive not found' });
     }
-    res.json(data);
+    res.json({ id: data.id, placement_status: data.placement_status, updated_at: data.updated_at });
   } catch (err) {
     logger.error('Update placement drive status:', err);
     res.status(500).json({ message: apiMessage(err, 'Server error') });
@@ -1313,14 +1313,11 @@ exports.getDriveEligibility = async (req, res) => {
     const driveId = parseInt(req.params.driveId, 10);
     if (Number.isNaN(driveId)) return res.status(400).json({ message: 'Invalid drive ID' });
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select('eligibility_criteria')
-      .eq('id', driveId)
-      .maybeSingle();
-
-    if (error) throw error;
-    res.json(data?.eligibility_criteria || null);
+    const { rows } = await pool.query(
+      'SELECT eligibility_criteria FROM placements_drives WHERE id = $1',
+      [driveId]
+    );
+    res.json(rows[0]?.eligibility_criteria ?? null);
   } catch (err) {
     logger.error('getDriveEligibility:', err);
     res.status(500).json({ message: apiMessage(err, 'Server error') });
@@ -1367,20 +1364,13 @@ exports.upsertDriveEligibility = async (req, res) => {
       min_new_ctc_lpa: body.min_new_ctc_lpa != null && body.min_new_ctc_lpa !== '' ? parseFloat(body.min_new_ctc_lpa) : null,
       min_ctc_multiplier: body.min_ctc_multiplier != null && body.min_ctc_multiplier !== '' ? parseFloat(body.min_ctc_multiplier) : null,
       count_offcampus_offers: body.count_offcampus_offers !== false,
-      no_disciplinary_action: body.no_disciplinary_action !== false,
-      no_active_placement_violation: body.no_active_placement_violation !== false,
       admin_override_allowed: body.admin_override_allowed === true,
       max_total_offers: body.max_total_offers != null && body.max_total_offers !== '' ? parseInt(body.max_total_offers, 10) : null,
     };
     Object.keys(eligibilityCriteria).forEach((k) => { if (eligibilityCriteria[k] === undefined) delete eligibilityCriteria[k]; });
 
-    const { data: updated, error: updErr } = await supabase
-      .from('placements_drives')
-      .update({ eligibility_criteria: eligibilityCriteria, updated_at: new Date().toISOString() })
-      .eq('id', driveId)
-      .select()
-      .single();
-    if (updErr) throw updErr;
+    const updated = await placementDb.updateDriveEligibilityCriteria(driveId, eligibilityCriteria);
+    if (!updated) return res.status(404).json({ message: 'Drive not found' });
     const result = { ...updated, ...eligibilityCriteria };
 
     // Add all eligible students to this drive's process
@@ -1421,11 +1411,8 @@ exports.upsertDriveEligibility = async (req, res) => {
         return res.json({ ...result, addedToProcess: 0 });
       }
 
-      const { data: existingProcess } = await supabase
-        .from('student_placement_process')
-        .select('usn')
-        .eq('placement_drive_id', driveId);
-      const existingSet = new Set((existingProcess || []).map((r) => r.usn));
+      const existingUsns = await placementDb.getExistingProcessUsns(driveId);
+      const existingSet = new Set(existingUsns);
       const toAdd = eligibleUsns.filter((u) => !existingSet.has(u));
       const processRows = toAdd.map((usn) => ({
         usn,
@@ -1435,11 +1422,10 @@ exports.upsertDriveEligibility = async (req, res) => {
       }));
 
       if (processRows.length > 0) {
-        const BATCH = 200;
-        for (let i = 0; i < processRows.length; i += BATCH) {
-          const chunk = processRows.slice(i, i + BATCH);
-          const { error: procErr } = await supabase.from('student_placement_process').insert(chunk);
-          if (procErr) logger.warn('Eligibility: add to process batch error', procErr.message);
+        try {
+          await placementDb.insertProcessBatch(processRows);
+        } catch (procErr) {
+          logger.warn('Eligibility: add to process batch error', procErr?.message);
         }
         const driveRegistrationLink = `${FRONTEND_URL}/student/placements/drive/${driveId}`;
         getDriveForNotification(driveId).then((driveInfo) => {
@@ -1497,67 +1483,231 @@ exports.getDashboardStats = async (req, res) => {
   }
 };
 
+function parseQueryIntList(str) {
+  if (!str || typeof str !== 'string') return null;
+  const nums = str.split(/[\s,]+/).map((x) => parseInt(x.trim(), 10)).filter((n) => !Number.isNaN(n));
+  return nums.length ? nums : null;
+}
+
+function parseQueryFloat(str) {
+  if (str == null || str === '') return null;
+  const n = parseFloat(str);
+  return Number.isNaN(n) ? null : n;
+}
+
 /**
  * GET /placement/students
  * Returns list of students for "Add Students to Drive" (admin).
- * Query: school_id, school_ids, program_id, program_ids, search, limit, opt_in_only, drive_id (optional - includes academics and eligibility).
+ * Query: school_id, school_ids, program_id, program_ids, search, limit, page, page_size, opt_in_only, drive_id, filters...
+ * Paginated (page + page_size): { students, total, page, pageSize, totalPages }
+ * Legacy (no page): array of students
  */
 exports.getStudentsForPlacement = async (req, res) => {
+  const startTime = Date.now();
   try {
-    const limit = Math.min(20000, Math.max(1, parseInt(req.query.limit, 10) || 10000));
+    const driveId = req.query.drive_id ? parseInt(req.query.drive_id, 10) : null;
+    const driveIdValid = driveId != null && !Number.isNaN(driveId);
+    const pageRaw = parseInt(req.query.page, 10);
+    const page = !Number.isNaN(pageRaw) && pageRaw >= 1 ? pageRaw : 1;
+    const requestedSize = parseInt(req.query.page_size, 10) || parseInt(req.query.limit, 10) || 50;
+    const pageSize = Math.min(100, Math.max(1, requestedSize));
+    const offset = (page - 1) * pageSize;
+
     const search = (req.query.search || '').trim();
     const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
     const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
-    const schoolIds = req.query.school_ids ? req.query.school_ids.split(',').map((x) => parseInt(x, 10)).filter((n) => !Number.isNaN(n)) : null;
-    const programIds = req.query.program_ids ? req.query.program_ids.split(',').map((x) => parseInt(x, 10)).filter((n) => !Number.isNaN(n)) : null;
-    const optedInOnly = req.query.opt_in_only === '1' || req.query.opt_in_only === 'true';
-    const driveId = req.query.drive_id ? parseInt(req.query.drive_id, 10) : null;
-    const includeAcademics = driveId != null && !Number.isNaN(driveId);
+    const schoolIds = parseQueryIntList(req.query.school_ids);
+    const programIds = parseQueryIntList(req.query.program_ids);
+    const specializationIds = parseQueryIntList(req.query.specialization_ids);
+    const majorIds = parseQueryIntList(req.query.major_ids);
+    const joiningYears = parseQueryIntList(req.query.joining_years);
+    const graduationYears = parseQueryIntList(req.query.graduation_years);
+    const minCgpa = parseQueryFloat(req.query.min_cgpa);
+    const maxCgpa = parseQueryFloat(req.query.max_cgpa);
+    const maxActiveBacklogs = req.query.max_backlogs != null && req.query.max_backlogs !== ''
+      ? parseInt(req.query.max_backlogs, 10) : null;
+    const maxBacklogHistory = req.query.max_backlog_history != null && req.query.max_backlog_history !== ''
+      ? parseInt(req.query.max_backlog_history, 10) : null;
 
-    // Using PG pool instead of Supabase client to bypass PostgREST's 1000-row default limit
-    let sql = `
-      SELECT 
-        s.usn, s.full_name, s.college_email, s.personal_email, s.school_id, s.program_id, s.major_id, s.specialization_id,
-        s.year_of_joining, s.current_year, s.current_semester, s.section, s.opt_in, s.is_placement_eligible,
-        sch.name as school_name, sch.abbreviation as school_abbr,
-        prg.name as program_name, prg.min_duration_years, prg.max_duration_years,
-        maj.name as major_name,
-        spc.name as specialization_name
+    const optedInOnly =
+      req.query.opt_in_only === '0' || req.query.opt_in_only === 'false'
+        ? false
+        : req.query.opt_in_only === '1' ||
+          req.query.opt_in_only === 'true' ||
+          driveIdValid;
+    const includeInactive = req.query.include_inactive === '1' || req.query.include_inactive === 'true';
+    const includeAcademics = driveIdValid;
+
+    // Default: exclude students with active violations/disciplinary records (opt out with =0 or include_*=1)
+    const excludePlacementViolations =
+      req.query.include_placement_violations === '1' || req.query.include_placement_violations === 'true'
+        ? false
+        : req.query.exclude_placement_violations !== '0' && req.query.exclude_placement_violations !== 'false';
+    const excludeDisciplinaryRecords =
+      req.query.include_disciplinary_records === '1' || req.query.include_disciplinary_records === 'true'
+        ? false
+        : req.query.exclude_disciplinary_records !== '0' && req.query.exclude_disciplinary_records !== 'false';
+    const excludeAdminHold = req.query.exclude_admin_hold === '1' || req.query.exclude_admin_hold === 'true';
+    const excludeAdminOverrideHold = req.query.exclude_admin_override_hold === '1' || req.query.exclude_admin_override_hold === 'true';
+    const excludeAlreadyAdded = req.query.exclude_already_added === '1' || req.query.exclude_already_added === 'true';
+
+    const values = [];
+    if (driveIdValid) values.push(driveId);
+    const driveIdIdx = driveIdValid ? values.length : null;
+
+    const academicsSource = await resolveAcademicsTableSource();
+    const academicsTable = academicsSource === 'legacy' ? 'student_semester_academics' : 'student_semester_records';
+    const latestSgpaExpr = academicsSource === 'legacy' ? 'result_in_sgpa' : 'COALESCE(cgpa, sgpa)';
+    const liveBacklogsExpr = academicsSource === 'legacy' ? 'COALESCE(live_backlogs, 0)' : 'COALESCE(active_backlogs, 0)';
+    const closedBacklogsExpr = academicsSource === 'legacy' ? 'closed_backlogs' : 'cleared_backlogs';
+    const needsAcademicsLateral =
+      includeAcademics
+      || minCgpa != null
+      || maxCgpa != null
+      || (maxActiveBacklogs != null && !Number.isNaN(maxActiveBacklogs))
+      || (maxBacklogHistory != null && !Number.isNaN(maxBacklogHistory));
+
+    let academicsJoinSql = '';
+    if (needsAcademicsLateral) {
+      academicsJoinSql = `
+      LEFT JOIN LATERAL (
+        SELECT (${latestSgpaExpr})::float AS latest_sgpa,
+               (${liveBacklogsExpr})::int AS live_backlogs,
+               (${closedBacklogsExpr})::int AS closed_backlogs
+        FROM public.${academicsTable} r
+        WHERE r.usn = s.usn
+        ORDER BY r.academic_year DESC NULLS LAST, r.semester DESC NULLS LAST
+        LIMIT 1
+      ) ac ON true`;
+    }
+
+    const fromClause = `
       FROM student_basic_details s
       LEFT JOIN schools sch ON s.school_id = sch.id
       LEFT JOIN programs prg ON s.program_id = prg.id
       LEFT JOIN majors maj ON s.major_id = maj.id
       LEFT JOIN specializations spc ON s.specialization_id = spc.id
-      WHERE 1=1
-    `;
-    const values = [];
+      LEFT JOIN student_edit_control sec ON s.usn = sec.usn${academicsJoinSql}`;
 
-    if (optedInOnly) {
-      sql += ` AND s.opt_in = true`;
+    const inactiveJoinSql = !includeInactive
+      ? ' INNER JOIN user_login ul ON ul.usn = s.usn AND ul.is_active = true'
+      : '';
+
+    const whereParts = ['TRUE'];
+    if (driveIdValid) {
+      whereParts.push(`($${driveIdIdx} = $${driveIdIdx})`);
     }
-    if (schoolIds && schoolIds.length > 0) {
-      sql += ` AND s.school_id = ANY($${values.length + 1})`;
+    if (optedInOnly) whereParts.push('s.opt_in = true');
+    if (excludeAlreadyAdded && driveIdValid) {
+      whereParts.push(`NOT EXISTS (SELECT 1 FROM student_placement_process spp WHERE spp.usn = s.usn AND spp.placement_drive_id = $${driveIdIdx})`);
+    }
+    if (schoolIds?.length) {
+      whereParts.push(`s.school_id = ANY($${values.length + 1})`);
       values.push(schoolIds);
     } else if (schoolId != null) {
-      sql += ` AND s.school_id = $${values.length + 1}`;
+      whereParts.push(`s.school_id = $${values.length + 1}`);
       values.push(schoolId);
     }
-    if (programIds && programIds.length > 0) {
-      sql += ` AND s.program_id = ANY($${values.length + 1})`;
+    if (programIds?.length) {
+      whereParts.push(`s.program_id = ANY($${values.length + 1})`);
       values.push(programIds);
     } else if (programId != null) {
-      sql += ` AND s.program_id = $${values.length + 1}`;
+      whereParts.push(`s.program_id = $${values.length + 1}`);
       values.push(programId);
     }
     if (search) {
-      sql += ` AND (s.usn ILIKE $${values.length + 1} OR s.full_name ILIKE $${values.length + 1} OR s.college_email ILIKE $${values.length + 1} OR s.personal_email ILIKE $${values.length + 1})`;
+      whereParts.push(`(s.usn ILIKE $${values.length + 1} OR s.full_name ILIKE $${values.length + 1} OR s.college_email ILIKE $${values.length + 1} OR s.personal_email ILIKE $${values.length + 1})`);
       values.push(`%${search}%`);
     }
+    if (specializationIds?.length) {
+      whereParts.push(`s.specialization_id = ANY($${values.length + 1})`);
+      values.push(specializationIds);
+    }
+    if (majorIds?.length) {
+      whereParts.push(`s.major_id = ANY($${values.length + 1})`);
+      values.push(majorIds);
+    }
+    if (joiningYears?.length) {
+      whereParts.push(`s.year_of_joining = ANY($${values.length + 1})`);
+      values.push(joiningYears);
+    }
+    if (graduationYears?.length) {
+      whereParts.push(`(s.year_of_joining + COALESCE(prg.max_duration_years, 4)) = ANY($${values.length + 1})`);
+      values.push(graduationYears);
+    }
+    if (minCgpa != null) {
+      if (needsAcademicsLateral) {
+        whereParts.push(`ac.latest_sgpa IS NOT NULL AND ac.latest_sgpa >= $${values.length + 1}`);
+      } else {
+        whereParts.push(`EXISTS (SELECT 1 FROM public.${academicsTable} r WHERE r.usn = s.usn AND (${latestSgpaExpr})::float >= $${values.length + 1})`);
+      }
+      values.push(minCgpa);
+    }
+    if (maxCgpa != null) {
+      if (needsAcademicsLateral) {
+        whereParts.push(`ac.latest_sgpa IS NOT NULL AND ac.latest_sgpa <= $${values.length + 1}`);
+      } else {
+        whereParts.push(`EXISTS (SELECT 1 FROM public.${academicsTable} r WHERE r.usn = s.usn AND (${latestSgpaExpr})::float <= $${values.length + 1})`);
+      }
+      values.push(maxCgpa);
+    }
+    if (maxActiveBacklogs != null && !Number.isNaN(maxActiveBacklogs)) {
+      if (needsAcademicsLateral) {
+        whereParts.push(`COALESCE(ac.live_backlogs, 0) <= $${values.length + 1}`);
+      } else {
+        whereParts.push(`EXISTS (SELECT 1 FROM public.${academicsTable} r WHERE r.usn = s.usn AND (${liveBacklogsExpr}) <= $${values.length + 1})`);
+      }
+      values.push(maxActiveBacklogs);
+    }
+    if (maxBacklogHistory != null && !Number.isNaN(maxBacklogHistory)) {
+      whereParts.push(`(SELECT COALESCE(SUM(${closedBacklogsExpr}), 0)::int FROM public.${academicsTable} r WHERE r.usn = s.usn) <= $${values.length + 1}`);
+      values.push(maxBacklogHistory);
+    }
+    if (excludeAdminHold && driveIdValid) {
+      whereParts.push(`NOT EXISTS (SELECT 1 FROM eligibility_decision_logs edl WHERE edl.usn = s.usn AND edl.placement_drive_id = $${driveIdIdx} AND edl.is_eligible = false)`);
+    }
+    if (excludePlacementViolations) {
+      whereParts.push('NOT EXISTS (SELECT 1 FROM student_placement_violations spv WHERE spv.usn = s.usn AND spv.is_active = true)');
+    }
+    if (excludeDisciplinaryRecords) {
+      whereParts.push('NOT EXISTS (SELECT 1 FROM student_disciplinary_records sdr WHERE sdr.usn = s.usn AND sdr.is_active = true)');
+    }
+    if (excludeAdminOverrideHold) {
+      whereParts.push('COALESCE(sec.is_placements_locked, false) = false');
+      if (driveIdValid) {
+        whereParts.push(`NOT EXISTS (SELECT 1 FROM eligibility_decision_logs edl WHERE edl.usn = s.usn AND edl.placement_drive_id = $${driveIdIdx})`);
+      }
+    }
 
-    sql += ` ORDER BY s.usn ASC LIMIT $${values.length + 1}`;
-    values.push(limit);
+    const whereClause = `WHERE ${whereParts.join(' AND ')}`;
+    const countSql = `SELECT COUNT(*)::int AS total ${fromClause}${inactiveJoinSql} ${whereClause}`;
+    const countStart = Date.now();
+    const { rows: countRows } = await pool.query(countSql, values);
+    const total = countRows[0]?.total ?? 0;
+    console.log(`[getStudentsForPlacement] Count finished. total=${total}, time=${Date.now() - countStart}ms`);
 
-    const { rows } = await pool.query(sql, values);
+    const inProcessCol = driveIdValid
+      ? `, EXISTS(SELECT 1 FROM student_placement_process spp WHERE spp.usn = s.usn AND spp.placement_drive_id = $${driveIdIdx}) AS is_in_process`
+      : '';
+    const acadSelectCols = needsAcademicsLateral
+      ? ', ac.latest_sgpa, ac.live_backlogs, ac.closed_backlogs'
+      : '';
+    const selectCols = `s.usn, s.full_name, s.college_email, s.personal_email, s.school_id, s.program_id, s.major_id, s.specialization_id,
+        s.year_of_joining, s.current_year, s.current_semester, s.section, s.gender, s.opt_in, s.is_placement_eligible,
+        sch.name AS school_name,
+        prg.name AS program_name, prg.max_duration_years,
+        maj.name AS major_name,
+        spc.name AS specialization_name,
+        COALESCE(sec.is_placements_locked, false) AS admin_hold${inProcessCol}${acadSelectCols}`;
+
+    let sql = `SELECT ${selectCols} ${fromClause}${inactiveJoinSql} ${whereClause}`;
+    const queryValues = [...values];
+    sql += ` ORDER BY s.usn ASC LIMIT $${queryValues.length + 1} OFFSET $${queryValues.length + 2}`;
+    queryValues.push(pageSize, offset);
+
+    const fetchStart = Date.now();
+    const { rows } = await pool.query(sql, queryValues);
+    console.log(`[getStudentsForPlacement] Fetch finished. rows=${rows.length}, time=${Date.now() - fetchStart}ms`);
 
     let list = rows.map((s) => {
       const maxYears = s.max_duration_years ?? 4;
@@ -1582,33 +1732,45 @@ exports.getStudentsForPlacement = async (req, res) => {
         current_year: s.current_year,
         current_semester: s.current_semester,
         section: s.section,
+        gender: s.gender,
         opt_in: s.opt_in,
-        is_placement_eligible: s.is_placement_eligible
+        is_placement_eligible: s.is_placement_eligible,
+        admin_hold: s.admin_hold,
+        is_in_process: s.is_in_process ?? false
       };
     });
 
     if (includeAcademics && list.length > 0) {
       const usns = list.map((s) => s.usn).filter(Boolean);
-      const academicsMap = await getStudentAcademicsMap(usns);
-      list = list.map((s) => {
-        const ac = academicsMap.get(s.usn) || {};
-        return {
+      if (!needsAcademicsLateral) {
+        const academicsMap = await getStudentAcademicsMap(usns);
+        list = list.map((s) => {
+          const ac = academicsMap.get(s.usn) || {};
+          return {
+            ...s,
+            latest_sgpa: ac.latest_sgpa ?? null,
+            live_backlogs: ac.live_backlogs ?? 0,
+            closed_backlogs: ac.closed_backlogs ?? 0,
+            total_backlog_history: ac.total_backlog_history ?? 0,
+          };
+        });
+      } else {
+        list = list.map((s) => ({
           ...s,
-          latest_sgpa: ac.latest_sgpa ?? null,
-          live_backlogs: ac.live_backlogs ?? 0,
-          closed_backlogs: ac.closed_backlogs ?? 0,
-          total_backlog_history: ac.total_backlog_history ?? 0,
-          latest_academic_year: ac.latest_academic_year ?? null,
-        };
-      });
+          latest_sgpa: s.latest_sgpa != null ? parseFloat(s.latest_sgpa) : null,
+          live_backlogs: s.live_backlogs != null ? parseInt(s.live_backlogs, 10) : 0,
+          closed_backlogs: s.closed_backlogs != null ? parseInt(s.closed_backlogs, 10) : 0,
+          total_backlog_history: s.closed_backlogs != null ? parseInt(s.closed_backlogs, 10) : 0,
+        }));
+      }
 
       if (driveId) {
-        const { data: driveRow } = await supabase
-          .from('placements_drives')
-          .select('eligibility_criteria')
-          .eq('id', driveId)
-          .maybeSingle();
-        const elig = driveRow?.eligibility_criteria || null;
+        const { rows: eligRows } = await pool.query(
+          'SELECT eligibility_criteria FROM placements_drives WHERE id = $1',
+          [driveId]
+        );
+        const elig = eligRows[0]?.eligibility_criteria || null;
+        // Annotate eligibility for display only — never remove rows from the response
         if (elig) {
           list = list.map((s) => {
             const { isEligible, rejectionReasons } = evaluateEligibility(s, elig);
@@ -1616,83 +1778,49 @@ exports.getStudentsForPlacement = async (req, res) => {
           });
         }
 
-        // Fetch placement-related data: offers, placement CTC, violations, disciplinary
-        const usnSet = new Set(usns);
-        const [
-          { data: offersRows },
-          { data: placementRows },
-          { data: capstoneRows },
-          { data: violationRows },
-          { data: disciplinaryRows },
-        ] = await Promise.all([
-          supabase.from('offers').select('student_id, placement_id, capstone_id, job_type, is_accepted').in('student_id', usns),
-          supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa').in('student_id', usns),
-          supabase.from('capstone').select('usn, internship_stipend_min, internship_stipend_max').in('usn', usns),
-          supabase.from('student_placement_violations').select('usn').in('usn', usns).eq('is_active', true),
-          supabase.from('student_disciplinary_records').select('usn').in('usn', usns).eq('is_active', true),
-        ]);
+        // Apply manual overrides from eligibility_decision_logs
+        try {
+          const logMap = new Map();
+          for (const chunk of chunkArray(usns)) {
+            const { rows: logRows } = await pool.query(
+              `SELECT usn, is_eligible, rejection_reasons
+               FROM eligibility_decision_logs
+               WHERE placement_drive_id = $1 AND usn = ANY($2::text[])`,
+              [driveId, chunk]
+            );
+            (logRows || []).forEach((row) => logMap.set(row.usn, row));
+          }
 
-        const perUsn = {};
-        usns.forEach((u) => {
-          perUsn[u] = {
-            offers_count: 0,
-            max_ctc_lpa: null,
-            has_placement_from_drive: false,
-            has_capstone_only: false,
-            placement_violations: 0,
-            disciplinary: 0,
-            admin_hold: false,
-          };
-        });
-
-        (violationRows || []).forEach((v) => { if (perUsn[v.usn]) perUsn[v.usn].placement_violations += 1; });
-        (disciplinaryRows || []).forEach((d) => { if (perUsn[d.usn]) perUsn[d.usn].disciplinary += 1; });
-
-        const placementByStudent = {};
-        (placementRows || []).forEach((pl) => {
-          if (!placementByStudent[pl.student_id]) placementByStudent[pl.student_id] = [];
-          placementByStudent[pl.student_id].push(pl);
-        });
-        const capstoneByStudent = {};
-        (capstoneRows || []).forEach((c) => {
-          if (!capstoneByStudent[c.usn]) capstoneByStudent[c.usn] = [];
-          capstoneByStudent[c.usn].push(c);
-        });
-
-        (offersRows || []).forEach((off) => {
-          if (!perUsn[off.student_id]) return;
-          const o = perUsn[off.student_id];
-          o.offers_count += 1;
-          if (off.placement_id) o.has_placement_from_drive = true;
-          if (off.capstone_id && !off.placement_id) o.has_capstone_only = true;
-        });
-
-        Object.keys(placementByStudent).forEach((sid) => {
-          const o = perUsn[sid];
-          if (!o) return;
-          placementByStudent[sid].forEach((pl) => {
-            const ctc = pl.ctc_max_lpa != null ? pl.ctc_max_lpa : pl.ctc_min_lpa;
-            if (ctc != null && (o.max_ctc_lpa == null || ctc > o.max_ctc_lpa)) o.max_ctc_lpa = Number(ctc);
+          list = list.map((s) => {
+            const log = logMap.get(s.usn);
+            // Result: YES if (locked in student_edit_control) OR (exists in eligibility_decision_logs)
+            const hasManualLog = !!log;
+            if (hasManualLog) {
+              return {
+                ...s,
+                is_eligible: log.is_eligible,
+                rejection_reasons: log.is_eligible ? [] : (log.rejection_reasons || ['Manual admin override']),
+                is_manual_override: true,
+                admin_hold: true 
+              };
+            }
+            return s;
           });
-        });
+        } catch (logErr) {
+          logger.warn('getStudentsForPlacement: eligibility_decision_logs', logErr.message);
+        }
 
-        list = list.map((s) => {
-          const agg = perUsn[s.usn] || {};
-          return {
-            ...s,
-            offers_count: agg.offers_count ?? 0,
-            max_ctc_lpa: agg.max_ctc_lpa != null ? agg.max_ctc_lpa : null,
-            is_placed: (agg.offers_count ?? 0) > 0,
-            is_placed_off_campus: (agg.offers_count ?? 0) > 0 && !agg.has_placement_from_drive,
-            placement_violations: agg.placement_violations ?? 0,
-            disciplinary: agg.disciplinary ?? 0,
-            admin_hold: agg.admin_hold ?? false,
-          };
-        });
+        list = await attachPlacementStats(list, usns);
       }
     }
 
-    res.json(list);
+    return res.json({
+      students: list,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    });
   } catch (err) {
     logger.error('getStudentsForPlacement:', err);
     res.status(500).json({ message: 'Server error fetching students' });
@@ -1708,41 +1836,39 @@ exports.getStudentsForPlacement = async (req, res) => {
  */
 exports.getStudentsOverviewTable = async (req, res) => {
   try {
-    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 2000));
+    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const offset = (page - 1) * limit;
     const search = (req.query.search || '').trim();
     const schoolParam = (req.query.school || '').trim();
     const programParam = (req.query.program || '').trim();
 
-    const { data: schoolsList } = await supabase.from('schools').select('id, name').order('name', { ascending: true });
+    const schoolsList = await catalogDb.getAllSchools();
 
-    let query = supabase
-      .from('student_basic_details')
-      .select('usn, full_name, college_email, school_id, program_id, schools(name), programs(name)')
-      .eq('opt_in', true);
-
+    let schoolIds = null;
+    let programIds = null;
     if (schoolParam) {
       const schoolNames = schoolParam.split(',').map((s) => s.trim()).filter(Boolean);
       if (schoolNames.length > 0) {
-        const { data: schoolRows } = await supabase.from('schools').select('id').in('name', schoolNames);
-        const schoolIds = (schoolRows || []).map((r) => r.id).filter(Boolean);
-        if (schoolIds.length > 0) query = query.in('school_id', schoolIds);
+        const schoolRows = await catalogDb.getSchoolsByNames(schoolNames);
+        schoolIds = schoolRows.map((r) => r.id).filter(Boolean);
       }
     }
     if (programParam) {
       const programNames = programParam.split(',').map((p) => p.trim()).filter(Boolean);
       if (programNames.length > 0) {
-        const { data: programRows } = await supabase.from('programs').select('id').in('name', programNames);
-        const programIds = (programRows || []).map((r) => r.id).filter(Boolean);
-        if (programIds.length > 0) query = query.in('program_id', programIds);
+        const programRows = await catalogDb.getProgramsByNames(programNames);
+        programIds = programRows.map((r) => r.id).filter(Boolean);
       }
     }
 
-    const { data: students, error: studentsErr } = await query
-      .order('usn', { ascending: true })
-      .limit(limit);
-
-    if (studentsErr) throw studentsErr;
-    const studentList = students || [];
+    const { students: studentList, total: totalCount } = await placementDb.fetchOverviewStudentsPage({
+      limit,
+      offset,
+      search: search || null,
+      schoolIds: schoolIds?.length ? schoolIds : null,
+      programIds: programIds?.length ? programIds : null,
+    });
 
     const roundColumns = [
       { id: 'oa_passed', label: 'OA passed' },
@@ -1754,34 +1880,34 @@ exports.getStudentsOverviewTable = async (req, res) => {
     ];
 
     if (studentList.length === 0) {
-      return res.json({ rows: [], roundColumns, schoolsList: schoolsList || [] });
+      return res.json({
+        rows: [],
+        roundColumns,
+        schoolsList: schoolsList || [],
+        total: totalCount ?? 0,
+        page,
+        limit,
+      });
     }
 
     const usns = studentList.map((s) => s.usn).filter(Boolean);
     const usnSet = new Set(usns);
 
-    const [
-      { data: processRows },
-      { data: offersRows },
-      { data: placementRows },
-      { data: capstoneRows },
-      { data: violationRows },
-      { data: disciplinaryRows },
-    ] = await Promise.all([
-      supabase.from('student_placement_process').select('usn, placement_drive_id, is_eligible, registration_status, oa_status, gd_status, technical_round_status, interview_status, hr_round_status, final_select_status, attendance, malpractice').in('usn', usns),
-      supabase.from('offers').select('student_id, placement_id, capstone_id, job_type, is_accepted').in('student_id', usns),
-      supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa').in('student_id', usns),
-      supabase.from('capstone').select('usn, internship_stipend_min, internship_stipend_max').in('usn', usns),
-      supabase.from('student_placement_violations').select('usn').in('usn', usns).eq('is_active', true),
-      supabase.from('student_disciplinary_records').select('usn').in('usn', usns).eq('is_active', true),
-    ]);
-
-    const processList = processRows || [];
-    const offersList = offersRows || [];
-    const placementList = placementRows || [];
-    const capstoneList = capstoneRows || [];
-    const violationList = violationRows || [];
-    const disciplinaryList = disciplinaryRows || [];
+    const {
+      processes: processList,
+      offers: offersList,
+      placements: placementList,
+      capstones: capstoneList,
+      violations,
+      disciplinary,
+      editLocks,
+    } = await placementDb.getOverviewStatsForUsns(usns);
+    const violationList = [...violations].map((usn) => ({ usn }));
+    const disciplinaryList = [...disciplinary].map((usn) => ({ usn }));
+    const lockList = [...editLocks.entries()].map(([usn, is_placements_locked]) => ({
+      usn,
+      is_placements_locked,
+    }));
 
     const perUsn = {};
     usns.forEach((u) => {
@@ -1798,6 +1924,7 @@ exports.getStudentsOverviewTable = async (req, res) => {
         malpractice_count: 0,
         placement_violations: 0,
         disciplinary: 0,
+        admin_hold: false,
         offers_count: 0,
         internship_offers: 0,
         offer_accepted: false,
@@ -1826,6 +1953,9 @@ exports.getStudentsOverviewTable = async (req, res) => {
     });
     disciplinaryList.forEach((d) => {
       if (perUsn[d.usn]) perUsn[d.usn].disciplinary += 1;
+    });
+    lockList.forEach((l) => {
+      if (perUsn[l.usn]) perUsn[l.usn].admin_hold = l.is_placements_locked === true;
     });
 
     const placementByStudent = {};
@@ -1866,15 +1996,14 @@ exports.getStudentsOverviewTable = async (req, res) => {
     });
 
     const rows = studentList
-      .filter((s) => !search || [s.usn, s.full_name, s.college_email].some((v) => (v || '').toLowerCase().includes(search.toLowerCase())))
       .map((s) => {
         const agg = perUsn[s.usn] || {};
         return {
           usn: s.usn,
           full_name: s.full_name,
           college_email: s.college_email,
-          school: (s.schools && s.schools.name) ? s.schools.name : null,
-          program: (s.programs && s.programs.name) ? s.programs.name : null,
+          school: s.school_name || null,
+          program: s.program_name || null,
           drives_eligible: agg.drives_eligible ?? 0,
           drives_applied: agg.drives_applied ?? 0,
           oas_passed: agg.oas_passed ?? 0,
@@ -1891,12 +2020,19 @@ exports.getStudentsOverviewTable = async (req, res) => {
           drives_absent: agg.drives_absent ?? 0,
           placement_violations: agg.placement_violations ?? 0,
           disciplinary: agg.disciplinary ?? 0,
-          admin_hold: false,
+          admin_hold: agg.admin_hold === true,
           malpractice: agg.malpractice_count ?? 0,
         };
       });
 
-    res.json({ rows, roundColumns, schoolsList: schoolsList || [] });
+    res.json({ 
+      rows, 
+      roundColumns, 
+      schoolsList: schoolsList || [],
+      total: totalCount || 0,
+      page,
+      limit
+    });
   } catch (err) {
     logger.error('getStudentsOverviewTable:', err);
     res.status(500).json({ message: 'Server error fetching students overview table' });
@@ -1915,100 +2051,11 @@ exports.getAllCompanies = async (req, res) => {
     const schoolIdParam = req.query.school_id;
     const schoolId = schoolIdParam ? parseInt(schoolIdParam, 10) : null;
     const filterBySchool = schoolId != null && !Number.isNaN(schoolId);
-
-    // Build company_id -> school_ids via: process -> drive -> company, process.usn -> student.school_id
-    const { data: processRows } = await supabase
-      .from('student_placement_process')
-      .select('placement_drive_id, usn');
-    const processList = processRows || [];
-    const driveIds = [...new Set(processList.map((p) => p.placement_drive_id).filter(Boolean))];
-
-    let companySchoolMap = {}; // company_id -> Set(school_id)
-    if (driveIds.length > 0) {
-      const { data: drives } = await supabase
-        .from('placements_drives')
-        .select('id, company_id')
-        .in('id', driveIds);
-      const driveToCompany = (drives || []).reduce((acc, d) => {
-        if (d.company_id != null) acc[d.id] = d.company_id;
-        return acc;
-      }, {});
-
-      const usns = [...new Set(processList.map((p) => p.usn).filter(Boolean))];
-      let studentSchoolMap = {};
-      if (usns.length > 0) {
-        const { data: students } = await supabase
-          .from('student_basic_details')
-          .select('usn, school_id')
-          .in('usn', usns);
-        studentSchoolMap = (students || []).reduce((acc, s) => {
-          if (s.school_id != null) acc[s.usn] = s.school_id;
-          return acc;
-        }, {});
-      }
-
-      processList.forEach((p) => {
-        const companyId = driveToCompany[p.placement_drive_id];
-        const schoolIdFromStudent = studentSchoolMap[p.usn];
-        if (companyId != null && schoolIdFromStudent != null) {
-          if (!companySchoolMap[companyId]) companySchoolMap[companyId] = new Set();
-          companySchoolMap[companyId].add(schoolIdFromStudent);
-        }
-      });
-    }
-
-    // Build schoolsList: schools that have at least one company (via drives/process)
-    const allSchoolIds = new Set();
-    Object.values(companySchoolMap).forEach((sids) => sids.forEach((sid) => allSchoolIds.add(sid)));
-    let schoolsList = [];
-    if (allSchoolIds.size > 0) {
-      const { data: schools } = await supabase
-        .from('schools')
-        .select('id, name')
-        .in('id', [...allSchoolIds])
-        .order('name', { ascending: true });
-      const schoolIdsWithCompanies = new Set();
-      Object.entries(companySchoolMap).forEach(([companyId, sids]) => {
-        sids.forEach((sid) => schoolIdsWithCompanies.add(sid));
-      });
-      schoolsList = (schools || []).map((s) => {
-        const count = Object.values(companySchoolMap).filter((sids) => sids.has(s.id)).length;
-        return { id: s.id, name: s.name, count };
-      }).filter((s) => s.count > 0);
-    }
-
-    // Fetch companies (filter by school if requested)
-    let companyIdsToFetch = null;
-    if (filterBySchool) {
-      companyIdsToFetch = Object.keys(companySchoolMap)
-        .filter((cid) => companySchoolMap[cid].has(schoolId))
-        .map((x) => parseInt(x, 10))
-        .filter((n) => !Number.isNaN(n));
-      if (companyIdsToFetch.length === 0) {
-        const { count } = await supabase.from('companies').select('*', { count: 'exact', head: true });
-        return res.json({ companies: [], schoolsList, totalCompanies: count ?? 0 });
-      }
-    }
-
-    let query = supabase.from('companies').select('*').order('company_name', { ascending: true });
-    if (companyIdsToFetch && companyIdsToFetch.length > 0) {
-      query = query.in('id', companyIdsToFetch);
-    }
-    const { data: companies, error } = await query;
-
-    if (error) throw error;
-
-    // totalCompanies = total count of all companies (for "All Schools" card)
-    let totalCompanies = (companies || []).length;
-    if (filterBySchool) {
-      const { count } = await supabase.from('companies').select('*', { count: 'exact', head: true });
-      totalCompanies = count ?? totalCompanies;
-    }
-
-    res.json({ companies: companies || [], schoolsList, totalCompanies });
+    const result = await placementDb.getCompaniesList(filterBySchool ? schoolId : null);
+    res.json(result);
   } catch (error) {
     logger.error('Error fetching companies:', error);
-    res.status(500).json({ companies: [], schoolsList: [] });
+    res.status(500).json({ companies: [], schoolsList: [], totalCompanies: 0 });
   }
 };
 
@@ -2021,19 +2068,11 @@ exports.getCompanyById = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    const { data, error } = await supabase
-      .from('companies')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ message: 'Company not found' });
-      throw error;
-    }
+    const data = await placementDb.getCompanyById(id);
+    if (!data) return res.status(404).json({ message: 'Company not found' });
     res.json(data);
   } catch (error) {
-    console.error('Error fetching company:', error);
+    logger.error('Error fetching company:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
@@ -2047,14 +2086,8 @@ exports.getCompanyDrives = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    const { data, error } = await supabase
-      .from('placements_drives')
-      .select('*')
-      .eq('company_id', id)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-    const drives = (data || []).map((d) => {
+    const data = await placementDb.getCompanyDrives(id);
+    const drives = data.map((d) => {
       const ctc = d.ctc_structure && typeof d.ctc_structure === 'object'
         ? (d.ctc_structure.min_lpa != null || d.ctc_structure.max_lpa != null)
           ? [d.ctc_structure.min_lpa, d.ctc_structure.max_lpa].filter(Boolean).join('–')
@@ -2095,52 +2128,15 @@ exports.getCompanyOffers = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    const { data: placements, error: plErr } = await supabase
-      .from('placement')
-      .select(`
-        id,
-        student_id,
-        designation,
-        offer_letter_status,
-        ctc_min_lpa,
-        ctc_max_lpa,
-        type_of_hiring,
-        academic_year,
-        student_basic_details!inner(full_name, schools(name))
-      `)
-      .eq('company_id', id)
-      .order('created_at', { ascending: false });
-
-    if (plErr) {
-      const { data: simple, error: simpleErr } = await supabase
-        .from('placement')
-        .select('id, student_id, designation, offer_letter_status, ctc_min_lpa, ctc_max_lpa, type_of_hiring, academic_year')
-        .eq('company_id', id)
-        .order('created_at', { ascending: false });
-      if (simpleErr) throw simpleErr;
-      const offers = (simple || []).map((p) => ({
-        id: p.id,
-        usn: p.student_id,
-        student_name: null,
-        school: '-',
-        ctc: [p.ctc_min_lpa, p.ctc_max_lpa].filter((x) => x != null).join('–') || '-',
-        job_type: p.type_of_hiring || '-',
-        designation: p.designation || '-',
-        offer_letter_status: p.offer_letter_status || '-',
-      }));
-      return res.json(offers);
-    }
-
-    const offers = (placements || []).map((p) => {
+    const placements = await placementDb.getCompanyPlacements(id);
+    const offers = placements.map((p) => {
       const ctc = [p.ctc_min_lpa, p.ctc_max_lpa].filter((x) => x != null);
       const ctcStr = ctc.length ? ctc.join('–') : '-';
-      const student = p.student_basic_details || {};
-      const school = student.schools?.name || '-';
       return {
         id: p.id,
         usn: p.student_id,
-        student_name: student.full_name || null,
-        school,
+        student_name: p.full_name || null,
+        school: p.school_name || '-',
         ctc: ctcStr,
         job_type: p.type_of_hiring || '-',
         designation: p.designation || '-',
@@ -2176,7 +2172,7 @@ exports.addCompany = async (req, res) => {
     const payload = {
       company_name: String(company_name).trim(),
       description: body.description || null,
-      company_type: body.company_type || null,
+      company_type: body.company_type || body.industry || null,
       address: body.address || null,
       website: body.website || null,
       linkedin: body.linkedin || null,
@@ -2184,13 +2180,10 @@ exports.addCompany = async (req, res) => {
       company_logo_link: body.company_logo_link || body.logo || null,
     };
 
-    const { data, error } = await supabase
-      .from('companies')
-      .insert(payload)
-      .select()
-      .single();
-
-    if (error) {
+    let data;
+    try {
+      data = await placementDb.insertCompany(payload);
+    } catch (error) {
       if (error.code === '23505') return res.status(409).json({ message: 'Company with this name already exists' });
       throw error;
     }
@@ -2208,7 +2201,7 @@ exports.addCompany = async (req, res) => {
           remarks: c.remarks || null,
         }));
       if (contactRows.length > 0) {
-        await supabase.from('contacts').insert(contactRows);
+        await placementDb.insertContacts(contactRows);
       }
     }
     res.status(201).json(data);
@@ -2238,6 +2231,7 @@ exports.updateCompany = async (req, res) => {
     if (body.company_name != null) payload.company_name = String(body.company_name).trim();
     if (body.description != null) payload.description = body.description;
     if (body.company_type != null) payload.company_type = body.company_type;
+    else if (body.industry != null) payload.company_type = body.industry;
     if (body.address != null) payload.address = body.address;
     if (body.website != null) payload.website = body.website;
     if (body.linkedin != null) payload.linkedin = body.linkedin;
@@ -2245,14 +2239,10 @@ exports.updateCompany = async (req, res) => {
     if (body.company_logo_link != null) payload.company_logo_link = body.company_logo_link;
     if (body.logo != null) payload.company_logo_link = body.logo;
 
-    const { data, error } = await supabase
-      .from('companies')
-      .update(payload)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
+    let data;
+    try {
+      data = await placementDb.updateCompany(id, payload);
+    } catch (error) {
       if (error.code === '23505') return res.status(409).json({ message: 'Company with this name already exists' });
       throw error;
     }
@@ -2273,11 +2263,7 @@ exports.deleteCompany = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    await supabase.from('contacts').delete().eq('company_id', id);
-
-    const { error } = await supabase.from('companies').delete().eq('id', id);
-
-    if (error) throw error;
+    await placementDb.deleteCompany(id);
     res.status(204).send();
   } catch (error) {
     logger.error('Error deleting company:', error);
@@ -2294,14 +2280,8 @@ exports.getCompanyContacts = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .eq('company_id', id)
-      .order('id', { ascending: true });
-
-    if (error) throw error;
-    res.json(data || []);
+    const data = await placementDb.getCompanyContacts(id);
+    res.json(data);
   } catch (error) {
     logger.error('Error fetching company contacts:', error);
     res.status(500).json({ message: 'Server error' });
@@ -2334,13 +2314,8 @@ exports.addCompanyContacts = async (req, res) => {
       return res.status(400).json({ message: 'At least one contact with name, email or phone is required' });
     }
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .insert(contactRows)
-      .select();
-
-    if (error) throw error;
-    res.status(201).json(Array.isArray(data) ? data : [data]);
+    const data = await placementDb.insertContacts(contactRows);
+    res.status(201).json(data);
   } catch (error) {
     logger.error('Error adding company contacts:', error);
     res.status(500).json({ message: error.message || 'Server error' });
@@ -2365,15 +2340,7 @@ exports.updateCompanyContact = async (req, res) => {
     if (body.role_title != null) payload.role_title = body.role_title;
     if (body.remarks != null) payload.remarks = body.remarks;
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .update(payload)
-      .eq('id', contactId)
-      .eq('company_id', companyId)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await placementDb.updateContact(contactId, companyId, payload);
     if (!data) return res.status(404).json({ message: 'Contact not found' });
     res.json(data);
   } catch (error) {
@@ -2392,13 +2359,7 @@ exports.deleteCompanyContact = async (req, res) => {
     const contactId = parseInt(req.params.contactId, 10);
     if (isNaN(companyId) || isNaN(contactId)) return res.status(400).json({ message: 'Invalid id' });
 
-    const { error } = await supabase
-      .from('contacts')
-      .delete()
-      .eq('id', contactId)
-      .eq('company_id', companyId);
-
-    if (error) throw error;
+    await placementDb.deleteContact(contactId, companyId);
     res.status(204).send();
   } catch (error) {
     logger.error('Error deleting contact:', error);
@@ -2414,21 +2375,14 @@ exports.deleteCompanyContact = async (req, res) => {
 exports.getPlacementOverview = async (req, res) => {
   try {
     const academicYear = req.query.academic_year || null;
-    const [
-      { data: students },
-      { data: schools },
-      { data: programs },
-      { data: policies },
-      { data: placementRows },
-      { data: placementYears }
-    ] = await Promise.all([
-      supabase.from('student_basic_details').select('usn, school_id, program_id, year_of_joining, current_year'),
-      supabase.from('schools').select('id, name'),
-      supabase.from('programs').select('id, school_id, name, graduation_level'),
-      supabase.from('batch_academic_policies').select('school_id, program_id, joining_year, summer_immersion, summer_internship, capstone, placement'),
-      supabase.from('placement').select('student_id, ctc_min_lpa, ctc_max_lpa, academic_year'),
-      supabase.from('placement').select('academic_year')
-    ]);
+    const {
+      students,
+      schools,
+      programs,
+      policies,
+      placementRows,
+      placementYears,
+    } = await placementDb.getPlacementOverviewData();
 
     const schoolMap = (schools || []).reduce((acc, s) => { acc[s.id] = s.name; return acc; }, {});
     const programMap = (programs || []).reduce((acc, p) => { acc[p.id] = { name: p.name, graduation_level: p.graduation_level }; return acc; }, {});
@@ -2597,30 +2551,16 @@ exports.getPlacementOverview = async (req, res) => {
  */
 exports.getAllPolicies = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('batch_academic_policies')
-      .select(`
-        *,
-        schools ( name ),
-        programs ( name )
-      `)
-      .order('joining_year', { ascending: false });
-
-    if (error) throw error;
-    const policies = data || [];
-
-    const { data: students } = await supabase
-      .from('student_basic_details')
-      .select('usn, school_id, program_id, year_of_joining');
+    const policies = await policiesDb.getAllPoliciesWithNames();
+    const students = await policiesDb.getStudentsForBatchKeys();
     const batchToUsns = {};
-    (students || []).forEach((s) => {
+    students.forEach((s) => {
       const key = `${s.school_id}|${s.program_id}|${s.year_of_joining}`;
       if (!batchToUsns[key]) batchToUsns[key] = [];
       batchToUsns[key].push(s.usn);
     });
-
-    const { data: alumniRows } = await supabase.from('alumni').select('student_id').not('student_id', 'is', null);
-    const alumniUsnSet = new Set((alumniRows || []).map((a) => a.student_id).filter(Boolean));
+    const alumniIds = await policiesDb.getAlumniStudentIds();
+    const alumniUsnSet = new Set(alumniIds);
 
     const list = policies.map((p) => {
       const key = `${p.school_id}|${p.program_id}|${p.joining_year}`;
@@ -2630,11 +2570,11 @@ exports.getAllPolicies = async (req, res) => {
       const alumni_conversion_pct = studentCount > 0 ? Math.round((alumniCount / studentCount) * 1000) / 10 : 0;
       return {
         ...p,
-        school_name: p.schools?.name || null,
-        program_name: p.programs?.name || null,
+        school_name: p.school_name || null,
+        program_name: p.program_name || null,
         alumni_conversion_pct,
         alumni_count: alumniCount,
-        student_count: studentCount
+        student_count: studentCount,
       };
     });
     res.json(list);
@@ -2664,39 +2604,24 @@ exports.upsertPolicy = async (req, res) => {
       remarks: body.remarks || null
     };
 
-    let policyData;
-    if (id && !Number.isNaN(id)) {
-      const { data, error } = await supabase.from('batch_academic_policies').update(payload).eq('id', id).select().single();
-      if (error) throw error;
-      policyData = data;
-    } else {
-      const { data, error } = await supabase.from('batch_academic_policies').insert(payload).select().single();
-      if (error) throw error;
-      policyData = data;
-    }
-
-    // Update all matching students' eligibility columns in student_basic_details
-    const studentEligibilityPayload = {
-      is_summer_immersion_eligible: payload.summer_immersion,
-      is_summer_internship_eligible: payload.summer_internship,
-      is_capstone_eligible: payload.capstone,
-      is_placement_eligible: payload.placement,
-      updated_at: new Date().toISOString()
-    };
-
-    const { error: studentUpdateError, count } = await supabase
-      .from('student_basic_details')
-      .update(studentEligibilityPayload, { count: 'exact' })
-      .eq('school_id', payload.school_id)
-      .eq('program_id', payload.program_id)
-      .eq('year_of_joining', payload.joining_year);
+    const policyData = await policiesDb.upsertPolicy(id && !Number.isNaN(id) ? id : null, payload);
 
     let studentsUpdated = 0;
-    if (studentUpdateError) {
-      logger.warn('Failed to update student eligibility columns:', studentUpdateError);
-    } else {
-      studentsUpdated = count || 0;
+    try {
+      studentsUpdated = await policiesDb.updateStudentEligibilityByBatch(
+        payload.school_id,
+        payload.program_id,
+        payload.joining_year,
+        {
+          is_summer_immersion_eligible: payload.summer_immersion,
+          is_summer_internship_eligible: payload.summer_internship,
+          is_capstone_eligible: payload.capstone,
+          is_placement_eligible: payload.placement,
+        }
+      );
       logger.info(`Updated eligibility for ${studentsUpdated} students (school_id=${payload.school_id}, program_id=${payload.program_id}, year=${payload.joining_year})`);
+    } catch (studentUpdateError) {
+      logger.warn('Failed to update student eligibility columns:', studentUpdateError?.message);
     }
 
     // Return policy data along with student update count
@@ -2716,51 +2641,37 @@ exports.upsertPolicy = async (req, res) => {
  */
 exports.getStudentsEligibility = async (req, res) => {
   try {
-    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 500));
+    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const offset = (page - 1) * limit;
     const search = (req.query.search || '').trim();
     const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
     const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
 
-    let query = supabase
-      .from('student_basic_details')
-      .select(`
-        usn, full_name, college_email, school_id, program_id, year_of_joining,
-        is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible,
-        schools ( id, name, abbreviation ),
-        programs ( id, name )
-      `)
-      .order('full_name', { ascending: true })
-      .limit(limit);
+    const { students: rows, total } = await policiesDb.fetchStudentsEligibilityPage({
+      limit,
+      offset,
+      schoolId: schoolId != null && !Number.isNaN(schoolId) ? schoolId : null,
+      programId: programId != null && !Number.isNaN(programId) ? programId : null,
+      search: search || null,
+    });
 
-    if (schoolId != null && !Number.isNaN(schoolId)) {
-      query = query.eq('school_id', schoolId);
-    }
-    if (programId != null && !Number.isNaN(programId)) {
-      query = query.eq('program_id', programId);
-    }
-    if (search) {
-      query = query.or(`usn.ilike.%${search}%,full_name.ilike.%${search}%,college_email.ilike.%${search}%`);
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    const students = (data || []).map((s) => ({
+    const students = rows.map((s) => ({
       usn: s.usn,
       full_name: s.full_name,
       college_email: s.college_email,
       school_id: s.school_id,
       program_id: s.program_id,
       year_of_joining: s.year_of_joining,
-      school_name: s.schools?.name || s.schools?.abbreviation || '',
-      program_name: s.programs?.name || '',
+      school_name: s.school_name || s.school_abbr || '',
+      program_name: s.program_name || '',
       is_summer_immersion_eligible: !!s.is_summer_immersion_eligible,
       is_summer_internship_eligible: !!s.is_summer_internship_eligible,
       is_capstone_eligible: !!s.is_capstone_eligible,
-      is_placement_eligible: !!s.is_placement_eligible
+      is_placement_eligible: !!s.is_placement_eligible,
     }));
 
-    res.json({ students, total: students.length });
+    res.json({ students, total, page, limit });
   } catch (err) {
     logger.error('getStudentsEligibility:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch students' });
@@ -2796,14 +2707,8 @@ exports.updateStudentEligibility = async (req, res) => {
       payload.is_placement_eligible = body.is_placement_eligible;
     }
 
-    const { data, error } = await supabase
-      .from('student_basic_details')
-      .update(payload)
-      .eq('usn', usn)
-      .select('usn, full_name, is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible')
-      .single();
-
-    if (error) throw error;
+    const data = await policiesDb.updateStudentEligibilityByUsn(usn, payload);
+    if (!data) return res.status(404).json({ message: 'Student not found' });
 
     logger.info(`Updated eligibility for student ${usn}`);
     res.json(data);
@@ -2841,12 +2746,7 @@ exports.bulkUpdateStudentEligibility = async (req, res) => {
       payload.is_placement_eligible = eligibility.is_placement_eligible;
     }
 
-    const { error, count } = await supabase
-      .from('student_basic_details')
-      .update(payload, { count: 'exact' })
-      .in('usn', usns);
-
-    if (error) throw error;
+    const count = await policiesDb.bulkUpdateStudentEligibility(usns, payload);
 
     logger.info(`Bulk updated eligibility for ${count} students`);
     res.json({ success: true, updated: count || usns.length });
@@ -2865,14 +2765,13 @@ exports.getMyPolicy = async (req, res) => {
     const usn = req.user?.usn;
     if (!usn) return res.status(403).json({ message: 'Student USN required' });
 
-    const { data: student, error: studentError } = await supabase
-      .from('student_basic_details')
-      .select('school_id, program_id, year_of_joining, opt_in, is_summer_immersion_eligible, is_summer_internship_eligible, is_capstone_eligible, is_placement_eligible')
-      .eq('usn', usn)
-      .maybeSingle();
+    const student = await policiesDb.getStudentPolicyContext(usn);
 
-    if (studentError || !student?.school_id || !student?.program_id || student?.year_of_joining == null) {
+    if (!student?.school_id || !student?.program_id || student?.year_of_joining == null) {
       return res.json({
+        school_id: student?.school_id || null,
+        program_id: student?.program_id || null,
+        joining_year: student?.year_of_joining || null,
         summer_immersion: false,
         summer_internship: false,
         capstone: false,
@@ -2886,16 +2785,17 @@ exports.getMyPolicy = async (req, res) => {
       });
     }
 
-    const { data: policy, error } = await supabase
-      .from('batch_academic_policies')
-      .select('summer_immersion, summer_internship, capstone, placement')
-      .eq('school_id', student.school_id)
-      .eq('program_id', student.program_id)
-      .eq('joining_year', student.year_of_joining)
-      .maybeSingle();
+    const policy = await policiesDb.getBatchPolicy(
+      student.school_id,
+      student.program_id,
+      student.year_of_joining
+    );
 
-    if (error || !policy) {
+    if (!policy) {
       return res.json({
+        school_id: student.school_id,
+        program_id: student.program_id,
+        joining_year: student.year_of_joining,
         summer_immersion: false,
         summer_internship: false,
         capstone: false,
@@ -2910,6 +2810,9 @@ exports.getMyPolicy = async (req, res) => {
     }
 
     res.json({
+      school_id: student.school_id,
+      program_id: student.program_id,
+      joining_year: student.year_of_joining,
       summer_immersion: !!policy.summer_immersion,
       summer_internship: !!policy.summer_internship,
       capstone: !!policy.capstone,
@@ -2932,24 +2835,8 @@ exports.getMyPolicy = async (req, res) => {
  */
 exports.syncPolicies = async (req, res) => {
   try {
-    const { data: students } = await supabase.from('student_basic_details').select('school_id, program_id, year_of_joining');
-    const keys = new Set();
-    (students || []).forEach((s) => {
-      if (s.school_id && s.program_id && s.year_of_joining) keys.add(`${s.school_id}-${s.program_id}-${s.year_of_joining}`);
-    });
-    const { data: existing } = await supabase.from('batch_academic_policies').select('id, school_id, program_id, joining_year');
-    const existingKeys = new Set((existing || []).map((p) => `${p.school_id}-${p.program_id}-${p.joining_year}`));
-    const toInsert = [];
-    keys.forEach((k) => {
-      if (existingKeys.has(k)) return;
-      const [school_id, program_id, joining_year] = k.split('-').map(Number);
-      toInsert.push({ school_id, program_id, joining_year, summer_immersion: false, summer_internship: false, capstone: false, placement: false, alumni: false });
-    });
-    if (toInsert.length > 0) {
-      const { error } = await supabase.from('batch_academic_policies').insert(toInsert);
-      if (error) throw error;
-    }
-    res.json({ message: `Synced; ${toInsert.length} new policies added.` });
+    const inserted = await policiesDb.syncPoliciesFromCatalog();
+    res.json({ message: `Synced; ${inserted} new policies added.` });
   } catch (err) {
     logger.error('syncPolicies:', err);
     res.status(500).json({ message: err.message || 'Sync failed' });
@@ -2967,8 +2854,7 @@ exports.getAlumniConversions = async (req, res) => {
     const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
     const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
 
-    const { data: schoolsList } = await supabase.from('schools').select('id, name').order('name', { ascending: true });
-    const { data: programsList } = await supabase.from('programs').select('id, name, school_id, min_duration_years, max_duration_years').order('name', { ascending: true });
+    const { schools: schoolsList, programs: programsList } = await alumniDb.getAlumniConversionsMeta();
 
     if (schoolId == null || programId == null || Number.isNaN(schoolId) || Number.isNaN(programId)) {
       return res.json({
@@ -2978,22 +2864,14 @@ exports.getAlumniConversions = async (req, res) => {
       });
     }
 
-    const { data: students, error: studentsErr } = await supabase
-      .from('student_basic_details')
-      .select('usn, full_name, college_email, personal_email, school_id, program_id, year_of_joining, opt_in')
-      .eq('school_id', schoolId)
-      .eq('program_id', programId)
-      .order('usn', { ascending: true });
-
-    if (studentsErr) throw studentsErr;
-    const studentList = students || [];
+    const studentList = await alumniDb.getStudentsBySchoolProgram(schoolId, programId);
     if (studentList.length === 0) {
       return res.json({ schools: schoolsList || [], programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })), rows: [] });
     }
 
     const usns = studentList.map((s) => s.usn).filter(Boolean);
-    const { data: existingAlumni } = await supabase.from('alumni').select('student_id').in('student_id', usns);
-    const convertedUsns = new Set((existingAlumni || []).map((a) => a.student_id).filter(Boolean));
+    const existingAlumni = await alumniDb.getAlumniByStudentIds(usns);
+    const convertedUsns = new Set(existingAlumni.map((a) => a.student_id).filter(Boolean));
     const studentListNotConverted = studentList.filter((s) => !convertedUsns.has(s.usn));
 
     const program = (programsList || []).find((p) => p.id === programId);
@@ -3001,12 +2879,8 @@ exports.getAlumniConversions = async (req, res) => {
     const maxY = program?.max_duration_years ?? 4;
     const programName = program?.name ?? null;
 
-    const { data: offersRows } = await supabase
-      .from('offers')
-      .select('student_id')
-      .in('student_id', usns)
-      .eq('is_accepted', true);
-    const placedUsns = new Set((offersRows || []).map((o) => o.student_id).filter(Boolean));
+    const placedIds = await alumniDb.getAcceptedOfferStudentIds(usns);
+    const placedUsns = new Set(placedIds.filter(Boolean));
 
     const rows = studentListNotConverted.map((s) => ({
       usn: s.usn,
@@ -3248,12 +3122,7 @@ exports.getAlumniConversionLogs = async (req, res) => {
  */
 exports.getAllAlumni = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('alumni')
-      .select('*')
-      .order('full_name', { ascending: true });
-
-    if (error) throw error;
+    const data = await alumniDb.getAllAlumniOrdered();
     const hasProfileData = (a) => {
       const hasEmail = !!(a.personal_email && String(a.personal_email).trim());
       const hasCareer = !!(a.current_company && String(a.current_company).trim()) || !!(a.current_designation && String(a.current_designation).trim());
@@ -3297,8 +3166,7 @@ exports.addAlumni = async (req, res) => {
       is_verified: true
     };
 
-    const { data, error } = await supabase.from('alumni').insert(payload).select().single();
-    if (error) throw error;
+    const data = await alumniDb.insertAlumni(payload);
     res.status(201).json({ ...data, usn: data.student_id });
   } catch (err) {
     logger.error('addAlumni:', err);
@@ -3315,12 +3183,7 @@ exports.getAlumniByIdOrUsn = async (req, res) => {
     const idNum = parseInt(identifier, 10);
     const byId = !Number.isNaN(idNum);
 
-    let q = supabase.from('alumni').select('*');
-    if (byId) q = q.eq('id', idNum);
-    else q = q.eq('student_id', identifier);
-    const { data, error } = await q.maybeSingle();
-
-    if (error) throw error;
+    const data = await alumniDb.getAlumniByIdentifier(byId ? idNum : identifier, byId);
     if (!data) return res.status(404).json({ message: 'Alumni not found' });
     res.json({ ...data, usn: data.student_id });
   } catch (err) {
@@ -3339,12 +3202,7 @@ exports.updateAlumni = async (req, res) => {
     const idNum = parseInt(identifier, 10);
     const byId = !Number.isNaN(idNum);
 
-    let q = supabase.from('alumni').select('id');
-    if (byId) q = q.eq('id', idNum);
-    else q = q.eq('student_id', identifier);
-    const { data: existing, error: findErr } = await q.maybeSingle();
-
-    if (findErr) throw findErr;
+    const existing = await alumniDb.getAlumniIdByIdentifier(byId ? idNum : identifier, byId);
     if (!existing) return res.status(404).json({ message: 'Alumni not found' });
 
     const payload = {
@@ -3363,14 +3221,7 @@ exports.updateAlumni = async (req, res) => {
     };
     Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
 
-    const { data: updated, error } = await supabase
-      .from('alumni')
-      .update(payload)
-      .eq('id', existing.id)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const updated = await alumniDb.updateAlumni(existing.id, payload);
     res.json({ ...updated, usn: updated.student_id });
   } catch (err) {
     logger.error('updateAlumni:', err);
@@ -3387,13 +3238,7 @@ exports.getAlumniMe = async (req, res) => {
     if (!email) {
       return res.status(403).json({ message: 'Alumni profile not found for this account.' });
     }
-    const { data, error } = await supabase
-      .from('alumni')
-      .select('*')
-      .ilike('personal_email', email)
-      .maybeSingle();
-
-    if (error) throw error;
+    const data = await alumniDb.getAlumniByEmail(email);
     if (!data) return res.status(404).json({ message: 'Alumni profile not found.' });
     res.json({ ...data, usn: data.student_id });
   } catch (err) {
@@ -3411,13 +3256,7 @@ exports.updateAlumniMe = async (req, res) => {
     if (!email) {
       return res.status(403).json({ message: 'Alumni profile not found for this account.' });
     }
-    const { data: existing, error: findErr } = await supabase
-      .from('alumni')
-      .select('id')
-      .ilike('personal_email', email)
-      .maybeSingle();
-
-    if (findErr) throw findErr;
+    const existing = await alumniDb.getAlumniIdByEmail(email);
     if (!existing) return res.status(404).json({ message: 'Alumni profile not found.' });
 
     const b = req.body;
@@ -3438,14 +3277,7 @@ exports.updateAlumniMe = async (req, res) => {
     };
     Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
 
-    const { data: updated, error } = await supabase
-      .from('alumni')
-      .update(payload)
-      .eq('id', existing.id)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const updated = await alumniDb.updateAlumni(existing.id, payload);
     res.json({ ...updated, usn: updated.student_id });
   } catch (err) {
     logger.error('updateAlumniMe:', err);
@@ -3458,13 +3290,8 @@ exports.updateAlumniMe = async (req, res) => {
  */
 exports.getRegistrationCodes = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('alumni_registration_codes')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-    res.json(data || []);
+    const data = await alumniDb.getRegistrationCodes();
+    res.json(data);
   } catch (err) {
     logger.error('getRegistrationCodes:', err);
     res.status(500).json({ message: err.message || 'Server error fetching codes' });
@@ -3493,8 +3320,7 @@ exports.createRegistrationCode = async (req, res) => {
       created_by: req.user?.id || null
     };
 
-    const { data, error } = await supabase.from('alumni_registration_codes').insert(payload).select().single();
-    if (error) throw error;
+    const data = await alumniDb.insertRegistrationCode(payload);
     res.status(201).json(data);
   } catch (err) {
     logger.error('createRegistrationCode:', err);
@@ -3510,14 +3336,7 @@ exports.deleteRegistrationCode = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (Number.isNaN(id)) return res.status(400).json({ message: 'Invalid code id' });
 
-    const { data, error } = await supabase
-      .from('alumni_registration_codes')
-      .update({ is_active: false })
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await alumniDb.deactivateRegistrationCode(id);
     if (!data) return res.status(404).json({ message: 'Code not found' });
     res.json(data);
   } catch (err) {
@@ -3531,201 +3350,60 @@ exports.deleteRegistrationCode = async (req, res) => {
  */
 exports.getAllJobOffers = async (req, res) => {
   try {
-    // 1. Fetch all offers with linked placement and capstone data
-    const { data: offersData, error: offersError } = await supabase
-      .from('offers')
-      .select(`
-        id,
-        student_id,
-        company_id,
-        placement_id,
-        capstone_id,
-        job_type,
-        academic_year,
-        remarks,
-        created_at,
-        updated_at,
-        companies(id, company_name)
-      `)
-      .order('created_at', { ascending: false });
-
-    if (offersError) {
-      logger.error('[placement] getAllJobOffers offers query error:', offersError);
-      throw offersError;
-    }
-
-    // 2. Get all unique placement_ids and capstone_ids
-    const placementIds = [...new Set((offersData || []).map(o => o.placement_id).filter(Boolean))];
-    const capstoneIds = [...new Set((offersData || []).map(o => o.capstone_id).filter(Boolean))];
-
-    // 3. Fetch placement details
-    let placementsMap = {};
-    if (placementIds.length > 0) {
-      const { data: placements, error: placementError } = await supabase
-        .from('placement')
-        .select(`
-          id,
-          student_id,
-          company_id,
-          designation,
-          offer_letter_status,
-          job_description,
-          ctc_min_lpa,
-          ctc_max_lpa,
-          ctc_variable_pay,
-          ctc_stock_in_lpa,
-          type_of_hiring,
-          academic_year,
-          remarks,
-          companies(id, company_name)
-        `)
-        .in('id', placementIds);
-
-      if (placementError) {
-        logger.error('[placement] getAllJobOffers placements query error:', placementError);
-      } else {
-        (placements || []).forEach(p => {
-          placementsMap[p.id] = p;
-        });
-      }
-    }
-
-    // 4. Fetch capstone details
-    let capstonesMap = {};
-    if (capstoneIds.length > 0) {
-      const { data: capstones, error: capstoneError } = await supabase
-        .from('capstone')
-        .select(`
-          id,
-          usn,
-          company_name,
-          internship_duration_months,
-          designation,
-          offer_letter_status,
-          internship_stipend_min,
-          internship_stipend_max,
-          description,
-          academic_year,
-          remarks
-        `)
-        .in('id', capstoneIds);
-
-      if (capstoneError) {
-        logger.error('[placement] getAllJobOffers capstones query error:', capstoneError);
-      } else {
-        (capstones || []).forEach(c => {
-          capstonesMap[c.id] = c;
-        });
-      }
-    }
-
-    // 5. Get unique student IDs from all sources
-    const studentIds = [...new Set([
-      ...(offersData || []).map(o => o.student_id),
-      ...Object.values(placementsMap).map(p => p.student_id),
-      ...Object.values(capstonesMap).map(c => c.usn)
-    ].filter(Boolean))];
-
-    // 6. Fetch student details
-    let studentsMap = {};
-    if (studentIds.length > 0) {
-      const { data: students, error: studentsError } = await supabase
-        .from('student_basic_details')
-        .select(`
-          usn,
-          full_name,
-          year_of_joining,
-          school_id,
-          program_id,
-          schools(name, abbreviation),
-          programs(name)
-        `)
-        .in('usn', studentIds);
-
-      if (studentsError) {
-        logger.error('[placement] getAllJobOffers students query error:', studentsError);
-      } else {
-        (students || []).forEach(s => {
-          studentsMap[s.usn] = s;
-        });
-      }
-    }
-
-    // 7. Transform offers data
-    const results = (offersData || []).map(o => {
-      const student = studentsMap[o.student_id] || null;
-      const placement = o.placement_id ? placementsMap[o.placement_id] : null;
-      const capstone = o.capstone_id ? capstonesMap[o.capstone_id] : null;
-      const company = o.companies || placement?.companies || null;
-
-      return {
-        // Offer table fields
-        id: o.id,
-        offer_id: o.id,
-        student_id: o.student_id,
-        placement_id: o.placement_id,
-        capstone_id: o.capstone_id,
-        offer_job_type: o.job_type,
-        offer_academic_year: o.academic_year,
-        offer_remarks: o.remarks,
-        offer_created_at: o.created_at,
-        offer_updated_at: o.updated_at,
-
-        // Student fields
-        usn: student?.usn || o.student_id,
-        student_name: student?.full_name || '',
-        batch: student?.year_of_joining || null,
-        school: student?.schools?.name || student?.schools?.abbreviation || '',
-        program: student?.programs?.name || '',
-
-        // Company fields (from offer or placement)
-        company_id: o.company_id || placement?.company_id,
-        company_name: company?.company_name || capstone?.company_name || '',
-
-        // Placement table fields
-        placement_designation: placement?.designation || null,
-        placement_offer_letter_status: placement?.offer_letter_status || null,
-        placement_job_description: placement?.job_description || null,
-        placement_ctc_min_lpa: placement?.ctc_min_lpa || null,
-        placement_ctc_max_lpa: placement?.ctc_max_lpa || null,
-        placement_ctc_variable_pay: placement?.ctc_variable_pay || null,
-        placement_ctc_stock_in_lpa: placement?.ctc_stock_in_lpa || null,
-        placement_type_of_hiring: placement?.type_of_hiring || null,
-        placement_academic_year: placement?.academic_year || null,
-        placement_remarks: placement?.remarks || null,
-
-        // Capstone table fields
-        capstone_company_name: capstone?.company_name || null,
-        capstone_internship_duration_months: capstone?.internship_duration_months || null,
-        capstone_designation: capstone?.designation || null,
-        capstone_offer_letter_status: capstone?.offer_letter_status || null,
-        capstone_internship_stipend_min: capstone?.internship_stipend_min || null,
-        capstone_internship_stipend_max: capstone?.internship_stipend_max || null,
-        capstone_description: capstone?.description || null,
-        capstone_academic_year: capstone?.academic_year || null,
-        capstone_remarks: capstone?.remarks || null,
-
-        // Combined/derived fields for backward compatibility
-        designation: placement?.designation || capstone?.designation || null,
-        job_type: o.job_type || placement?.type_of_hiring || (capstone ? 'capstone' : 'full time'),
-        ctc_min_lpa: placement?.ctc_min_lpa || null,
-        ctc_max_lpa: placement?.ctc_max_lpa || null,
-        ctc: placement?.ctc_max_lpa || placement?.ctc_min_lpa || null,
-        ctc_variable_pay: placement?.ctc_variable_pay || null,
-        offer_letter_status: placement?.offer_letter_status || capstone?.offer_letter_status || 'Pending',
-        academic_year: o.academic_year || placement?.academic_year || capstone?.academic_year || null,
-        remarks: o.remarks || placement?.remarks || capstone?.remarks || null,
-        internship_duration: capstone?.internship_duration_months || null,
-        internship_stipend_min: capstone?.internship_stipend_min || null,
-        internship_stipend_max: capstone?.internship_stipend_max || null,
-        created_at: o.created_at,
-        updated_at: o.updated_at,
-
-        // Source indicator
-        source: capstone ? 'capstone' : (placement ? 'placement' : 'offer')
-      };
-    });
-
+    const rows = await placementDb.getAllJobOffersRows();
+    const results = rows.map((r) => ({
+      id: r.id,
+      offer_id: r.id,
+      student_id: r.student_id,
+      placement_id: r.placement_id,
+      capstone_id: r.capstone_id,
+      offer_job_type: r.offer_job_type,
+      offer_academic_year: r.offer_academic_year,
+      offer_remarks: r.offer_remarks,
+      offer_created_at: r.offer_created_at,
+      offer_updated_at: r.offer_updated_at,
+      usn: r.usn || r.student_id,
+      student_name: r.student_name || '',
+      batch: r.batch,
+      school: r.school || r.school_abbr || '',
+      program: r.program || '',
+      company_id: r.company_id,
+      company_name: r.company_name || '',
+      placement_designation: r.placement_designation,
+      placement_offer_letter_status: r.placement_offer_letter_status,
+      placement_job_description: r.placement_job_description,
+      placement_ctc_min_lpa: r.placement_ctc_min_lpa,
+      placement_ctc_max_lpa: r.placement_ctc_max_lpa,
+      placement_ctc_variable_pay: r.placement_ctc_variable_pay,
+      placement_ctc_stock_in_lpa: r.placement_ctc_stock_in_lpa,
+      placement_type_of_hiring: r.placement_type_of_hiring,
+      placement_academic_year: r.placement_academic_year,
+      placement_remarks: r.placement_remarks,
+      capstone_company_name: r.capstone_company_name,
+      capstone_internship_duration_months: r.capstone_internship_duration_months,
+      capstone_designation: r.capstone_designation,
+      capstone_offer_letter_status: r.capstone_offer_letter_status,
+      capstone_internship_stipend_min: r.capstone_internship_stipend_min,
+      capstone_internship_stipend_max: r.capstone_internship_stipend_max,
+      capstone_description: r.capstone_description,
+      capstone_academic_year: r.capstone_academic_year,
+      capstone_remarks: r.capstone_remarks,
+      designation: r.placement_designation || r.capstone_designation || null,
+      job_type: r.offer_job_type || r.placement_type_of_hiring || (r.capstone_id ? 'capstone' : 'full time'),
+      ctc_min_lpa: r.placement_ctc_min_lpa,
+      ctc_max_lpa: r.placement_ctc_max_lpa,
+      ctc: r.placement_ctc_max_lpa || r.placement_ctc_min_lpa || null,
+      ctc_variable_pay: r.placement_ctc_variable_pay,
+      offer_letter_status: r.placement_offer_letter_status || r.capstone_offer_letter_status || 'Pending',
+      academic_year: r.offer_academic_year || r.placement_academic_year || r.capstone_academic_year || null,
+      remarks: r.offer_remarks || r.placement_remarks || r.capstone_remarks || null,
+      internship_duration: r.capstone_internship_duration_months,
+      internship_stipend_min: r.capstone_internship_stipend_min,
+      internship_stipend_max: r.capstone_internship_stipend_max,
+      created_at: r.offer_created_at,
+      updated_at: r.offer_updated_at,
+      source: r.capstone_id ? 'capstone' : (r.placement_id ? 'placement' : 'offer'),
+    }));
     res.json(results);
   } catch (err) {
     logger.error('[placement] getAllJobOffers:', err);
@@ -3746,13 +3424,8 @@ exports.addJobOffer = async (req, res) => {
     }
 
     // Validate student exists
-    const { data: student, error: studentError } = await supabase
-      .from('student_basic_details')
-      .select('usn, full_name')
-      .eq('usn', b.usn)
-      .maybeSingle();
-
-    if (studentError || !student) {
+    const student = await placementDb.getStudentBasicByUsn(b.usn);
+    if (!student) {
       return res.status(404).json({ message: 'Student not found' });
     }
 
@@ -3772,16 +3445,7 @@ exports.addJobOffer = async (req, res) => {
     };
 
     // Insert into placement table
-    const { data: placementData, error: placementError } = await supabase
-      .from('placement')
-      .insert(placement)
-      .select()
-      .single();
-
-    if (placementError) {
-      logger.error('addJobOffer placement insert error:', placementError);
-      throw placementError;
-    }
+    const placementData = await placementDb.insertPlacement(placement);
 
     // Also insert into offers table (linking table)
     const offer = {
@@ -3793,15 +3457,11 @@ exports.addJobOffer = async (req, res) => {
       remarks: b.remarks || null,
     };
 
-    const { data: offerData, error: offerError } = await supabase
-      .from('offers')
-      .insert(offer)
-      .select()
-      .single();
-
-    if (offerError) {
-      logger.warn('addJobOffer offers table insert warning:', offerError);
-      // Don't fail if offers table insert fails, placement is the main record
+    let offerData = null;
+    try {
+      offerData = await placementDb.insertOffer(offer);
+    } catch (offerError) {
+      logger.warn('addJobOffer offers table insert warning:', offerError?.message);
     }
 
     res.status(201).json({
@@ -3831,17 +3491,7 @@ exports.updateJobOffer = async (req, res) => {
     const b = req.body;
 
     // First, get the existing offer to find linked placement/capstone
-    const { data: existingOffer, error: fetchError } = await supabase
-      .from('offers')
-      .select('id, student_id, company_id, placement_id, capstone_id, job_type, academic_year, remarks')
-      .eq('id', offerId)
-      .maybeSingle();
-
-    if (fetchError) {
-      logger.error('updateJobOffer fetch error:', fetchError);
-      throw fetchError;
-    }
-
+    const existingOffer = await placementDb.getOfferById(offerId);
     if (!existingOffer) {
       return res.status(404).json({ message: 'Offer not found' });
     }
@@ -3854,12 +3504,9 @@ exports.updateJobOffer = async (req, res) => {
     if (b.remarks !== undefined) offerUpdate.remarks = b.remarks;
 
     if (Object.keys(offerUpdate).length > 0) {
-      const { error: offerUpdateError } = await supabase
-        .from('offers')
-        .update(offerUpdate)
-        .eq('id', offerId);
-
-      if (offerUpdateError) {
+      try {
+        await placementDb.updateOffer(offerId, offerUpdate);
+      } catch (offerUpdateError) {
         logger.error('updateJobOffer offers update error:', offerUpdateError);
       }
     }
@@ -3880,12 +3527,9 @@ exports.updateJobOffer = async (req, res) => {
       if (b.remarks !== undefined) placementUpdate.remarks = b.remarks;
 
       if (Object.keys(placementUpdate).length > 0) {
-        const { error: placementUpdateError } = await supabase
-          .from('placement')
-          .update(placementUpdate)
-          .eq('id', existingOffer.placement_id);
-
-        if (placementUpdateError) {
+        try {
+          await placementDb.updatePlacement(existingOffer.placement_id, placementUpdate);
+        } catch (placementUpdateError) {
           logger.error('updateJobOffer placement update error:', placementUpdateError);
         }
       }
@@ -3905,12 +3549,9 @@ exports.updateJobOffer = async (req, res) => {
       if (b.remarks !== undefined) capstoneUpdate.remarks = b.remarks;
 
       if (Object.keys(capstoneUpdate).length > 0) {
-        const { error: capstoneUpdateError } = await supabase
-          .from('capstone')
-          .update(capstoneUpdate)
-          .eq('id', existingOffer.capstone_id);
-
-        if (capstoneUpdateError) {
+        try {
+          await placementDb.updateCapstone(existingOffer.capstone_id, capstoneUpdate);
+        } catch (capstoneUpdateError) {
           logger.error('updateJobOffer capstone update error:', capstoneUpdateError);
         }
       }
@@ -3927,23 +3568,10 @@ exports.updateJobOffer = async (req, res) => {
  * GET /placement/dashboard/stats
  * Returns dashboard metrics: placementSeeking, totalOffers, totalPlaced, totalInternship, totalInternshipCumFullTime
  */
-exports.getDashboardStats = async (req, res) => {
+exports.getDashboardOfferStats = async (req, res) => {
   try {
-    // 1. Placement Seeking Students (opt_in = true)
-    const { count: placementSeekingCount, error: optInError } = await supabase
-      .from('student_basic_details')
-      .select('*', { count: 'exact', head: true })
-      .eq('opt_in', true);
-    
-    if (optInError) throw optInError;
-
-    // 2. Offers Metrics
-    const { data: offers, error: offersError } = await supabase
-      .from('offers')
-      .select('student_id, placement_id, capstone_id');
-
-    if (offersError) throw offersError;
-
+    const placementSeekingCount = await placementDb.countOptedInStudents();
+    const offers = await placementDb.getOffersForDashboard();
     const totalOffers = offers.length;
     
     // Total Placed: Unique students with at least one offer
@@ -3985,14 +3613,7 @@ exports.getDashboardStats = async (req, res) => {
 async function resolveAlumniId(req) {
   const email = (req.user && req.user.email) ? String(req.user.email).trim().toLowerCase() : null;
   if (!email) return null;
-  
-  const { data } = await supabase
-    .from('alumni')
-    .select('id')
-    .ilike('personal_email', email)
-    .maybeSingle();
-  
-  return data?.id || null;
+  return alumniDb.resolveAlumniIdByEmail(email);
 }
 
 /**
@@ -4012,26 +3633,17 @@ exports.submitHrRecommendation = async (req, res) => {
       return res.status(400).json({ message: 'Company name and HR name are required' });
     }
 
-    const { data, error } = await supabase
-      .from('hr_recommendations')
-      .insert({
-        alumni_id: alumniId,
-        company_name: b.company_name,
-        hr_name: b.hr_name,
-        hr_email: b.hr_email || null,
-        hr_phone: b.hr_phone || null,
-        hiring_role: b.hiring_role || null,
-        opportunity_type: b.opportunity_type || null,
-        recommendation_note: b.recommendation_note || null,
-        consent_given: b.consent_given === true,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      logger.error('submitHrRecommendation insert error:', error);
-      return res.status(500).json({ message: apiMessage(error, 'Failed to submit recommendation') });
-    }
+    const data = await alumniDb.insertHrRecommendation({
+      alumni_id: alumniId,
+      company_name: b.company_name,
+      hr_name: b.hr_name,
+      hr_email: b.hr_email || null,
+      hr_phone: b.hr_phone || null,
+      hiring_role: b.hiring_role || null,
+      opportunity_type: b.opportunity_type || null,
+      recommendation_note: b.recommendation_note || null,
+      consent_given: b.consent_given === true,
+    });
 
     res.status(201).json({ message: 'HR recommendation submitted successfully', data });
   } catch (err) {
@@ -4051,18 +3663,8 @@ exports.getMyHrRecommendations = async (req, res) => {
       return res.status(403).json({ message: 'Alumni profile not found for this account' });
     }
 
-    const { data, error } = await supabase
-      .from('hr_recommendations')
-      .select('*')
-      .eq('alumni_id', alumniId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.error('getMyHrRecommendations error:', error);
-      return res.status(500).json({ message: apiMessage(error, 'Failed to fetch recommendations') });
-    }
-
-    res.json(data || []);
+    const data = await alumniDb.getHrRecommendationsByAlumniId(alumniId);
+    res.json(data);
   } catch (err) {
     logger.error('getMyHrRecommendations:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to fetch recommendations') });
@@ -4098,16 +3700,9 @@ exports.getAlumniEvents = async (req, res) => {
       return res.json([]);
     }
 
-    const { data: events, error } = await supabase
-      .from('events')
-      .select('*')
-      .in('id', ids)
-      .order('event_datetime', { ascending: true });
-
-    if (error) throw error;
-
+    const events = await placementDb.getEventsByIds(ids);
     const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-    const withImageUrls = (events || []).map((ev) => ({
+    const withImageUrls = events.map((ev) => ({
       ...ev,
       image_url: baseUrl && ev.id
         ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
@@ -4126,15 +3721,9 @@ exports.getAlumniEvents = async (req, res) => {
  */
 exports.getVcEvents = async (req, res) => {
   try {
-    const { data: events, error } = await supabase
-      .from('events')
-      .select('*')
-      .order('event_datetime', { ascending: true });
-
-    if (error) throw error;
-
+    const events = await placementDb.getAllEventsOrdered();
     const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-    const withImageUrls = (events || []).map((ev) => ({
+    const withImageUrls = events.map((ev) => ({
       ...ev,
       image_url: baseUrl && ev.id
         ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
@@ -4153,20 +3742,19 @@ exports.getVcEvents = async (req, res) => {
  */
 exports.getAllHrRecommendations = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('hr_recommendations')
-      .select(`
-        *,
-        alumni:alumni_id (id, full_name, current_company, personal_email)
-      `)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.error('getAllHrRecommendations error:', error);
-      return res.status(500).json({ message: apiMessage(error, 'Failed to fetch recommendations') });
-    }
-
-    res.json(data || []);
+    const rows = await alumniDb.getHrRecommendations();
+    const data = rows.map((r) => ({
+      ...r,
+      alumni: r.alumni_ref_id
+        ? {
+            id: r.alumni_ref_id,
+            full_name: r.alumni_full_name,
+            current_company: r.alumni_current_company,
+            personal_email: r.alumni_personal_email,
+          }
+        : null,
+    }));
+    res.json(data);
   } catch (err) {
     logger.error('getAllHrRecommendations:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to fetch recommendations') });
@@ -4184,36 +3772,24 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       return res.status(400).json({ message: 'USN is required' });
     }
 
-    // Get basic student details
-    const { data: student, error: studentError } = await supabase
-      .from('student_basic_details')
-      .select(`
+    const student = await studentDb.getBasicByUsn(usn, `
         usn, full_name, college_email, personal_email,
         phone_country_code, phone_number,
         school_id, program_id, major_id, minor_id, specialization_id,
         year_of_joining, current_year, current_semester,
-        social_links, profile_image
-      `)
-      .eq('usn', usn)
-      .single();
+        social_links, profile_image`);
 
-    if (studentError || !student) {
+    if (!student) {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    // Get school, program, major names
-    const [schoolRes, programRes, majorRes] = await Promise.all([
-      student.school_id ? supabase.from('schools').select('name').eq('id', student.school_id).single() : { data: null },
-      student.program_id ? supabase.from('programs').select('name').eq('id', student.program_id).single() : { data: null },
-      student.major_id ? supabase.from('majors').select('name').eq('id', student.major_id).single() : { data: null },
-    ]);
+    const { schoolMap, programMap, majorMap } = await catalogDb.getNameMaps({
+      schoolIds: student.school_id ? [student.school_id] : [],
+      programIds: student.program_id ? [student.program_id] : [],
+      majorIds: student.major_id ? [student.major_id] : [],
+    });
 
-    // Get profile details (career info, resume)
-    const { data: profileDetails } = await supabase
-      .from('student_profile_details')
-      .select('brief_summary, key_expertise, hobbies_interests, career_objective, future_goals, resume_file')
-      .eq('usn', usn)
-      .single();
+    const profileDetails = await studentDb.selectOneByUsn('student_profile_details', usn);
 
     // Get all approved projects for this student (use student.usn for exact match; status case-insensitive)
     const ownerUsn = student.usn || usn;
@@ -4294,62 +3870,31 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       };
     });
 
-    // Get education history
-    const { data: education } = await supabase
-      .from('student_education_history')
-      .select('*')
-      .eq('usn', usn)
-      .order('end_year', { ascending: false });
-
-    // Get internships
-    const { data: internships } = await supabase
-      .from('student_internships')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
-
-    // Get trainings
-    const { data: trainings } = await supabase
-      .from('student_trainings')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
-
-    // Get certifications
-    const { data: certifications } = await supabase
-      .from('student_certifications')
-      .select('*')
-      .eq('usn', usn)
-      .order('issue_date', { ascending: false });
-
-    // Get publications
-    const { data: publications } = await supabase
-      .from('student_publications')
-      .select('*')
-      .eq('usn', usn)
-      .order('publication_date', { ascending: false });
-
-    // Get extra-curricular activities
-    const { data: extraCurricular } = await supabase
-      .from('student_extra_curricular_activities')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
-
-    // Get other experiences
-    const { data: otherExperiences } = await supabase
-      .from('student_other_experiences')
-      .select('*')
-      .eq('usn', usn)
-      .order('start_date', { ascending: false });
+    const [
+      { data: education },
+      { data: internships },
+      { data: trainings },
+      { data: certifications },
+      { data: publications },
+      { data: extraCurricular },
+      { data: otherExperiences },
+    ] = await Promise.all([
+      studentDb.selectByUsn('student_education_history', usn, { orderBy: 'end_year' }),
+      studentDb.selectByUsn('student_internships', usn, { orderBy: 'start_date' }),
+      studentDb.selectByUsn('student_trainings', usn, { orderBy: 'start_date' }),
+      studentDb.selectByUsn('student_certifications', usn, { orderBy: 'issue_date' }),
+      studentDb.selectByUsn('student_publications', usn, { orderBy: 'publication_date' }),
+      studentDb.selectByUsn('student_extra_curricular_activities', usn, { orderBy: 'start_date' }),
+      studentDb.selectByUsn('student_other_experiences', usn, { orderBy: 'start_date' }),
+    ]);
 
     res.json({
       usn: student.usn,
       personal: {
         ...student,
-        schoolName: schoolRes.data?.name || null,
-        programName: programRes.data?.name || null,
-        majorName: majorRes.data?.name || null,
+        schoolName: student.school_id ? schoolMap.get(student.school_id) || null : null,
+        programName: student.program_id ? programMap.get(student.program_id)?.name || programMap.get(student.program_id) : null,
+        majorName: student.major_id ? majorMap.get(student.major_id) || null : null,
       },
       career: profileDetails || {},
       resume_file: profileDetails?.resume_file || null,
@@ -4380,13 +3925,8 @@ exports.createAlumniConnectionRequest = async (req, res) => {
     }
 
     // Get Alumni ID
-    const { data: alumni, error: alumError } = await supabase
-      .from('alumni')
-      .select('id')
-      .ilike('personal_email', email)
-      .maybeSingle();
-
-    if (alumError || !alumni) {
+    const alumniId = await alumniDb.resolveAlumniIdByEmail(email);
+    if (!alumniId) {
       return res.status(404).json({ message: 'Alumni profile not found.' });
     }
 
@@ -4404,7 +3944,7 @@ exports.createAlumniConnectionRequest = async (req, res) => {
     }
 
     const payload = {
-      alumni_id: alumni.id,
+      alumni_id: alumniId,
       student_usn,
       connection_purpose,
       message_to_po,
@@ -4414,13 +3954,7 @@ exports.createAlumniConnectionRequest = async (req, res) => {
       status: 'PENDING'
     };
 
-    const { data, error } = await supabase
-      .from('alumni_connection_requests')
-      .insert(payload)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await alumniDb.insertConnectionRequest(payload);
     res.status(201).json(data);
   } catch (err) {
     logger.error('createAlumniConnectionRequest:', err);
@@ -4435,19 +3969,11 @@ exports.createAlumniConnectionRequest = async (req, res) => {
 exports.getAlumniConnectionRequests = async (req, res) => {
   try {
     const statusFilter = (req.query.status || '').trim().toUpperCase();
-    let q = supabase
-      .from('alumni_connection_requests')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (statusFilter && ['PENDING', 'APPROVED', 'REJECTED', 'CONTACTED'].includes(statusFilter)) {
-      q = q.eq('status', statusFilter);
-    }
-
-    const { data: requests, error } = await q;
-    if (error) throw error;
-
-    const rows = requests || [];
+    const filterVal =
+      statusFilter && ['PENDING', 'APPROVED', 'REJECTED', 'CONTACTED'].includes(statusFilter)
+        ? statusFilter
+        : null;
+    const rows = await alumniDb.getConnectionRequests(filterVal);
     const alumniIds = [...new Set(rows.map((r) => r.alumni_id).filter(Boolean))];
     const studentUsns = [...new Set(rows.map((r) => r.student_usn).filter(Boolean))];
 
@@ -4455,19 +3981,17 @@ exports.getAlumniConnectionRequests = async (req, res) => {
     const studentMap = {};
 
     if (alumniIds.length > 0) {
-      const { data: alumniRows } = await supabase
-        .from('alumni')
-        .select('id, full_name, personal_email, current_company, current_designation')
-        .in('id', alumniIds);
-      (alumniRows || []).forEach((a) => { alumniMap[a.id] = a; });
+      const alumniRows = await alumniDb.getAlumniByIds(alumniIds);
+      alumniRows.forEach((a) => {
+        alumniMap[a.id] = a;
+      });
     }
 
     if (studentUsns.length > 0) {
-      const { data: studentRows } = await supabase
-        .from('student_basic_details')
-        .select('usn, full_name, college_email')
-        .in('usn', studentUsns);
-      (studentRows || []).forEach((s) => { studentMap[s.usn] = s; });
+      const studentRows = await alumniDb.getStudentsBriefByUsns(studentUsns);
+      studentRows.forEach((s) => {
+        studentMap[s.usn] = s;
+      });
     }
 
     const enriched = rows.map((r) => {
@@ -4515,14 +4039,7 @@ exports.updateAlumniConnectionRequest = async (req, res) => {
       contacted_at: String(status).toUpperCase() === 'CONTACTED' ? new Date().toISOString() : undefined,
     };
 
-    const { data, error } = await supabase
-      .from('alumni_connection_requests')
-      .update(payload)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) throw error;
+    const data = await alumniDb.updateConnectionRequest(id, payload);
     if (!data) return res.status(404).json({ message: 'Request not found.' });
 
     res.json(data);

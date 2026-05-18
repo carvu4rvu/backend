@@ -33,8 +33,6 @@ BEGIN
       'min_new_ctc_lpa', e.min_new_ctc_lpa,
       'min_ctc_multiplier', e.min_ctc_multiplier,
       'count_offcampus_offers', e.count_offcampus_offers,
-      'no_disciplinary_action', e.no_disciplinary_action,
-      'no_active_placement_violation', e.no_active_placement_violation,
       'admin_override_allowed', e.admin_override_allowed,
       'max_total_offers', e.max_total_offers
     )) AS criteria

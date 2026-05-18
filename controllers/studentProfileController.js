@@ -1,5 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const pool = require('../config/db');
+const catalogDb = require('../db/catalogDb');
+const studentDb = require('../db/studentDb');
 const { enqueueVariantJob } = require('../services/variantJobProcessor');
 const { ensureShareLink } = require('./projectController');
 const { computeCurrentYearSemester } = require('../utils/studentAcademic');
@@ -54,14 +56,10 @@ function parseProvisionalLinks(val) {
  */
 exports.getSchools = async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('schools')
-            .select('*')
-            .order('name', { ascending: true });
-        
-        if (error) throw error;
-        res.json(data);
+        const { rows } = await pool.query('SELECT * FROM schools ORDER BY name ASC');
+        res.json(rows);
     } catch (error) {
+        console.error('[getSchools] Pool error:', error);
         return sendCaughtError(res, error, 'Server error fetching schools.');
     }
 };
@@ -167,8 +165,7 @@ exports.deleteSchool = async (req, res) => {
         await client.query('DELETE FROM programs WHERE school_id = $1', [id]);
         
         // Finally delete the school
-        const { error } = await supabase.from('schools').delete().eq('id', id);
-        if (error) throw error;
+        await client.query('DELETE FROM schools WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.status(204).send();
@@ -185,14 +182,10 @@ exports.deleteSchool = async (req, res) => {
  */
 exports.getPrograms = async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('programs')
-            .select('*')
-            .order('name', { ascending: true });
-        
-        if (error) throw error;
-        res.json(data);
+        const { rows } = await pool.query('SELECT * FROM programs ORDER BY name ASC');
+        res.json(rows);
     } catch (error) {
+        console.error('[getPrograms] Pool error:', error);
         return sendCaughtError(res, error, 'Server error fetching programs.');
     }
 };
@@ -214,7 +207,7 @@ exports.createProgram = async (req, res) => {
         if (!name) {
             return sendValidationError(res, 'Program name is required.', { name: 'Name is required.' });
         }
-        const { data: school } = await supabase.from('schools').select('id').eq('id', schoolId).maybeSingle();
+        const school = await catalogDb.existsById('schools', schoolId);
         if (!school) {
             return sendValidationError(res, 'Invalid school selected.', { school_id: 'School does not exist.' });
         }
@@ -307,8 +300,7 @@ exports.deleteProgram = async (req, res) => {
         await client.query('DELETE FROM specializations WHERE program_id = $1', [id]);
 
         // Delete the program
-        const { error } = await supabase.from('programs').delete().eq('id', id);
-        if (error) throw error;
+        await client.query('DELETE FROM programs WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.status(204).send();
@@ -325,14 +317,10 @@ exports.deleteProgram = async (req, res) => {
  */
 exports.getMajors = async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('majors')
-            .select('*')
-            .order('name', { ascending: true });
-        
-        if (error) throw error;
-        res.json(data);
+        const { rows } = await pool.query('SELECT * FROM majors ORDER BY name ASC');
+        res.json(rows);
     } catch (error) {
+        console.error('[getMajors] Pool error:', error);
         return sendCaughtError(res, error, 'Server error fetching majors.');
     }
 };
@@ -351,7 +339,7 @@ exports.createMajor = async (req, res) => {
         if (!name) {
             return sendValidationError(res, 'Major name is required.', { name: 'Name is required.' });
         }
-        const { data: program } = await supabase.from('programs').select('id').eq('id', programId).maybeSingle();
+        const program = await catalogDb.existsById('programs', programId);
         if (!program) {
             return sendValidationError(res, 'Invalid program selected.', { program_id: 'Program does not exist.' });
         }
@@ -427,8 +415,7 @@ exports.deleteMajor = async (req, res) => {
             );
         }
 
-        const { error } = await supabase.from('majors').delete().eq('id', id);
-        if (error) throw error;
+        await client.query('DELETE FROM majors WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.status(204).send();
@@ -445,14 +432,10 @@ exports.deleteMajor = async (req, res) => {
  */
 exports.getMinors = async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('minors')
-            .select('*')
-            .order('name', { ascending: true });
-        
-        if (error) throw error;
-        res.json(data);
+        const { rows } = await pool.query('SELECT * FROM minors ORDER BY name ASC');
+        res.json(rows);
     } catch (error) {
+        console.error('[getMinors] Pool error:', error);
         return sendCaughtError(res, error, 'Server error fetching minors.');
     }
 };
@@ -471,7 +454,7 @@ exports.createMinor = async (req, res) => {
         if (!name) {
             return sendValidationError(res, 'Minor name is required.', { name: 'Name is required.' });
         }
-        const { data: school } = await supabase.from('schools').select('id').eq('id', schoolId).maybeSingle();
+        const school = await catalogDb.existsById('schools', schoolId);
         if (!school) {
             return sendValidationError(res, 'Invalid school selected.', { school_id: 'School does not exist.' });
         }
@@ -547,8 +530,7 @@ exports.deleteMinor = async (req, res) => {
             );
         }
 
-        const { error } = await supabase.from('minors').delete().eq('id', id);
-        if (error) throw error;
+        await client.query('DELETE FROM minors WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.status(204).send();
@@ -565,14 +547,10 @@ exports.deleteMinor = async (req, res) => {
  */
 exports.getSpecializations = async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('specializations')
-            .select('*')
-            .order('name', { ascending: true });
-        
-        if (error) throw error;
-        res.json(data);
+        const { rows } = await pool.query('SELECT * FROM specializations ORDER BY name ASC');
+        res.json(rows);
     } catch (error) {
+        console.error('[getSpecializations] Pool error:', error);
         return sendCaughtError(res, error, 'Server error fetching specializations.');
     }
 };
@@ -591,7 +569,7 @@ exports.createSpecialization = async (req, res) => {
         if (!name) {
             return sendValidationError(res, 'Specialization name is required.', { name: 'Name is required.' });
         }
-        const { data: program } = await supabase.from('programs').select('id').eq('id', programId).maybeSingle();
+        const program = await catalogDb.existsById('programs', programId);
         if (!program) {
             return sendValidationError(res, 'Invalid program selected.', { program_id: 'Program does not exist.' });
         }
@@ -667,8 +645,7 @@ exports.deleteSpecialization = async (req, res) => {
             );
         }
 
-        const { error } = await supabase.from('specializations').delete().eq('id', id);
-        if (error) throw error;
+        await client.query('DELETE FROM specializations WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.status(204).send();
@@ -685,28 +662,8 @@ exports.deleteSpecialization = async (req, res) => {
  */
 exports.getAcademyOverview = async (req, res) => {
     try {
-        const [
-            { data: schools, error: schoolsErr },
-            { data: programs, error: programsErr },
-            { data: majors, error: majorsErr },
-            { data: minors, error: minorsErr },
-            { data: specializations, error: specErr },
-            { data: students, error: studentsErr }
-        ] = await Promise.all([
-            supabase.from('schools').select('id, name, abbreviation').order('name', { ascending: true }),
-            supabase.from('programs').select('id, school_id, name, graduation_level, min_duration_years, max_duration_years').order('name', { ascending: true }),
-            supabase.from('majors').select('id, program_id, name').order('name', { ascending: true }),
-            supabase.from('minors').select('id, school_id, name').order('name', { ascending: true }),
-            supabase.from('specializations').select('id, program_id, name').order('name', { ascending: true }),
-            supabase.from('student_basic_details').select('school_id, program_id')
-        ]);
-
-        if (schoolsErr) throw schoolsErr;
-        if (programsErr) throw programsErr;
-        if (majorsErr) throw majorsErr;
-        if (minorsErr) throw minorsErr;
-        if (specErr) throw specErr;
-        if (studentsErr) throw studentsErr;
+        const { schools, programs, majors, minors, specializations, students } =
+            await catalogDb.getAcademyOverviewData();
 
         const programList = programs || [];
         const majorList = majors || [];
@@ -1049,31 +1006,31 @@ exports.updatePersonalProfile = async (req, res) => {
 
         // --- 4. FK validation: school_id, program_id, major_id, minor_id, specialization_id ---
         if (updateData.school_id != null) {
-            const { data: school } = await supabase.from('schools').select('id').eq('id', updateData.school_id).maybeSingle();
+            const school = await catalogDb.existsById('schools', updateData.school_id);
             if (!school) {
                 return sendValidationError(res, 'Invalid school selected.', { school_id: 'School does not exist.' });
             }
         }
         if (updateData.program_id != null) {
-            const { data: program } = await supabase.from('programs').select('id').eq('id', updateData.program_id).maybeSingle();
+            const program = await catalogDb.existsById('programs', updateData.program_id);
             if (!program) {
                 return sendValidationError(res, 'Invalid program selected.', { program_id: 'Program does not exist.' });
             }
         }
         if (updateData.major_id != null) {
-            const { data: major } = await supabase.from('majors').select('id').eq('id', updateData.major_id).maybeSingle();
+            const major = await catalogDb.existsById('majors', updateData.major_id);
             if (!major) {
                 return sendValidationError(res, 'Invalid major selected.', { major_id: 'Major does not exist.' });
             }
         }
         if (updateData.minor_id != null) {
-            const { data: minor } = await supabase.from('minors').select('id').eq('id', updateData.minor_id).maybeSingle();
+            const minor = await catalogDb.existsById('minors', updateData.minor_id);
             if (!minor) {
                 return sendValidationError(res, 'Invalid minor selected.', { minor_id: 'Minor does not exist.' });
             }
         }
         if (updateData.specialization_id != null) {
-            const { data: spec } = await supabase.from('specializations').select('id').eq('id', updateData.specialization_id).maybeSingle();
+            const spec = await catalogDb.existsById('specializations', updateData.specialization_id);
             if (!spec) {
                 return sendValidationError(res, 'Invalid specialization selected.', { specialization_id: 'Specialization does not exist.' });
             }
@@ -1082,7 +1039,7 @@ exports.updatePersonalProfile = async (req, res) => {
         // --- 5. Business rules: opt-in one-way, has_agreed_placement_policy, eligibility ---
         if (data.optIn !== undefined || data.opt_in !== undefined) {
             const requestedOptIn = data.optIn === true || data.opt_in === true;
-            const { data: currentRow } = await supabase.from('student_basic_details').select('opt_in').eq('usn', usn).maybeSingle();
+            const currentRow = await studentDb.getBasicByUsn(usn, 'opt_in');
             if (currentRow?.opt_in === true && !requestedOptIn) {
                 // One-way: cannot revert opt-in
                 delete updateData.opt_in;
@@ -1092,7 +1049,7 @@ exports.updatePersonalProfile = async (req, res) => {
                 const merged = { ...updateData };
                 const { data: current } = await supabase
                     .from('student_basic_details')
-                    .select('school_id, program_id, year_of_joining, full_name, personal_email, phone_number')
+                    .select('school_id, program_id, year_of_joining, full_name, personal_email, phone_number, is_placement_eligible, is_capstone_eligible')
                     .eq('usn', usn)
                     .maybeSingle();
                 const effective = { ...current, ...merged };
@@ -1106,8 +1063,13 @@ exports.updatePersonalProfile = async (req, res) => {
                     .eq('program_id', effective.program_id)
                     .eq('joining_year', effective.year_of_joining)
                     .maybeSingle();
-                if (!policy || (!policy.placement && !policy.capstone)) {
-                    return sendError(res, 400, 'Your batch does not allow placement or capstone track.', { errorCode: ERROR_CODES.OPT_IN_ELIGIBILITY });
+
+                // Allow opt-in if BATCH allows it OR STUDENT is individually eligible
+                const isBatchEligible = !!(policy && (policy.placement || policy.capstone));
+                const isStudentEligible = !!(effective.is_placement_eligible || effective.is_capstone_eligible);
+
+                if (!isBatchEligible && !isStudentEligible) {
+                    return sendError(res, 400, 'Your batch does not allow placement or capstone track, and you are not individually marked as eligible.', { errorCode: ERROR_CODES.OPT_IN_ELIGIBILITY });
                 }
                 const hasName = !!(effective.full_name && String(effective.full_name).trim().length >= 2);
                 const hasContact = !!(effective.personal_email && String(effective.personal_email).trim()) ||
@@ -1156,18 +1118,21 @@ exports.updatePersonalProfile = async (req, res) => {
         }
 
         // --- 8. Execute update ---
-        let result = await supabase
-            .from('student_basic_details')
-            .update(updateData)
-            .eq('usn', usn)
-            .select()
-            .single();
-
-        let dbError = result.error;
-        if (dbError && (dbError.code === 'PGRST204' || (dbError.message && dbError.message.includes('profile_image')))) {
-            delete updateData.profile_image;
-            result = await supabase.from('student_basic_details').update(updateData).eq('usn', usn).select().single();
-            dbError = result.error;
+        let updatedRow;
+        let dbError = null;
+        try {
+            updatedRow = await studentDb.updateBasicDetails(usn, updateData);
+        } catch (err) {
+            dbError = err;
+            if (err.message && (err.message.includes('profile_image') || err.code === '42703')) {
+                delete updateData.profile_image;
+                try {
+                    updatedRow = await studentDb.updateBasicDetails(usn, updateData);
+                    dbError = null;
+                } catch (retryErr) {
+                    dbError = retryErr;
+                }
+            }
         }
 
         if (dbError) {
@@ -1177,7 +1142,7 @@ exports.updatePersonalProfile = async (req, res) => {
             return sendCaughtError(res, dbError, 'Failed to update personal profile.');
         }
 
-        res.json(result.data);
+        res.json(updatedRow);
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to update personal profile.');
     }
@@ -1531,7 +1496,7 @@ exports.updateSummerImmersion = async (req, res) => {
             return sendValidationError(res, 'Please correct the errors below.', fieldErrors);
         }
 
-        const { error: delError } = await supabase.from('student_summer_immersion').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_summer_immersion', usn);
         if (delError) {
             return sendCaughtError(res, delError, 'Failed to update Summer Immersion.');
         }
@@ -1666,7 +1631,7 @@ exports.updatePublications = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_publications').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_publications', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update publications.');
             return res.json([]);
         }
@@ -1751,7 +1716,7 @@ exports.updatePublications = async (req, res) => {
             return sendValidationError(res, 'Please correct the errors below.', fieldErrors);
         }
 
-        const { error: delError } = await supabase.from('student_publications').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_publications', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update publications.');
 
         const toInsert = itemsToInsert.map(({ _normTitle, _normDate, _dataIndex, ...rest }) => rest);
@@ -1808,8 +1773,8 @@ exports.updateEducation = async (req, res) => {
         // If both empty, clear both tables
         if (educationHistory.length === 0 && educationGaps.length === 0) {
             const [delHist, delGaps] = await Promise.all([
-                supabase.from('student_education_history').delete().eq('usn', usn),
-                supabase.from('student_education_gaps').delete().eq('usn', usn)
+                studentDb.deleteByUsn('student_education_history', usn),
+                studentDb.deleteByUsn('student_education_gaps', usn)
             ]);
             if (delHist.error) return sendCaughtError(res, delHist.error, 'Failed to update education history.');
             if (delGaps.error) return sendCaughtError(res, delGaps.error, 'Failed to update education gaps.');
@@ -1954,18 +1919,18 @@ exports.updateEducation = async (req, res) => {
 
         // --- 4. Bulk replace: delete + insert ---
         const [delHist, delGaps] = await Promise.all([
-            supabase.from('student_education_history').delete().eq('usn', usn),
-            supabase.from('student_education_gaps').delete().eq('usn', usn)
+            studentDb.deleteByUsn('student_education_history', usn),
+            studentDb.deleteByUsn('student_education_gaps', usn)
         ]);
         if (delHist.error) return sendCaughtError(res, delHist.error, 'Failed to update education history.');
         if (delGaps.error) return sendCaughtError(res, delGaps.error, 'Failed to update education gaps.');
 
         const [insHist, insGaps] = await Promise.all([
             historyToInsert.length > 0
-                ? supabase.from('student_education_history').insert(historyToInsert).select()
+                ? studentDb.insertRows('student_education_history', historyToInsert)
                 : Promise.resolve({ data: [], error: null }),
             gapsToInsert.length > 0
-                ? supabase.from('student_education_gaps').insert(gapsToInsert).select()
+                ? studentDb.insertRows('student_education_gaps', gapsToInsert)
                 : Promise.resolve({ data: [], error: null })
         ]);
 
@@ -2004,7 +1969,7 @@ exports.updateAcademics = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_semester_academics').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_semester_academics', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update academics.');
 
             // Also clear new Postgres-backed semester tables for this student
@@ -2120,7 +2085,7 @@ exports.updateAcademics = async (req, res) => {
         }
 
         // --- 4. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_semester_academics').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_semester_academics', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update academics.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -2207,7 +2172,7 @@ exports.updateExtraCurricular = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_extra_curricular_activities').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_extra_curricular_activities', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update extra-curricular activities.');
             return res.json([]);
         }
@@ -2290,7 +2255,7 @@ exports.updateExtraCurricular = async (req, res) => {
         }
 
         // --- 4. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_extra_curricular_activities').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_extra_curricular_activities', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update extra-curricular activities.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -2764,7 +2729,7 @@ exports.updateInternships = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_internships').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_internships', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update internships.');
             return res.json([]);
         }
@@ -2870,7 +2835,7 @@ exports.updateInternships = async (req, res) => {
         }
 
         // --- 4. Bulk replace ---
-        const { error: delError } = await supabase.from('student_internships').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_internships', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update internships.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -2942,7 +2907,7 @@ exports.updateTrainingsProfile = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_trainings').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_trainings', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update trainings.');
             return res.json([]);
         }
@@ -3018,7 +2983,7 @@ exports.updateTrainingsProfile = async (req, res) => {
         console.log('[updateTrainingsProfile] VALID OK, itemsToInsert count:', itemsToInsert.length, itemsToInsert);
 
         // --- 4. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_trainings').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_trainings', usn);
         if (delError) {
             console.error('[updateTrainingsProfile] DELETE ERROR', delError);
             return sendCaughtError(res, delError, 'Failed to update trainings.');
@@ -3105,7 +3070,7 @@ exports.updateCertifications = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_certifications').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_certifications', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update certifications.');
             return res.json([]);
         }
@@ -3235,7 +3200,7 @@ exports.updateCertifications = async (req, res) => {
         }
 
         // --- 5. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_certifications').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_certifications', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update certifications.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -3321,7 +3286,7 @@ exports.updateParentDetails = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_parent_details').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_parent_details', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update parent/guardian details.');
             return res.json([]);
         }
@@ -3458,7 +3423,7 @@ exports.updateParentDetails = async (req, res) => {
         }
 
         // --- 6. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_parent_details').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_parent_details', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update parent/guardian details.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -3692,7 +3657,7 @@ exports.updateOtherExperiences = async (req, res) => {
         }
 
         if (data.length === 0) {
-            const { error: delError } = await supabase.from('student_other_experiences').delete().eq('usn', usn);
+            const { error: delError } = await studentDb.deleteByUsn('student_other_experiences', usn);
             if (delError) return sendCaughtError(res, delError, 'Failed to update other experiences.');
             return res.json([]);
         }
@@ -3783,7 +3748,7 @@ exports.updateOtherExperiences = async (req, res) => {
         }
 
         // --- 5. Bulk replace: delete + insert ---
-        const { error: delError } = await supabase.from('student_other_experiences').delete().eq('usn', usn);
+        const { error: delError } = await studentDb.deleteByUsn('student_other_experiences', usn);
         if (delError) return sendCaughtError(res, delError, 'Failed to update other experiences.');
 
         if (itemsToInsert.length === 0) return res.json([]);
@@ -3828,7 +3793,7 @@ exports.addStudent = async (req, res) => {
         const usn = normalizeUsn(body.usn);
         if (!usn) return sendValidationError(res, 'usn is required.');
 
-        const { data: existing } = await supabase.from('student_basic_details').select('usn').eq('usn', usn).maybeSingle();
+        const existing = await studentDb.existsBasicByUsn(usn);
         if (existing) {
             return sendConflict(res, 'A student with this USN already exists.');
         }
@@ -3876,8 +3841,7 @@ exports.addStudent = async (req, res) => {
         if (normCode !== undefined) row.phone_country_code = normCode;
         if (normNumber !== undefined) row.phone_number = normNumber;
 
-        const { data: inserted, error } = await supabase.from('student_basic_details').insert(row).select().single();
-        if (error) throw error;
+        const inserted = await studentDb.insertBasicDetails(row);
         res.status(201).json(inserted);
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to add student.');
@@ -3906,7 +3870,7 @@ exports.checkBulkDuplicates = async (req, res) => {
 
         let duplicateUsnsInDb = [];
         if (uniqueUsns.length > 0) {
-            const { data: existing } = await supabase.from('student_basic_details').select('usn').in('usn', uniqueUsns);
+            const existing = await studentDb.getExistingUsns(uniqueUsns);
             duplicateUsnsInDb = (existing || []).map((r) => r.usn);
         }
 
@@ -4002,8 +3966,7 @@ exports.bulkInsertStudents = async (req, res) => {
             return sendValidationError(res, 'Every row must have usn, full_name, college_email, year_of_joining.');
         }
 
-        const { data: inserted, error } = await supabase.from('student_basic_details').insert(rows).select('usn');
-        if (error) throw error;
+        const inserted = await studentDb.insertBasicDetailsBulk(rows, 'usn');
         res.status(201).json({ inserted: inserted || [], count: (inserted || []).length });
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to bulk insert students.');

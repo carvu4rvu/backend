@@ -8,29 +8,35 @@ process.on('uncaughtException', (err) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('[FATAL] unhandledRejection - promise:', promise);
-  console.error('[FATAL] reason:', reason?.message || reason);
+  console.error('[WARN] unhandledRejection (process continues):', reason?.message || reason);
   if (reason && typeof reason === 'object' && reason.stack) {
     console.error(reason.stack);
   }
 });
 
-process.on('SIGTERM', () => {
-  console.log('[SERVER] SIGTERM received - shutting down');
+async function shutdown(signal) {
+  console.log(`[SERVER] ${signal} received - shutting down`);
+  await gracefulPoolShutdown();
   process.exit(0);
+}
+
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM').catch(() => process.exit(0));
 });
 
 process.on('SIGINT', () => {
-  console.log('[SERVER] SIGINT received - shutting down');
-  process.exit(0);
+  shutdown('SIGINT').catch(() => process.exit(0));
 });
 
 const express = require('express');
 const morgan = require('morgan');
 const cors = require('cors');
 const pool = require('./config/db');
-const supabase = require('./config/supabaseClient');
+const { gracefulPoolShutdown } = require('./config/db');
 const { isUsingSendGrid } = require('./services/emailService');
+const { withExponentialRetry } = require('./utils/connectivityRetry');
+const { probeStorageAtStartup } = require('./services/supabaseHealthService');
+const { validateDatabaseUrl } = require('./utils/supabaseDiagnostics');
 
 // hello
 
@@ -96,8 +102,10 @@ const ensureResumeFileColumn = require('./migrations/ensureResumeFileColumn');
 const ensureIsApprovedColumn = require('./migrations/ensureIsApprovedColumn');
 const ensureAlumniLikedProjectIds = require('./migrations/ensureAlumniLikedProjectIds');
 const ensureEventsStatusColumn = require('./migrations/ensureEventsStatusColumn');
+const ensureEligibilityCriteriaColumn = require('./migrations/ensureEligibilityCriteriaColumn');
 const ensureNotificationNodesRecipientEntityId = require('./migrations/ensureNotificationNodesRecipientEntityId');
 const ensureProjectsVisibilityPublicLink = require('./migrations/ensureProjectsVisibilityPublicLink');
+const ensurePlacementPerformanceIndexes = require('./migrations/ensurePlacementPerformanceIndexes');
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/placement', placementRoutes);
@@ -118,11 +126,24 @@ app.get('/', (req, res) => {
   res.send('health');
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
+app.get('/api/health', async (req, res) => {
+  const { checkPostgres, checkStorage } = require('./services/supabaseHealthService');
+  const [database, storage] = await Promise.all([
+    checkPostgres(),
+    checkStorage({ attempts: 1, timeoutMs: 8000 }),
+  ]);
+  const status =
+    database.status === 'ok' && storage.status === 'ok'
+      ? 'ok'
+      : database.status === 'ok'
+        ? 'degraded'
+        : 'unhealthy';
+  res.status(status === 'unhealthy' ? 503 : 200).json({
+    status,
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
+    database: { status: database.status, latencyMs: database.latencyMs },
+    storage: { status: storage.status, latencyMs: storage.latencyMs },
   });
 });
 
@@ -147,24 +168,13 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
   const fs = require('fs');
   const path = require('path');
 
-  const connectWithRetry = async (name, connectFn, attempts = 3) => {
-    for (let i = 1; i <= attempts; i++) {
-      try {
-        await connectFn();
-        console.log(`${name} connected ✅`);
-        return;
-      } catch (err) {
-        console.error(`${name} connect failed (Attempt ${i}/${attempts}) ❌`, err.message);
-        if (i === attempts) {
-          throw new Error(`${name} failed after ${attempts} attempts: ${err.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
-  };
-
   try {
     console.log(`Server listening on 0.0.0.0:${PORT}`);
+
+    const dbUrlCheck = validateDatabaseUrl(process.env.DATABASE_URL);
+    if (dbUrlCheck.warning) {
+      console.warn(`[startup] ${dbUrlCheck.warning}`);
+    }
 
     if (process.env.NODE_ENV === 'production') {
       const required = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
@@ -182,40 +192,65 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       console.log('Public directory exists ✅');
     }
 
-    await connectWithRetry('database', async () => {
-      const client = await pool.connect();
-      client.release();
-    });
+    const dbProbe = await withExponentialRetry(
+      'database',
+      async () => {
+        const client = await pool.connect();
+        try {
+          await client.query('SELECT 1');
+        } finally {
+          client.release();
+        }
+      },
+      {
+        attempts: 5,
+        baseDelayMs: 1500,
+        timeoutMs: 10000,
+        onAttemptError: ({ attempt, attempts, err, elapsedMs }) => {
+          console.error(
+            `database connect failed (attempt ${attempt}/${attempts}) after ${elapsedMs}ms:`,
+            err.message
+          );
+        },
+      }
+    );
+
+    if (!dbProbe.ok) {
+      throw dbProbe.error || new Error('database connection failed');
+    }
+    console.log(`database connected ✅ (${dbProbe.latencyMs}ms)`);
 
     await ensureProfileImageColumn();
     await ensureResumeFileColumn();
     await ensureIsApprovedColumn();
     await ensureAlumniLikedProjectIds();
     await ensureEventsStatusColumn();
+    await ensureEligibilityCriteriaColumn();
     await ensureNotificationNodesRecipientEntityId();
     await ensureProjectsVisibilityPublicLink();
-
-    if (process.env.NODE_ENV === 'production') {
-      await connectWithRetry('supabase storage', async () => {
-        const { error } = await supabase.storage.listBuckets();
-        if (error) throw error;
-      });
-    } else {
-      try {
-        await connectWithRetry('supabase storage', async () => {
-          const { error } = await supabase.storage.listBuckets();
-          if (error) throw error;
-        });
-      } catch (err) {
-        console.warn('[startup] supabase storage unavailable in development; continuing without storage health check');
-      }
+    try {
+      await ensurePlacementPerformanceIndexes();
+    } catch (idxErr) {
+      console.warn('[startup] placement performance indexes:', idxErr.message);
     }
 
+    // Storage is optional at startup — never terminate the process if REST/Storage is down.
+    await probeStorageAtStartup();
+
     if (process.env.NODE_ENV !== 'production' && !isUsingSendGrid()) {
-      const transporter = require('./config/smtp');
-      await connectWithRetry('smtp', async () => {
-        await transporter.verify();
-      });
+      const smtpProbe = await withExponentialRetry(
+        'smtp',
+        async () => {
+          const transporter = require('./config/smtp');
+          await transporter.verify();
+        },
+        { attempts: 3, baseDelayMs: 2000 }
+      );
+      if (smtpProbe.ok) {
+        console.log(`smtp connected ✅ (${smtpProbe.latencyMs}ms)`);
+      } else {
+        console.warn('[startup] smtp unavailable; email features may fail until SMTP is reachable');
+      }
     }
   } catch (err) {
     console.error('Startup failed:', err.message);

@@ -90,6 +90,18 @@ router.get(
   authorizeRoles('admin'),
   studentEditControlController.getProfileLocks
 );
+router.get(
+  '/students/profile-locks/batch-count',
+  authenticateToken,
+  authorizeRoles('admin'),
+  studentEditControlController.getBatchLockCount
+);
+router.post(
+  '/students/profile-locks/batch-update',
+  authenticateToken,
+  authorizeRoles('admin'),
+  studentEditControlController.batchUpdateProfileLocks
+);
 router.post(
   '/students/profile-locks/sync',
   authenticateToken,
@@ -172,7 +184,7 @@ router.post('/job-offers', authenticateToken, authorizeRoles('admin'), addJobOff
 router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin'), placementController.updateJobOffer);
 
 // Dashboard Stats (admin and VC - VC can only view dashboard)
-router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardStats);
+router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardOfferStats);
 
 // Placement Reports (admin)
 router.get('/reports', authenticateToken, authorizeRoles('admin'), placementReportsController.getPlacementReport);
