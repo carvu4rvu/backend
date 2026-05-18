@@ -44,6 +44,7 @@ router.get('/companies/:id/offers', placementController.getCompanyOffers);
 router.post('/drives/:driveId/apply', authenticateToken, placementController.applyToDrive);
 
 router.get('/students', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getStudentsForPlacement);
+router.get('/dashboard/analytics', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardAnalytics);
 router.get('/dashboard-stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardStats);
 router.get('/students/overview', authenticateToken, placementController.getPlacementOverview);
 router.get('/students/overview-table', authenticateToken, authorizeRoles('admin'), placementController.getStudentsOverviewTable);

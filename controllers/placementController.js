@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const placementDb = require('../db/placementDb');
+const dashboardDb = require('../db/dashboardDb');
 const catalogDb = require('../db/catalogDb');
 const policiesDb = require('../db/policiesDb');
 const alumniDb = require('../db/alumniDb');
@@ -302,49 +303,50 @@ async function attachPlacementStats(list, usns) {
   });
 }
 
-/** Attach active placement-violation and disciplinary counts per USN (for process list highlighting). */
-async function attachComplianceFlags(rows) {
+/** Attach drive-scoped compliance details for process list highlighting (category-aware). */
+async function attachDriveComplianceDetails(rows, driveId) {
   if (!rows?.length) return rows;
+  const violationsDb = require('../db/violationsDb');
+  const { buildComplianceSummary } = require('../utils/complianceCategories');
+
   const usns = [...new Set(rows.map((r) => r.usn).filter(Boolean))];
   if (!usns.length) return rows;
 
-  const perUsn = {};
-  usns.forEach((u) => {
-    perUsn[u] = { placement_violations: 0, disciplinary: 0 };
-  });
+  const { violationsByUsn, disciplinaryByUsn } = await violationsDb.getDriveComplianceMaps(usns, driveId);
 
-  for (const chunk of chunkArray(usns)) {
-    const [violRes, discRes] = await Promise.all([
-      pool.query(
-        `SELECT usn, COUNT(*)::int AS cnt FROM student_placement_violations
-         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
-        [chunk]
-      ),
-      pool.query(
-        `SELECT usn, COUNT(*)::int AS cnt FROM student_disciplinary_records
-         WHERE usn = ANY($1::text[]) AND is_active = true GROUP BY usn`,
-        [chunk]
-      ),
-    ]);
-    (violRes.rows || []).forEach((v) => {
-      if (perUsn[v.usn]) perUsn[v.usn].placement_violations = v.cnt;
-    });
-    (discRes.rows || []).forEach((d) => {
-      if (perUsn[d.usn]) perUsn[d.usn].disciplinary = d.cnt;
-    });
-  }
+  const stats = { malpractice: 0, placement_policy: 0, disciplinary: 0, none: 0 };
 
-  return rows.map((row) => {
-    const agg = perUsn[row.usn] || { placement_violations: 0, disciplinary: 0 };
-    const placementViolations = agg.placement_violations ?? 0;
-    const disciplinary = agg.disciplinary ?? 0;
+  const enriched = rows.map((row) => {
+    const placementViolations = violationsByUsn[row.usn] || [];
+    const disciplinaryRecords = disciplinaryByUsn[row.usn] || [];
+    const compliance = buildComplianceSummary({
+      malpracticeFlag: row.malpractice === true,
+      placementViolations,
+      disciplinaryRecords,
+      driveId,
+    });
+
+    if (compliance.primary_category === 'malpractice') stats.malpractice += 1;
+    else if (compliance.primary_category === 'disciplinary') stats.disciplinary += 1;
+    else if (compliance.primary_category === 'placement_policy') stats.placement_policy += 1;
+    else stats.none += 1;
+
     return {
       ...row,
-      placement_violations: placementViolations,
-      disciplinary,
-      has_compliance_issue: placementViolations > 0 || disciplinary > 0,
+      compliance,
+      compliance_labels: compliance.labels,
+      placement_violations: placementViolations.length,
+      disciplinary: disciplinaryRecords.length,
+      has_compliance_issue: compliance.has_compliance_issue,
     };
   });
+
+  logger.info(
+    `[compliance] drive=${driveId} rows=${rows.length} malpractice=${stats.malpractice} ` +
+      `placement_policy=${stats.placement_policy} disciplinary=${stats.disciplinary} clean=${stats.none}`
+  );
+
+  return enriched;
 }
 
 /** Evaluate student against eligibility_criteria rules (from placements_drives). */
@@ -901,7 +903,10 @@ exports.getDriveRegistrations = async (req, res) => {
         drive: driveSnippet,
       };
     });
-    rows = await attachComplianceFlags(rows);
+    const { enrichProcessRoundDisplays } = require('../utils/placementRoundProgression');
+    const processRounds = sanitizeProcessRounds(driveRow.process_rounds);
+    rows = await attachDriveComplianceDetails(rows, driveId);
+    rows = rows.map((row) => enrichProcessRoundDisplays(row, processRounds));
     res.json(rows);
   } catch (err) {
     logger.error('getDriveRegistrations:', err);
@@ -926,6 +931,14 @@ exports.getDriveExportData = async (req, res) => {
     if (stage === 'approved') {
       processes = processes.filter((p) => String(p.registration_status || '').toLowerCase() === 'registered');
     }
+
+    const { rows: driveMetaRows } = await pool.query(
+      'SELECT process_rounds FROM placements_drives WHERE id = $1',
+      [driveId]
+    );
+    const exportProcessRounds = sanitizeProcessRounds(driveMetaRows[0]?.process_rounds);
+    const { formatStatusForExport } = require('../utils/placementRoundProgression');
+    processes = await attachDriveComplianceDetails(processes, driveId);
 
     const usns = [...new Set(processes.map((p) => p.usn).filter(Boolean))];
     if (usns.length === 0) return res.json({ data: [], columns: [] });
@@ -1030,16 +1043,16 @@ exports.getDriveExportData = async (req, res) => {
         brief_summary: profile.brief_summary || null,
         key_expertise: profile.key_expertise || null,
         career_objective: profile.career_objective || null,
-        registration_status: proc.registration_status || null,
-        approved_status: proc.approved_status || null,
+        registration_status: formatStatusForExport(proc, 'registration_status', exportProcessRounds),
+        approved_status: formatStatusForExport(proc, 'approved_status', exportProcessRounds),
         is_eligible: proc.is_eligible ?? null,
-        oa_status: proc.oa_status ?? null,
-        gd_status: proc.gd_status ?? null,
-        technical_round_status: proc.technical_round_status ?? null,
-        interview_status: proc.interview_status ?? null,
-        hr_round_status: proc.hr_round_status ?? null,
-        final_select_status: proc.final_select_status ?? null,
-        malpractice: proc.malpractice ?? null,
+        oa_status: formatStatusForExport(proc, 'oa_status', exportProcessRounds),
+        gd_status: formatStatusForExport(proc, 'gd_status', exportProcessRounds),
+        technical_round_status: formatStatusForExport(proc, 'technical_round_status', exportProcessRounds),
+        interview_status: formatStatusForExport(proc, 'interview_status', exportProcessRounds),
+        hr_round_status: formatStatusForExport(proc, 'hr_round_status', exportProcessRounds),
+        final_select_status: proc.final_select_status === true ? 'SELECTED' : proc.final_select_status === false ? 'NOT SELECTED' : 'PENDING',
+        malpractice: proc.malpractice === true ? 'YES' : 'NO',
         remarks: proc.remarks || null,
       };
     });
@@ -1468,18 +1481,29 @@ exports.upsertDriveEligibility = async (req, res) => {
  */
 exports.getDashboardStats = async (req, res) => {
   try {
-    const totalRegisteredRes = await pool.query('SELECT count(*) FROM student_basic_details');
-    const totalSeekingRes = await pool.query('SELECT count(*) FROM student_basic_details WHERE opt_in = true');
-    const totalEligibleRes = await pool.query('SELECT count(*) FROM student_basic_details WHERE is_placement_eligible = true');
-
+    const headline = await dashboardDb.getStudentHeadlineCounts();
     res.json({
-      total_registered: parseInt(totalRegisteredRes.rows[0].count, 10),
-      total_seeking: parseInt(totalSeekingRes.rows[0].count, 10),
-      total_eligible: parseInt(totalEligibleRes.rows[0].count, 10),
+      total_registered: headline.total_registered,
+      total_seeking: headline.total_seeking,
+      total_eligible: headline.total_eligible,
     });
   } catch (err) {
     logger.error('getDashboardStats:', err);
     res.status(500).json({ message: 'Server error fetching dashboard stats' });
+  }
+};
+
+/**
+ * GET /placement/dashboard/analytics
+ * Full placement dashboard metrics aggregated in PostgreSQL (no paginated student fetch).
+ */
+exports.getDashboardAnalytics = async (req, res) => {
+  try {
+    const data = await dashboardDb.getDashboardAnalytics();
+    res.json(data);
+  } catch (err) {
+    logger.error('getDashboardAnalytics:', err);
+    res.status(500).json({ message: apiMessage(err, 'Server error fetching dashboard analytics') });
   }
 };
 

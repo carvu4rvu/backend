@@ -1,4 +1,4 @@
-const { queryMany, queryOne, pool } = require('./query');
+const { queryMany, queryOne, pool, chunkArray } = require('./query');
 
 async function getEligibilityDecisionLogs() {
   return queryMany(
@@ -99,10 +99,57 @@ function shapeViolationRow(row) {
   };
 }
 
+/**
+ * Load active violations scoped to a placement drive (or global policy rows with null drive_id).
+ * Disciplinary records are student-wide (not drive-scoped).
+ */
+async function getDriveComplianceMaps(usns, driveId) {
+  const violationsByUsn = {};
+  const disciplinaryByUsn = {};
+  if (!usns?.length) return { violationsByUsn, disciplinaryByUsn };
+
+  usns.forEach((u) => {
+    violationsByUsn[u] = [];
+    disciplinaryByUsn[u] = [];
+  });
+
+  const driveIdNum = driveId != null ? parseInt(driveId, 10) : null;
+
+  for (const chunk of chunkArray(usns, 400)) {
+    const violParams = [chunk];
+    let violSql = `
+      SELECT usn, placement_drive_id, violation_type, penalty_type, penalty_days, remarks, created_at
+      FROM student_placement_violations
+      WHERE usn = ANY($1::text[]) AND is_active = true`;
+    if (driveIdNum != null && !Number.isNaN(driveIdNum)) {
+      violSql += ` AND (placement_drive_id = $2 OR placement_drive_id IS NULL)`;
+      violParams.push(driveIdNum);
+    }
+    const [violRes, discRes] = await Promise.all([
+      pool.query(violSql, violParams),
+      pool.query(
+        `SELECT usn, violation_type, severity, description, start_date, end_date, created_at
+         FROM student_disciplinary_records
+         WHERE usn = ANY($1::text[]) AND is_active = true`,
+        [chunk]
+      ),
+    ]);
+    (violRes.rows || []).forEach((v) => {
+      if (violationsByUsn[v.usn]) violationsByUsn[v.usn].push(v);
+    });
+    (discRes.rows || []).forEach((d) => {
+      if (disciplinaryByUsn[d.usn]) disciplinaryByUsn[d.usn].push(d);
+    });
+  }
+
+  return { violationsByUsn, disciplinaryByUsn };
+}
+
 module.exports = {
   getEligibilityDecisionLogs,
   getPlacementViolations,
   getDisciplinaryRecords,
+  getDriveComplianceMaps,
   insertPlacementViolation,
   insertEligibilityDecisionLog,
   insertDisciplinaryRecord,
