@@ -131,6 +131,26 @@ function isSupabaseUrl(url) {
 const PROJECTS_BUCKET = 'projects';
 const VARIANT_FOLDER = 'project-variants';
 
+/** Event cover image: system-assets/events/{eventId}.jpg (public bucket) */
+async function uploadEventImage(buffer, eventId) {
+  const bucket = 'system-assets';
+  const storagePath = `events/${String(eventId).replace(/[^0-9]/g, '')}.jpg`;
+
+  try {
+    const { error } = await supabase.storage.from(bucket).upload(storagePath, buffer, {
+      contentType: getContentType(storagePath),
+      upsert: true,
+    });
+    if (error) throw error;
+
+    const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const publicUrl = `${baseUrl}/storage/v1/object/public/${bucket}/${storagePath}`;
+    return { url: publicUrl, path: storagePath, bucket };
+  } catch (err) {
+    throw wrapStorageError(err, 'uploadEventImage', { bucket, path: storagePath });
+  }
+}
+
 async function uploadVariant(buffer, assetId, variantType) {
   const sanitized = String(variantType || 'variant').replace(/[^A-Z0-9_]/gi, '_').toUpperCase() || 'variant';
   const storagePath = `${VARIANT_FOLDER}/${assetId}/${sanitized}.webp`;
@@ -152,6 +172,7 @@ async function uploadVariant(buffer, assetId, variantType) {
 
 module.exports = {
   upload,
+  uploadEventImage,
   getSignedUrl,
   getBucket,
   generateRandomFileName,

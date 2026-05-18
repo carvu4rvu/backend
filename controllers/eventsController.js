@@ -1,4 +1,23 @@
 const { pool, queryOne, queryMany } = require('../db/query');
+const storageService = require('../services/storageService');
+
+function normalizeImages(images) {
+  if (Array.isArray(images)) return images;
+  if (images && typeof images === 'object') return Object.values(images).filter(Boolean);
+  return [];
+}
+
+function withEventImageUrl(ev) {
+  const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  return {
+    ...ev,
+    images: normalizeImages(ev.images),
+    image_url:
+      baseUrl && ev.id
+        ? `${baseUrl}/storage/v1/object/public/system-assets/events/${ev.id}.jpg`
+        : null,
+  };
+}
 
 /**
  * List events. Optional ?status=scheduled|ongoing|completed|failed
@@ -14,7 +33,7 @@ exports.list = async (req, res) => {
     }
     sql += ' ORDER BY event_datetime ASC';
     const rows = await queryMany(sql, params);
-    res.json(rows);
+    res.json(rows.map(withEventImageUrl));
   } catch (err) {
     console.error('Events list error:', err);
     res.status(500).json({ message: err.message || 'Failed to list events' });
@@ -64,7 +83,7 @@ exports.getById = async (req, res) => {
     const { id } = req.params;
     const data = await queryOne('SELECT * FROM events WHERE id = $1', [id]);
     if (!data) return res.status(404).json({ message: 'Event not found' });
-    res.json(data);
+    res.json(withEventImageUrl(data));
   } catch (err) {
     console.error('Events getById error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch event' });
@@ -130,6 +149,40 @@ exports.update = async (req, res) => {
   } catch (err) {
     console.error('Events update error:', err);
     res.status(500).json({ message: err.message || 'Failed to update event' });
+  }
+};
+
+/**
+ * POST /events/:id/image — upload cover image to system-assets/events/{id}.jpg
+ */
+exports.uploadImage = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'No file uploaded. Use multipart field name "file".' });
+    }
+    const event = await queryOne('SELECT id FROM events WHERE id = $1', [id]);
+    if (!event) return res.status(404).json({ message: 'Event not found' });
+
+    const { url, path: storagePath, bucket } = await storageService.uploadEventImage(file.buffer, id);
+
+    await pool.query(
+      `UPDATE events SET images = $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [id, JSON.stringify([url])]
+    );
+
+    res.json({
+      message: 'Event image uploaded',
+      url,
+      path: storagePath,
+      bucket,
+      image_url: url,
+    });
+  } catch (err) {
+    console.error('Events uploadImage error:', err);
+    const msg = err.userMessage || err.message || 'Failed to upload event image';
+    res.status(500).json({ message: msg });
   }
 };
 

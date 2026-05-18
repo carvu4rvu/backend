@@ -5,6 +5,7 @@
  * Requires: .env with SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
  */
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+const pool = require('../config/db');
 const supabase = require('../config/supabaseClient');
 
 const BUCKET = 'system-assets';
@@ -18,15 +19,7 @@ async function fetchImage(url) {
 }
 
 async function main() {
-  const { data: events, error: listError } = await supabase
-    .from('events')
-    .select('id, title')
-    .order('id', { ascending: true });
-
-  if (listError) {
-    console.error('Failed to list events:', listError.message);
-    process.exit(1);
-  }
+  const { rows: events } = await pool.query('SELECT id, title FROM events ORDER BY id ASC');
 
   if (!events?.length) {
     console.log('No events found. Create events first (e.g. run seedAlumniEventsAndNotifications.js).');
@@ -54,7 +47,11 @@ async function main() {
   console.log('\nDone. Set VITE_SUPABASE_URL in frontend .env to your Supabase URL so event images load.');
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await pool.end();
+  });
