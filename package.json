@@ -1,0 +1,45 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "nodemon server.js",
+    "start:node": "node server.js",
+    "dev": "nodemon server.js",
+    "seed:students": "node scripts/seedStudents.js",
+    "seed:companies": "node scripts/seedCompanies.js",
+    "seed:placement": "node scripts/seedPlacementData.js",
+    "seed:academic": "node scripts/seedAcademicCatalog.js",
+    "seed:socse-bsc-academics": "node scripts/seedSocseBscStudentAcademics.js",
+    "seed:students:full": "node scripts/seedStudentsFullProfiles.js",
+    "seed:roles": "node scripts/seedRoleCredentials.js",
+    "storage:test": "node ../scripts/test-storage-connectivity.js",
+    "storage:migrate": "node ../scripts/migrate-to-supabase-storage.js",
+    "storage:verify": "node ../scripts/verify-db-storage-urls.js",
+    "ensure:project-share-links": "node scripts/ensureProjectShareLinks.js",
+    "upload:event-images": "node scripts/uploadEventImagesToSystemAssets.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@sendgrid/mail": "^8.1.6",
+    "@supabase/supabase-js": "^2.93.1",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^7.0.13",
+    "pg": "^8.17.2",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
