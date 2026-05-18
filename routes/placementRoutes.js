@@ -18,7 +18,7 @@ router.get('/offers/:usn', authenticateToken, placementController.getStudentOffe
 router.patch('/offers/decision', authenticateToken, placementController.submitOfferDecision);
 router.get('/process/list', authenticateToken, authorizeRoles('admin'), placementController.getAllProcessList);
 router.patch('/process/:id', authenticateToken, authorizeRoles('admin'), placementController.updateProcessStatus);
-router.get('/drives', authenticateToken, placementController.getAllDrives);
+router.get('/drives', placementController.getAllDrives);
 router.post('/drives/sync-status', authenticateToken, authorizeRoles('admin'), placementController.syncDriveStatuses);
 router.get('/drives/:driveId/registrations', authenticateToken, authorizeRoles('admin'), placementController.getDriveRegistrations);
 router.get('/drives/:driveId/export', authenticateToken, authorizeRoles('admin'), placementController.getDriveExportData);
@@ -149,6 +149,7 @@ router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles(
 router.get('/vc/events', authenticateToken, authorizeRoles('vc'), placementController.getVcEvents);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
+router.get('/drives', authenticateToken, placementController.getAllDrives);
 
 // Violations: eligibility logs, placement violations, disciplinary records
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);
@@ -157,6 +158,9 @@ router.get('/violations/disciplinary-records', authenticateToken, authorizeRoles
 router.post('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.createEligibilityDecisionLog);
 router.post('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.createPlacementViolation);
 router.post('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.createDisciplinaryRecord);
+router.put('/violations/eligibility-logs/:id', authenticateToken, authorizeRoles('admin'), violationsController.updateEligibilityDecisionLog);
+router.put('/violations/placement-violations/:id', authenticateToken, authorizeRoles('admin'), violationsController.updatePlacementViolation);
+router.put('/violations/disciplinary-records/:id', authenticateToken, authorizeRoles('admin'), violationsController.updateDisciplinaryRecord);
 
 // Job Offers - ensure handlers exist before registering (avoids "argument handler must be a function" crash)
 const getAllJobOffersHandler = placementController.getAllJobOffers;
