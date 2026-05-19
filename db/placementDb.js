@@ -250,6 +250,29 @@ async function getOfferWithPlacement(offerId) {
   );
 }
 
+async function getOfferByPlacementId(placementId) {
+  return queryOne(
+    `SELECT o.*,
+            row_to_json(p.*) AS placement,
+            c.company_name AS placement_company_name
+     FROM offers o
+     INNER JOIN placement p ON p.id = o.placement_id
+     LEFT JOIN companies c ON c.id = p.company_id
+     WHERE o.placement_id = $1`,
+    [placementId]
+  );
+}
+
+async function getPlacementById(placementId) {
+  return queryOne(
+    `SELECT p.*, c.company_name
+     FROM placement p
+     LEFT JOIN companies c ON c.id = p.company_id
+     WHERE p.id = $1`,
+    [placementId]
+  );
+}
+
 async function updateOffer(id, fields) {
   const keys = Object.keys(fields);
   const sets = keys.map((k, i) => `${k} = $${i + 2}`);
@@ -392,34 +415,127 @@ async function deleteCompany(id) {
   await pool.query('DELETE FROM companies WHERE id = $1', [id]);
 }
 
-async function getAllJobOffersRows() {
-  const { rows } = await pool.query(`
-    SELECT
-      o.id, o.student_id, o.company_id, o.placement_id, o.capstone_id, o.job_type AS offer_job_type,
-      o.academic_year AS offer_academic_year, o.remarks AS offer_remarks,
-      o.created_at AS offer_created_at, o.updated_at AS offer_updated_at,
-      p.designation AS placement_designation, p.offer_letter_status AS placement_offer_letter_status,
-      p.job_description AS placement_job_description, p.ctc_min_lpa AS placement_ctc_min_lpa,
-      p.ctc_max_lpa AS placement_ctc_max_lpa, p.ctc_variable_pay AS placement_ctc_variable_pay,
-      p.ctc_stock_in_lpa AS placement_ctc_stock_in_lpa, p.type_of_hiring AS placement_type_of_hiring,
-      p.academic_year AS placement_academic_year, p.remarks AS placement_remarks,
-      cap.company_name AS capstone_company_name, cap.internship_duration_months AS capstone_internship_duration_months,
-      cap.designation AS capstone_designation, cap.offer_letter_status AS capstone_offer_letter_status,
-      cap.internship_stipend_min AS capstone_internship_stipend_min, cap.internship_stipend_max AS capstone_internship_stipend_max,
-      cap.description AS capstone_description, cap.academic_year AS capstone_academic_year, cap.remarks AS capstone_remarks,
-      sbd.usn, sbd.full_name AS student_name, sbd.year_of_joining AS batch,
-      sch.name AS school, sch.abbreviation AS school_abbr, prg.name AS program,
-      COALESCE(oc.company_name, pc.company_name, cap.company_name) AS company_name
-    FROM offers o
+const JOB_OFFERS_SELECT = `
+      o.id,
+      o.is_accepted,
+      o.student_id,
+      COALESCE(o.company_id, p.company_id) AS company_id,
+      o.placement_id,
+      o.capstone_id,
+      o.job_type AS offer_job_type,
+      o.academic_year AS offer_academic_year,
+      o.remarks AS offer_remarks,
+      o.created_at AS offer_created_at,
+      o.updated_at AS offer_updated_at,
+      p.designation AS placement_designation,
+      p.offer_letter_status AS placement_offer_letter_status,
+      p.job_description AS placement_job_description,
+      p.ctc_min_lpa AS placement_ctc_min_lpa,
+      p.ctc_max_lpa AS placement_ctc_max_lpa,
+      p.ctc_variable_pay AS placement_ctc_variable_pay,
+      p.ctc_stock_in_lpa AS placement_ctc_stock_in_lpa,
+      p.type_of_hiring AS placement_type_of_hiring,
+      p.academic_year AS placement_academic_year,
+      p.remarks AS placement_remarks,
+      cap.company_name AS capstone_company_name,
+      cap.internship_duration_months AS capstone_internship_duration_months,
+      cap.designation AS capstone_designation,
+      cap.offer_letter_status AS capstone_offer_letter_status,
+      cap.internship_stipend_min AS capstone_internship_stipend_min,
+      cap.internship_stipend_max AS capstone_internship_stipend_max,
+      cap.description AS capstone_description,
+      cap.academic_year AS capstone_academic_year,
+      cap.remarks AS capstone_remarks,
+      sbd.usn,
+      sbd.full_name AS student_name,
+      sbd.year_of_joining AS batch,
+      sch.name AS school,
+      sch.abbreviation AS school_abbr,
+      prg.name AS program,
+      COALESCE(oc.company_name, pc.company_name, cap.company_name) AS company_name`;
+
+const JOB_OFFERS_JOINS = `
     LEFT JOIN placement p ON p.id = o.placement_id
     LEFT JOIN capstone cap ON cap.id = o.capstone_id
     LEFT JOIN companies oc ON oc.id = o.company_id
     LEFT JOIN companies pc ON pc.id = p.company_id
     LEFT JOIN student_basic_details sbd ON sbd.usn = o.student_id
     LEFT JOIN schools sch ON sch.id = sbd.school_id
-    LEFT JOIN programs prg ON prg.id = sbd.program_id
+    LEFT JOIN programs prg ON prg.id = sbd.program_id`;
+
+async function getAllJobOffersRows() {
+  const { rows } = await pool.query(`
+    SELECT ${JOB_OFFERS_SELECT}
+    FROM offers o
+    ${JOB_OFFERS_JOINS}
     ORDER BY o.created_at DESC NULLS LAST
   `);
+  return rows;
+}
+
+/** All job offers for one company (offers rows + placements without an offers link). */
+async function getCompanyJobOffersRows(companyId) {
+  const { rows } = await pool.query(
+    `
+    SELECT * FROM (
+      SELECT ${JOB_OFFERS_SELECT}, true AS from_offers_table
+      FROM offers o
+      ${JOB_OFFERS_JOINS}
+      WHERE COALESCE(o.company_id, p.company_id) = $1
+
+      UNION ALL
+
+      SELECT
+        NULL::bigint AS id,
+        NULL::boolean AS is_accepted,
+        p.student_id,
+        p.company_id AS company_id,
+        p.id AS placement_id,
+        NULL::bigint AS capstone_id,
+        p.type_of_hiring AS offer_job_type,
+        p.academic_year AS offer_academic_year,
+        p.remarks AS offer_remarks,
+        p.created_at AS offer_created_at,
+        p.updated_at AS offer_updated_at,
+        p.designation AS placement_designation,
+        p.offer_letter_status AS placement_offer_letter_status,
+        p.job_description AS placement_job_description,
+        p.ctc_min_lpa AS placement_ctc_min_lpa,
+        p.ctc_max_lpa AS placement_ctc_max_lpa,
+        p.ctc_variable_pay AS placement_ctc_variable_pay,
+        p.ctc_stock_in_lpa AS placement_ctc_stock_in_lpa,
+        p.type_of_hiring AS placement_type_of_hiring,
+        p.academic_year AS placement_academic_year,
+        p.remarks AS placement_remarks,
+        NULL::text AS capstone_company_name,
+        NULL::int AS capstone_internship_duration_months,
+        NULL::text AS capstone_designation,
+        NULL::text AS capstone_offer_letter_status,
+        NULL::numeric AS capstone_internship_stipend_min,
+        NULL::numeric AS capstone_internship_stipend_max,
+        NULL::text AS capstone_description,
+        NULL::text AS capstone_academic_year,
+        NULL::text AS capstone_remarks,
+        sbd.usn,
+        sbd.full_name AS student_name,
+        sbd.year_of_joining AS batch,
+        sch.name AS school,
+        sch.abbreviation AS school_abbr,
+        prg.name AS program,
+        c.company_name AS company_name,
+        false AS from_offers_table
+      FROM placement p
+      LEFT JOIN offers o ON o.placement_id = p.id
+      LEFT JOIN companies c ON c.id = p.company_id
+      LEFT JOIN student_basic_details sbd ON sbd.usn = p.student_id
+      LEFT JOIN schools sch ON sch.id = sbd.school_id
+      LEFT JOIN programs prg ON prg.id = sbd.program_id
+      WHERE p.company_id = $1 AND o.id IS NULL
+    ) combined
+    ORDER BY offer_created_at DESC NULLS LAST
+    `,
+    [companyId]
+  );
   return rows;
 }
 
@@ -540,10 +656,14 @@ async function getAcademicsByUsns(usns) {
      ) AS has_records`
   );
   const table = meta[0]?.has_records ? 'student_semester_records' : 'student_semester_academics';
-  const sgpaCol = table === 'student_semester_records' ? 'sgpa' : 'result_in_sgpa';
+  const useRecords = table === 'student_semester_records';
+  const sgpaCol = useRecords ? 'COALESCE(cgpa, sgpa)' : 'result_in_sgpa';
+  const liveBacklogsCol = useRecords ? 'COALESCE(active_backlogs, 0)' : 'COALESCE(live_backlogs, 0)';
+  const closedBacklogsCol = useRecords ? 'COALESCE(cleared_backlogs, 0)' : 'COALESCE(closed_backlogs, 0)';
   return forEachChunk(usns, (chunk) =>
     queryMany(
-      `SELECT usn, academic_year, semester, ${sgpaCol} AS result_in_sgpa, live_backlogs, closed_backlogs
+      `SELECT usn, academic_year, semester, ${sgpaCol} AS result_in_sgpa,
+              ${liveBacklogsCol} AS live_backlogs, ${closedBacklogsCol} AS closed_backlogs
        FROM ${table} WHERE usn = ANY($1::text[])
        ORDER BY academic_year DESC NULLS LAST, semester DESC NULLS LAST`,
       [chunk]
@@ -834,6 +954,9 @@ module.exports = {
   updateCompany,
   deleteCompany,
   getAllJobOffersRows,
+  getCompanyJobOffersRows,
+  getOfferByPlacementId,
+  getPlacementById,
   getOverviewStatsForUsns,
   getExportProcessRows,
   getStudentsBasicByUsns,

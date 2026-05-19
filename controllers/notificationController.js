@@ -35,19 +35,49 @@ exports.list = async (req, res) => {
     }
 
     const whereClause = `WHERE ${conditions.join(' AND ')}`;
-    const countQuery = `SELECT COUNT(*)::int AS total FROM notifications n ${whereClause}`;
+
+    // One row per unique title + message + type (merged broadcast)
+    const countQuery = `
+      SELECT COUNT(*)::int AS total FROM (
+        SELECT 1
+        FROM notifications n
+        ${whereClause}
+        GROUP BY n.title, n.message, n.notification_type
+      ) merged
+    `;
     const countResult = await pool.query(countQuery, params);
     const total = countResult.rows[0]?.total ?? 0;
 
     params.push(limitVal, offset);
     const listQuery = `
-      SELECT n.id, n.title, n.message, n.link,
-             n.visible_from, n.visible_until, n.target_type, n.target_role, n.created_by, n.reason,
-             n.created_at, n.notification_type,
-             (SELECT COUNT(*)::int FROM notification_nodes nn WHERE nn.notification_id = n.id) AS recipient_count
-      FROM notifications n
-      ${whereClause}
-      ORDER BY n.created_at DESC
+      WITH filtered AS (
+        SELECT n.id, n.title, n.message, n.link,
+               n.visible_from, n.visible_until, n.target_type, n.target_role, n.created_by, n.reason,
+               n.created_at, n.notification_type
+        FROM notifications n
+        ${whereClause}
+      ),
+      with_counts AS (
+        SELECT f.*,
+          (SELECT COUNT(*)::int FROM notification_nodes nn WHERE nn.notification_id = f.id) AS recipient_count,
+          (SELECT COUNT(*)::int FROM notification_nodes nn WHERE nn.notification_id = f.id AND COALESCE(nn.delivered, false) = true) AS delivered_count,
+          (SELECT COUNT(*)::int FROM notification_nodes nn WHERE nn.notification_id = f.id AND COALESCE(nn.is_read, false) = true) AS read_count
+        FROM filtered f
+      )
+      SELECT
+        MIN(w.created_at) AS created_at,
+        w.title,
+        w.message,
+        w.notification_type,
+        MIN(w.id) AS id,
+        ARRAY_AGG(w.id ORDER BY w.created_at ASC) AS notification_ids,
+        COALESCE(SUM(w.recipient_count), 0)::int AS recipient_count,
+        COALESCE(SUM(w.delivered_count), 0)::int AS delivered_count,
+        COALESCE(SUM(w.read_count), 0)::int AS read_count,
+        COUNT(*)::int AS merge_count
+      FROM with_counts w
+      GROUP BY w.title, w.message, w.notification_type
+      ORDER BY MIN(w.created_at) DESC
       LIMIT $${idx} OFFSET $${idx + 1}
     `;
     const listResult = await pool.query(listQuery, params);

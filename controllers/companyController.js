@@ -7,6 +7,39 @@ const logger = require('../utils/logger');
  * Helper: Get company_id from authenticated user (uses pool = same DB as auth).
  * user_login has company_id linked to companies.id
  */
+/** Latest semester academics (records table or legacy academics table). */
+async function getLatestSemesterAcademics(usn) {
+  const { rows: meta } = await pool.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'student_semester_records'
+     ) AS has_records`
+  );
+  const useRecords = Boolean(meta[0]?.has_records);
+  if (useRecords) {
+    const { rows } = await pool.query(
+      `SELECT academic_year, semester,
+              COALESCE(cgpa, sgpa) AS result_in_sgpa,
+              COALESCE(active_backlogs, 0) AS live_backlogs
+       FROM student_semester_records
+       WHERE usn = $1
+       ORDER BY academic_year DESC NULLS LAST, semester DESC NULLS LAST
+       LIMIT 1`,
+      [usn]
+    );
+    return rows[0] || null;
+  }
+  const { rows } = await pool.query(
+    `SELECT academic_year, semester, result_in_sgpa, live_backlogs
+     FROM student_semester_academics
+     WHERE usn = $1
+     ORDER BY academic_year DESC NULLS LAST, semester DESC NULLS LAST
+     LIMIT 1`,
+    [usn]
+  );
+  return rows[0] || null;
+}
+
 async function getCompanyIdFromUser(req) {
   const userId = req.user?.id ?? req.user?.user_id;
   if (!userId) return null;
@@ -246,8 +279,8 @@ exports.getDrives = async (req, res) => {
                 pd.job_description, pd.job_location, pd.ctc_structure, pd.stipend_structure,
                 pd.process_rounds, pd.number_of_openings, pd.number_of_registrations,
                 pd.placement_status, pd.last_date_to_registration, pd.event_datetime,
-                pd.onboarded_date, pd.tpo, pd.company_remarks, pd.created_at,
-                c.company_name
+                pd.onboarded_date, pd.tpo, pd.company_remarks, pd.eligibility_criteria, pd.created_at,
+                c.company_name, c.company_logo_link
          FROM placements_drives pd
          LEFT JOIN companies c ON c.id = pd.company_id
          WHERE pd.company_id = $1
@@ -255,8 +288,8 @@ exports.getDrives = async (req, res) => {
         [cid]
       );
       rows = (driveResult.rows || []).map((r) => {
-        const { company_name, ...rest } = r;
-        return { ...rest, company: company_name != null ? { company_name } : null };
+        const { company_name, company_logo_link, ...rest } = r;
+        return { ...rest, company: company_name != null ? { company_name, company_logo_link } : null };
       });
     } catch (poolErr) {
       logger.error('getDrives pool query error:', poolErr);
@@ -368,15 +401,15 @@ exports.getDriveById = async (req, res) => {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      `SELECT pd.*, c.company_name
+      `SELECT pd.*, c.company_name, c.company_logo_link
        FROM placements_drives pd
        LEFT JOIN companies c ON c.id = pd.company_id
        WHERE pd.id = $1 AND pd.company_id = $2`,
       [id, companyId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Drive not found' });
-    const { company_name, ...rest } = rows[0];
-    res.json({ data: { ...rest, company: company_name != null ? { company_name } : null, company_name } });
+    const { company_name, company_logo_link, ...rest } = rows[0];
+    res.json({ data: { ...rest, company: company_name != null ? { company_name, company_logo_link } : null, company_name, company_logo_link } });
   } catch (err) {
     logger.error('getDriveById error:', err);
     res.status(500).json({ error: 'Failed to fetch drive details' });
@@ -605,15 +638,7 @@ exports.getStudentProfile = async (req, res) => {
     );
     const profile = profileRes.rows[0] || null;
 
-    const semesterRes = await pool.query(
-      `SELECT academic_year, semester, result_in_sgpa, live_backlogs
-       FROM student_semester_academics
-       WHERE usn = $1
-       ORDER BY academic_year DESC NULLS LAST, semester DESC NULLS LAST
-       LIMIT 1`,
-      [usn]
-    );
-    const semesterRows = semesterRes.rows;
+    const latestAcad = await getLatestSemesterAcademics(usn);
 
     // Public projects only (projects table)
     const projRes = await pool.query(
@@ -676,7 +701,7 @@ exports.getStudentProfile = async (req, res) => {
     const tenthEdu = eduList.find(e => (e.education_level || '').toUpperCase() === '10TH');
     const twelfthEdu = eduList.find(e => (e.education_level || '').toUpperCase() === '12TH');
     const diplomaEdu = eduList.find(e => (e.education_level || '').toUpperCase() === 'DIPLOMA');
-    const latestAcad = Array.isArray(semesterRows) && semesterRows.length > 0 ? semesterRows[0] : null;
+    // latestAcad already resolved above
 
     const formatDob = (d) => {
       if (!d) return null;
@@ -1183,9 +1208,10 @@ exports.getDashboardStats = async (req, res) => {
     );
     const drives = drivesRes.rows;
 
-    const activeDrives = (drives || []).filter(d =>
-      d.placement_status && !['completed', 'cancelled'].includes(d.placement_status.toLowerCase())
-    );
+    const activeDrives = (drives || []).filter((d) => {
+      const status = String(d.placement_status || 'scheduled').toLowerCase();
+      return !['completed', 'closed', 'cancelled', 'failed'].includes(status);
+    });
 
     const totalRegistrations = (drives || []).reduce((sum, d) => sum + (d.number_of_registrations || 0), 0);
 
@@ -1209,7 +1235,11 @@ exports.getDashboardStats = async (req, res) => {
     const chart_offers = { accepted: acceptedOffers, pending: pendingOffers };
 
     // Chart: drives by status (for doughnut)
-    const driveStatusCounts = { active: activeDrives.length, completed: (drives || []).length - activeDrives.length };
+    const completedDrives = (drives || []).filter((d) => {
+      const status = String(d.placement_status || '').toLowerCase();
+      return ['completed', 'closed'].includes(status);
+    });
+    const driveStatusCounts = { active: activeDrives.length, completed: completedDrives.length };
 
     // Recent activity: recent registrations
     const driveIds = (drives || []).map(d => d.id);

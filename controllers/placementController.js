@@ -571,21 +571,27 @@ exports.getStudentOffers = async (req, res) => {
 
     const list = placements.map((p) => {
       const offer = offerByPlacementId[p.id];
+      const isAccepted = offer?.is_accepted;
+      let displayStatus = p.offer_letter_status;
+      if (isAccepted === false) displayStatus = 'Declined';
+      else if (isAccepted === true) displayStatus = displayStatus || 'Accepted';
       return {
         id: p.id,
+        placement_id: p.id,
         offer_id: offer?.id ?? null,
         student_id: p.student_id,
         usn: p.student_id,
+        company_id: p.company_id,
         company_name: p.company_name,
         designation: p.designation,
-        offer_letter_status: p.offer_letter_status,
+        offer_letter_status: displayStatus,
         ctc_min_lpa: p.ctc_min_lpa,
         ctc_max_lpa: p.ctc_max_lpa,
         type_of_hiring: p.type_of_hiring,
         academic_year: p.academic_year,
         remarks: p.remarks,
-        is_accepted: offer?.is_accepted,
-        offer_remarks: offer?.remarks
+        is_accepted: isAccepted,
+        offer_remarks: offer?.remarks,
       };
     });
 
@@ -597,27 +603,143 @@ exports.getStudentOffers = async (req, res) => {
 };
 
 /**
- * PATCH /offers/decision
+ * Map DB row to job-offers API shape (admin list + company page).
+ */
+function mapJobOfferRow(r) {
+  const letterStatus =
+    r.placement_offer_letter_status || r.capstone_offer_letter_status || 'Pending';
+  let displayStatus = letterStatus;
+  if (r.is_accepted === false) displayStatus = 'Declined';
+  else if (r.is_accepted === true && !['Accepted', 'Issued'].includes(letterStatus)) {
+    displayStatus = 'Accepted';
+  } else if (letterStatus === 'Rejected' || letterStatus === 'Declined') {
+    displayStatus = 'Declined';
+  }
+
+  const offerRowId = r.id != null ? r.id : null;
+  const placementId = r.placement_id != null ? r.placement_id : null;
+
+  return {
+    id: offerRowId ?? placementId,
+    offer_row_id: offerRowId,
+    placement_id: placementId,
+    from_offers_table: r.from_offers_table !== false,
+    student_id: r.student_id,
+    placement_id_linked: placementId,
+    capstone_id: r.capstone_id,
+    offer_job_type: r.offer_job_type,
+    offer_academic_year: r.offer_academic_year,
+    offer_remarks: r.offer_remarks,
+    offer_created_at: r.offer_created_at,
+    offer_updated_at: r.offer_updated_at,
+    usn: r.usn || r.student_id,
+    student_name: r.student_name || '',
+    batch: r.batch,
+    school: r.school || r.school_abbr || '',
+    program: r.program || '',
+    company_id: r.company_id,
+    company_name: r.company_name || '',
+    placement_designation: r.placement_designation,
+    placement_offer_letter_status: r.placement_offer_letter_status,
+    placement_job_description: r.placement_job_description,
+    placement_ctc_min_lpa: r.placement_ctc_min_lpa,
+    placement_ctc_max_lpa: r.placement_ctc_max_lpa,
+    placement_ctc_variable_pay: r.placement_ctc_variable_pay,
+    placement_ctc_stock_in_lpa: r.placement_ctc_stock_in_lpa,
+    placement_type_of_hiring: r.placement_type_of_hiring,
+    placement_academic_year: r.placement_academic_year,
+    placement_remarks: r.placement_remarks,
+    capstone_company_name: r.capstone_company_name,
+    capstone_internship_duration_months: r.capstone_internship_duration_months,
+    capstone_designation: r.capstone_designation,
+    capstone_offer_letter_status: r.capstone_offer_letter_status,
+    capstone_internship_stipend_min: r.capstone_internship_stipend_min,
+    capstone_internship_stipend_max: r.capstone_internship_stipend_max,
+    capstone_description: r.capstone_description,
+    capstone_academic_year: r.capstone_academic_year,
+    capstone_remarks: r.capstone_remarks,
+    designation: r.placement_designation || r.capstone_designation || null,
+    job_type: r.offer_job_type || r.placement_type_of_hiring || (r.capstone_id ? 'capstone' : 'full time'),
+    ctc_min_lpa: r.placement_ctc_min_lpa,
+    ctc_max_lpa: r.placement_ctc_max_lpa,
+    ctc: r.placement_ctc_max_lpa || r.placement_ctc_min_lpa || null,
+    ctc_variable_pay: r.placement_ctc_variable_pay,
+    offer_letter_status: displayStatus,
+    is_accepted: r.is_accepted,
+    academic_year: r.offer_academic_year || r.placement_academic_year || r.capstone_academic_year || null,
+    remarks: r.offer_remarks || r.placement_remarks || r.capstone_remarks || null,
+    internship_duration: r.capstone_internship_duration_months,
+    internship_stipend_min: r.capstone_internship_stipend_min,
+    internship_stipend_max: r.capstone_internship_stipend_max,
+    created_at: r.offer_created_at,
+    updated_at: r.offer_updated_at,
+    source: r.capstone_id ? 'capstone' : r.placement_id ? 'placement' : 'offer',
+  };
+}
+
+/**
+ * PATCH /offers/decision — accept or decline (offer_id or placement_id from student UI).
  */
 exports.submitOfferDecision = async (req, res) => {
   try {
     const authUsn = req.user?.usn;
-    const { offer_id, is_accepted } = req.body;
+    const body = req.body || {};
+    const offerIdParam = body.offer_id ?? body.placement_id;
+    const { is_accepted, remarks } = body;
 
     if (!authUsn) return res.status(401).json({ message: 'Unauthorized' });
-    if (!offer_id) return res.status(400).json({ message: 'Offer ID required' });
+    if (!offerIdParam) return res.status(400).json({ message: 'Offer ID required' });
 
-    const offerRow = await placementDb.getOfferWithPlacement(offer_id);
+    const isAccepted = is_accepted === true || String(is_accepted) === 'true';
+
+    let offerRow = await placementDb.getOfferWithPlacement(offerIdParam);
+    if (!offerRow && body.placement_id) {
+      offerRow = await placementDb.getOfferByPlacementId(body.placement_id);
+    }
+
+    let resolvedOfferId = offerRow?.id;
+
+    if (!offerRow && body.placement_id) {
+      const placementRow = await placementDb.getPlacementById(body.placement_id);
+      if (!placementRow) return res.status(404).json({ message: 'Offer not found' });
+      if (String(placementRow.student_id) !== String(authUsn)) {
+        return res.status(403).json({ message: 'Not your offer' });
+      }
+      const created = await placementDb.insertOffer({
+        student_id: placementRow.student_id,
+        company_id: placementRow.company_id,
+        placement_id: placementRow.id,
+        job_type: placementRow.type_of_hiring || 'full time',
+        academic_year: placementRow.academic_year,
+        remarks: remarks || placementRow.remarks || null,
+        is_accepted: isAccepted,
+      });
+      resolvedOfferId = created.id;
+      offerRow = await placementDb.getOfferWithPlacement(resolvedOfferId);
+    }
+
     if (!offerRow) return res.status(404).json({ message: 'Offer not found' });
-    if (String(offerRow.student_id) !== String(authUsn)) return res.status(403).json({ message: 'Not your offer' });
+    if (String(offerRow.student_id) !== String(authUsn)) {
+      return res.status(403).json({ message: 'Not your offer' });
+    }
 
     const placementRow = offerRow.placement;
     const companyName = offerRow.placement_company_name || placementRow?.company_name;
-    const isAccepted = is_accepted === true || String(is_accepted) === 'true';
 
-    await placementDb.updateOffer(offer_id, { is_accepted: isAccepted });
+    const offerUpdate = { is_accepted: isAccepted };
+    if (remarks != null && String(remarks).trim()) offerUpdate.remarks = String(remarks).trim();
+    await placementDb.updateOffer(resolvedOfferId, offerUpdate);
+
+    if (!isAccepted && placementRow?.id) {
+      await placementDb.updatePlacement(placementRow.id, {
+        offer_letter_status: 'Declined',
+      });
+    }
 
     if (isAccepted && placementRow) {
+      await placementDb.updatePlacement(placementRow.id, {
+        offer_letter_status: 'Accepted',
+      });
       const capstoneRow = await placementDb.insertCapstone({
         usn: authUsn,
         company_name: companyName || 'Company',
@@ -629,7 +751,7 @@ exports.submitOfferDecision = async (req, res) => {
         remarks: placementRow.remarks || null,
       });
       if (capstoneRow?.id) {
-        await placementDb.updateOffer(offer_id, { capstone_id: capstoneRow.id });
+        await placementDb.updateOffer(resolvedOfferId, { capstone_id: capstoneRow.id });
       }
     }
 
@@ -2152,22 +2274,8 @@ exports.getCompanyOffers = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    const placements = await placementDb.getCompanyPlacements(id);
-    const offers = placements.map((p) => {
-      const ctc = [p.ctc_min_lpa, p.ctc_max_lpa].filter((x) => x != null);
-      const ctcStr = ctc.length ? ctc.join('–') : '-';
-      return {
-        id: p.id,
-        usn: p.student_id,
-        student_name: p.full_name || null,
-        school: p.school_name || '-',
-        ctc: ctcStr,
-        job_type: p.type_of_hiring || '-',
-        designation: p.designation || '-',
-        offer_letter_status: p.offer_letter_status || '-',
-      };
-    });
-    res.json(offers);
+    const rows = await placementDb.getCompanyJobOffersRows(id);
+    res.json(rows.map(mapJobOfferRow));
   } catch (error) {
     logger.error('Error fetching company offers:', error);
     res.status(500).json({ message: 'Server error' });
@@ -3378,60 +3486,7 @@ exports.deleteRegistrationCode = async (req, res) => {
 exports.getAllJobOffers = async (req, res) => {
   try {
     const rows = await placementDb.getAllJobOffersRows();
-    const results = rows.map((r) => ({
-      id: r.id,
-      offer_id: r.id,
-      student_id: r.student_id,
-      placement_id: r.placement_id,
-      capstone_id: r.capstone_id,
-      offer_job_type: r.offer_job_type,
-      offer_academic_year: r.offer_academic_year,
-      offer_remarks: r.offer_remarks,
-      offer_created_at: r.offer_created_at,
-      offer_updated_at: r.offer_updated_at,
-      usn: r.usn || r.student_id,
-      student_name: r.student_name || '',
-      batch: r.batch,
-      school: r.school || r.school_abbr || '',
-      program: r.program || '',
-      company_id: r.company_id,
-      company_name: r.company_name || '',
-      placement_designation: r.placement_designation,
-      placement_offer_letter_status: r.placement_offer_letter_status,
-      placement_job_description: r.placement_job_description,
-      placement_ctc_min_lpa: r.placement_ctc_min_lpa,
-      placement_ctc_max_lpa: r.placement_ctc_max_lpa,
-      placement_ctc_variable_pay: r.placement_ctc_variable_pay,
-      placement_ctc_stock_in_lpa: r.placement_ctc_stock_in_lpa,
-      placement_type_of_hiring: r.placement_type_of_hiring,
-      placement_academic_year: r.placement_academic_year,
-      placement_remarks: r.placement_remarks,
-      capstone_company_name: r.capstone_company_name,
-      capstone_internship_duration_months: r.capstone_internship_duration_months,
-      capstone_designation: r.capstone_designation,
-      capstone_offer_letter_status: r.capstone_offer_letter_status,
-      capstone_internship_stipend_min: r.capstone_internship_stipend_min,
-      capstone_internship_stipend_max: r.capstone_internship_stipend_max,
-      capstone_description: r.capstone_description,
-      capstone_academic_year: r.capstone_academic_year,
-      capstone_remarks: r.capstone_remarks,
-      designation: r.placement_designation || r.capstone_designation || null,
-      job_type: r.offer_job_type || r.placement_type_of_hiring || (r.capstone_id ? 'capstone' : 'full time'),
-      ctc_min_lpa: r.placement_ctc_min_lpa,
-      ctc_max_lpa: r.placement_ctc_max_lpa,
-      ctc: r.placement_ctc_max_lpa || r.placement_ctc_min_lpa || null,
-      ctc_variable_pay: r.placement_ctc_variable_pay,
-      offer_letter_status: r.placement_offer_letter_status || r.capstone_offer_letter_status || 'Pending',
-      academic_year: r.offer_academic_year || r.placement_academic_year || r.capstone_academic_year || null,
-      remarks: r.offer_remarks || r.placement_remarks || r.capstone_remarks || null,
-      internship_duration: r.capstone_internship_duration_months,
-      internship_stipend_min: r.capstone_internship_stipend_min,
-      internship_stipend_max: r.capstone_internship_stipend_max,
-      created_at: r.offer_created_at,
-      updated_at: r.offer_updated_at,
-      source: r.capstone_id ? 'capstone' : (r.placement_id ? 'placement' : 'offer'),
-    }));
-    res.json(results);
+    res.json(rows.map(mapJobOfferRow));
   } catch (err) {
     logger.error('[placement] getAllJobOffers:', err);
     res.status(500).json({ message: apiMessage(err, 'Failed to fetch job offers') });
@@ -3517,9 +3572,29 @@ exports.updateJobOffer = async (req, res) => {
 
     const b = req.body;
 
-    // First, get the existing offer to find linked placement/capstone
-    const existingOffer = await placementDb.getOfferById(offerId);
+    // Resolve offers row, or placement-only record (no row in offers table yet)
+    let existingOffer = await placementDb.getOfferById(offerId);
     if (!existingOffer) {
+      const placementOnly = await placementDb.getPlacementById(offerId);
+      if (placementOnly) {
+        const placementUpdate = {};
+        if (b.company_id !== undefined) placementUpdate.company_id = b.company_id;
+        if (b.designation !== undefined) placementUpdate.designation = b.designation;
+        if (b.offer_letter_status !== undefined) placementUpdate.offer_letter_status = b.offer_letter_status;
+        if (b.job_description !== undefined) placementUpdate.job_description = b.job_description;
+        if (b.ctc_min_lpa !== undefined) placementUpdate.ctc_min_lpa = b.ctc_min_lpa;
+        if (b.ctc_max_lpa !== undefined) placementUpdate.ctc_max_lpa = b.ctc_max_lpa;
+        if (b.ctc_variable_pay !== undefined) placementUpdate.ctc_variable_pay = b.ctc_variable_pay;
+        if (b.ctc_stock_in_lpa !== undefined) placementUpdate.ctc_stock_in_lpa = b.ctc_stock_in_lpa;
+        if (b.type_of_hiring !== undefined) placementUpdate.type_of_hiring = b.type_of_hiring;
+        if (b.academic_year !== undefined) placementUpdate.academic_year = b.academic_year;
+        if (b.remarks !== undefined) placementUpdate.remarks = b.remarks;
+
+        if (Object.keys(placementUpdate).length > 0) {
+          await placementDb.updatePlacement(offerId, placementUpdate);
+        }
+        return res.json({ message: 'Job offer updated successfully' });
+      }
       return res.status(404).json({ message: 'Offer not found' });
     }
 
