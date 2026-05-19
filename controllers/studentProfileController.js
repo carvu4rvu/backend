@@ -2479,11 +2479,25 @@ exports.updateProjects = async (req, res) => {
             }
             const priority = item.priority;
             const projectSnaps = item.project_snaps ?? item.projectSnaps ?? [];
-            const snapsArr = Array.isArray(projectSnaps)
+            let snapsArr = Array.isArray(projectSnaps)
                 ? projectSnaps.filter((s) => s != null && String(s).trim() !== '')
                 : typeof projectSnaps === 'string' && projectSnaps.trim()
                     ? [projectSnaps.trim()]
                     : [];
+            // 1 cover (index 0) + up to 4 gallery; cover must not repeat in gallery
+            const MAX_GALLERY_SNAPS = 4;
+            const MAX_TOTAL_SNAPS = 1 + MAX_GALLERY_SNAPS;
+            if (snapsArr.length > 0) {
+                const coverUrl = snapsArr[0];
+                const galleryOnly = snapsArr
+                    .slice(1)
+                    .filter((u) => u && String(u).trim() !== '' && u !== coverUrl)
+                    .slice(0, MAX_GALLERY_SNAPS);
+                snapsArr = [coverUrl, ...galleryOnly];
+            }
+            if (snapsArr.length > MAX_TOTAL_SNAPS) {
+                fieldErrors[key('project_snaps')] = `Maximum ${MAX_TOTAL_SNAPS} images allowed (1 cover + ${MAX_GALLERY_SNAPS} gallery).`;
+            }
             const hostedLink = item.hosted_link ?? item.hostedLink ?? '';
             const githubRepo = item.github_repo ?? item.githubRepo ?? '';
 
