@@ -1,216 +1,235 @@
-const reportsDb = require('../db/placementReportsDb');
+const { buildPlacementReport } = require('../services/placementReportBuilder');
+const { buildPlacementReportExcel } = require('../services/placementReportExcelService');
+const historyDb = require('../db/placementReportsHistoryDb');
+const storageService = require('../services/storageService');
 const logger = require('../utils/logger');
 
+function parseDates(req) {
+  const dateFrom = req.query.dateFrom || req.query.date_from || req.body?.dateFrom || req.body?.date_from || null;
+  const dateTo = req.query.dateTo || req.query.date_to || req.body?.dateTo || req.body?.date_to || null;
+  return { dateFrom, dateTo };
+}
+
+function defaultReportName(dateFrom, dateTo) {
+  if (dateFrom && dateTo) return `Placement Report ${dateFrom} to ${dateTo}`;
+  return `Placement Report ${new Date().toISOString().slice(0, 10)}`;
+}
+
+function dateOnly(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val.toISOString().slice(0, 10);
+  return String(val).slice(0, 10);
+}
+
+function formatFileSize(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function mapHistoryRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    reportName: row.report_name,
+    reportType: row.report_type,
+    generatedBy: row.generated_by,
+    fromDate: row.from_date,
+    toDate: row.to_date,
+    storagePath: row.storage_path,
+    fileUrl: row.file_url,
+    fileSize: row.file_size,
+    fileSizeLabel: formatFileSize(Number(row.file_size)),
+    generatedAt: row.generated_at,
+    status: row.status,
+    filters: row.filters_json,
+  };
+}
+
 /**
- * GET /placement/reports?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
- * Returns a comprehensive placement report for the date range.
+ * GET /placement/reports?dateFrom=&dateTo=
+ * Preview report JSON (no persistence).
  */
 exports.getPlacementReport = async (req, res) => {
   try {
-    const dateFrom = req.query.dateFrom || req.query.date_from || null;
-    const dateTo = req.query.dateTo || req.query.date_to || null;
-    const fromTs = dateFrom ? `${dateFrom}T00:00:00.000Z` : null;
-    const toTs = dateTo ? `${dateTo}T23:59:59.999Z` : null;
-
-    const data = await reportsDb.fetchReportData(fromTs, toTs);
-    const {
-      placements,
-      offers,
-      drives,
-      companies,
-      students,
-      processRows,
-      eligibilityLogs,
-      violations,
-      disciplinary,
-      events,
-      hrRecs,
-      schools,
-      programs,
-      totalPlaced,
-      drivesForProcess,
-      studentNames,
-      studentProfiles,
-      studentInterns,
-      studentProjs,
-      studentCerts,
-    } = data;
-
-    const schoolMap = schools.reduce((acc, s) => {
-      acc[s.id] = s.name;
-      return acc;
-    }, {});
-    const programMap = programs.reduce((acc, p) => {
-      acc[p.id] = p.name;
-      return acc;
-    }, {});
-
-    const eligibleCount = students.filter((s) => s.is_placement_eligible || s.is_summer_internship_eligible).length;
-    const optedInCount = students.filter((s) => s.opt_in).length;
-    const placedCount = placements.length;
-
-    const placementsWithCtc = placements
-      .map((p) => {
-        const ctc = p.ctc_max_lpa != null ? Number(p.ctc_max_lpa) : p.ctc_min_lpa != null ? Number(p.ctc_min_lpa) : null;
-        return { ...p, ctc, company: { company_name: p.company_name } };
-      })
-      .filter((p) => p.ctc != null);
-    const ctcValues = placementsWithCtc.map((p) => p.ctc).sort((a, b) => a - b);
-    const avgCtc = ctcValues.length > 0 ? ctcValues.reduce((a, b) => a + b, 0) / ctcValues.length : 0;
-    const medianCtc = ctcValues.length > 0 ? ctcValues[Math.floor(ctcValues.length / 2)] : 0;
-    const maxCtc = ctcValues.length > 0 ? Math.max(...ctcValues) : 0;
-    const minCtc = ctcValues.length > 0 ? Math.min(...ctcValues) : 0;
-
-    const ctcDistribution = {
-      under3: ctcValues.filter((c) => c < 3).length,
-      between3and5: ctcValues.filter((c) => c >= 3 && c < 5).length,
-      between5and8: ctcValues.filter((c) => c >= 5 && c < 8).length,
-      above8: ctcValues.filter((c) => c >= 8).length,
-    };
-
-    const registered = processRows.filter((p) => p.registration_status === 'registered' || p.registration_status).length;
-    const applied = processRows.length;
-    const attended = processRows.filter((p) => p.attendance === 'present').length;
-    const selected = processRows.filter((p) => p.final_select_status === true).length;
-
-    const driveIds = [...new Set(processRows.map((p) => p.placement_drive_id).filter(Boolean))];
-    const driveStats = driveIds.map((driveId) => {
-      const rows = processRows.filter((p) => p.placement_drive_id === driveId);
-      const drive = drivesForProcess.find((d) => d.id === driveId) || drives.find((d) => d.id === driveId);
-      const regs = rows.filter((r) => r.registration_status || r.registration_status === 'registered').length || rows.length;
-      const interviewed = rows.filter((r) => r.attendance === 'present').length;
-      const sel = rows.filter((r) => r.final_select_status === true).length;
-      const conv = regs > 0 ? ((sel / regs) * 100).toFixed(1) : 0;
-      return {
-        driveId,
-        company: drive?.company_name || drive?.company?.company_name || 'Unknown',
-        registrations: regs,
-        interviewed,
-        selected: sel,
-        conversionRate: conv,
-      };
-    });
-
-    const newCompaniesInPeriod = companies.length;
-    const placementsByCompany = placements.reduce((acc, p) => {
-      const name = p.company_name || 'Unknown';
-      if (!acc[name]) acc[name] = [];
-      acc[name].push(p);
-      return acc;
-    }, {});
-
-    const nameMap = studentNames.reduce((acc, s) => {
-      acc[s.usn] = s.full_name;
-      return acc;
-    }, {});
-
-    const placementList = placements
-      .map((p) => ({
-        usn: p.student_id,
-        studentName: nameMap[p.student_id] || p.student_id,
-        company: p.company_name || 'Unknown',
-        designation: p.designation,
-        ctcMin: p.ctc_min_lpa,
-        ctcMax: p.ctc_max_lpa,
-        typeOfHiring: p.type_of_hiring,
-        academicYear: p.academic_year,
-        createdAt: p.created_at,
-      }))
-      .sort((a, b) => (a.studentName || '').localeCompare(b.studentName || ''));
-
-    const usns = students.map((s) => s.usn).filter(Boolean);
-    const withResume = studentProfiles.length;
-    const withInternship = new Set(studentInterns.map((i) => i.usn)).size;
-    const withProject = new Set(studentProjs.map((p) => p.usn)).size;
-    const withCert = new Set(studentCerts.map((c) => c.usn)).size;
-
-    const report = {
-      meta: {
-        dateFrom: dateFrom || null,
-        dateTo: dateTo || null,
-        generatedAt: new Date().toISOString(),
-      },
-      executiveSnapshot: {
-        totalEligible: eligibleCount,
-        totalOptedIn: optedInCount,
-        placedThisPeriod: placedCount,
-        placedCumulative: totalPlaced,
-        placementRate: eligibleCount > 0 ? ((placedCount / eligibleCount) * 100).toFixed(1) : 0,
-        avgCtc: Math.round(avgCtc * 100) / 100,
-        medianCtc: Math.round(medianCtc * 100) / 100,
-        maxCtc: Math.round(maxCtc * 100) / 100,
-        minCtc: Math.round(minCtc * 100) / 100,
-        companiesOnboarded: newCompaniesInPeriod,
-        activeDrives: drives.filter((d) => {
-          const s = String(d.placement_status || '').toLowerCase();
-          return s === 'ongoing' || s === 'upcoming' || s === 'scheduled';
-        }).length,
-        pendingOffers: offers.filter((o) => o.is_accepted === null || o.is_accepted === false).length,
-      },
-      pipelineHealth: {
-        registered: registered || applied,
-        eligible: eligibleCount,
-        applied,
-        interviewed: attended,
-        selected,
-        placed: placedCount,
-      },
-      drivePerformance: driveStats,
-      companyPortfolio: {
-        newCompaniesAdded: newCompaniesInPeriod,
-        companiesWithPlacements: Object.keys(placementsByCompany).length,
-        placementsByCompany: Object.entries(placementsByCompany).map(([name, arr]) => ({
-          company: name,
-          count: arr.length,
-        })),
-      },
-      offerAnalytics: {
-        ctcDistribution,
-        topOffers: placementsWithCtc
-          .sort((a, b) => (b.ctc || 0) - (a.ctc || 0))
-          .slice(0, 10)
-          .map((p) => ({
-            usn: p.student_id,
-            company: p.company_name,
-            ctc: p.ctc,
-            designation: p.designation,
-          })),
-      },
-      compliance: {
-        violations: violations.length,
-        disciplinary: disciplinary.length,
-        eligibilityOverrides: eligibilityLogs.filter((l) => l.evaluated_by !== 'SYSTEM').length,
-      },
-      studentReadiness: {
-        totalStudents: usns.length,
-        withResume,
-        withInternship,
-        withProject,
-        withCertification: withCert,
-        resumePercent: usns.length > 0 ? ((withResume / usns.length) * 100).toFixed(1) : 0,
-      },
-      events: events.map((e) => ({
-        title: e.title,
-        type: e.type,
-        status: e.status,
-        date: e.event_datetime,
-      })),
-      alumniLeverage: {
-        hrRecommendations: hrRecs.length,
-      },
-      placementList: placementList.map((p) => {
-        const st = students.find((s) => s.usn === p.usn);
-        return {
-          ...p,
-          school: schoolMap[st?.school_id] || '-',
-          program: programMap[st?.program_id] || '-',
-        };
-      }),
-    };
-
+    const { dateFrom, dateTo } = parseDates(req);
+    const report = await buildPlacementReport(dateFrom, dateTo);
     res.json(report);
   } catch (err) {
     logger.error('getPlacementReport:', err);
     res.status(500).json({ message: 'Server error generating placement report' });
+  }
+};
+
+/**
+ * POST /placement/reports/generate
+ */
+exports.generateReport = async (req, res) => {
+  let savedRow = null;
+  try {
+    const { dateFrom, dateTo } = parseDates(req);
+    const reportName = req.body?.reportName?.trim() || defaultReportName(dateFrom, dateTo);
+    const reportType = req.body?.reportType || 'placement_summary';
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({ message: 'dateFrom and dateTo are required' });
+    }
+    if (new Date(dateFrom) > new Date(dateTo)) {
+      return res.status(400).json({ message: 'dateFrom must be before dateTo' });
+    }
+
+    const generatedBy = req.user?.email || req.user?.usn || 'Admin';
+
+    savedRow = await historyDb.insertReport({
+      report_name: reportName,
+      report_type: reportType,
+      generated_by: generatedBy,
+      generated_by_user_id: req.user?.id || null,
+      from_date: dateFrom,
+      to_date: dateTo,
+      status: 'generating',
+      filters_json: { dateFrom, dateTo, reportType },
+    });
+
+    const report = await buildPlacementReport(dateFrom, dateTo);
+    const excelBuffer = await buildPlacementReportExcel(report);
+    const fileName = `placement-report-${dateFrom}-${dateTo}.xlsx`;
+
+    const { url, path: storagePath } = await storageService.uploadPlacementReport(
+      excelBuffer,
+      savedRow.id,
+      fileName
+    );
+
+    savedRow = await historyDb.updateReportFile(savedRow.id, {
+      storage_path: storagePath,
+      file_url: url,
+      file_size: excelBuffer.length,
+      status: 'ready',
+      report_snapshot: report,
+    });
+
+    res.status(201).json({
+      report,
+      saved: mapHistoryRow(savedRow),
+    });
+  } catch (err) {
+    logger.error('generateReport:', err);
+    if (savedRow?.id) {
+      await historyDb.updateReportFile(savedRow.id, { status: 'failed' }).catch(() => {});
+    }
+    res.status(500).json({ message: err.message || 'Failed to generate and save report' });
+  }
+};
+
+/**
+ * GET /placement/reports/history
+ */
+exports.getReportHistory = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page || '1', 10);
+    const limit = Math.min(parseInt(req.query.limit || '15', 10), 50);
+    const result = await historyDb.listReports({
+      search: req.query.search || req.query.q || null,
+      reportType: req.query.reportType || req.query.report_type || null,
+      generatedBy: req.query.generatedBy || req.query.generated_by || null,
+      status: req.query.status || null,
+      dateFrom: req.query.historyFrom || req.query.history_from || null,
+      dateTo: req.query.historyTo || req.query.history_to || null,
+      page,
+      limit,
+      sort: req.query.sort || 'newest',
+    });
+
+    res.json({
+      items: result.items.map(mapHistoryRow),
+      total: result.total,
+      page: result.page,
+      limit: result.limit,
+      totalPages: result.totalPages,
+    });
+  } catch (err) {
+    logger.error('getReportHistory:', err);
+    res.status(500).json({ message: 'Failed to load report history' });
+  }
+};
+
+/**
+ * GET /placement/reports/:id/view
+ */
+exports.viewReport = async (req, res) => {
+  try {
+    const row = await historyDb.getReportById(req.params.id);
+    if (!row) return res.status(404).json({ message: 'Report not found' });
+
+    let report = row.report_snapshot;
+    if (typeof report === 'string') {
+      try {
+        report = JSON.parse(report);
+      } catch (_) {
+        report = null;
+      }
+    }
+
+    if (!report && row.from_date && row.to_date) {
+      report = await buildPlacementReport(dateOnly(row.from_date), dateOnly(row.to_date));
+    }
+
+    res.json({
+      meta: mapHistoryRow(row),
+      report,
+    });
+  } catch (err) {
+    logger.error('viewReport:', err);
+    res.status(500).json({ message: 'Failed to load report' });
+  }
+};
+
+/**
+ * GET /placement/reports/:id/download
+ */
+exports.downloadReport = async (req, res) => {
+  try {
+    const row = await historyDb.getReportById(req.params.id);
+    if (!row) return res.status(404).json({ message: 'Report not found' });
+    if (!row.storage_path) {
+      return res.status(404).json({ message: 'Report file not available' });
+    }
+
+    const buffer = await storageService.downloadPlacementReportBuffer(row.storage_path);
+    const safeName = (row.report_name || 'placement-report').replace(/[^\w\s.-]/g, '_');
+    const fileName = `${safeName}.xlsx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+  } catch (err) {
+    logger.error('downloadReport:', err);
+    res.status(500).json({ message: 'Failed to download report' });
+  }
+};
+
+/**
+ * DELETE /placement/reports/:id
+ */
+exports.deleteReport = async (req, res) => {
+  try {
+    const row = await historyDb.getReportById(req.params.id);
+    if (!row) return res.status(404).json({ message: 'Report not found' });
+
+    if (row.storage_path) {
+      await storageService.deletePlacementReportFile(row.storage_path);
+    }
+
+    await historyDb.deleteReportById(req.params.id);
+    res.json({ deleted: true, id: req.params.id });
+  } catch (err) {
+    logger.error('deleteReport:', err);
+    res.status(500).json({ message: 'Failed to delete report' });
   }
 };

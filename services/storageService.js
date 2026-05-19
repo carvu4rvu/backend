@@ -151,6 +151,54 @@ async function uploadEventImage(buffer, eventId) {
   }
 }
 
+const REPORTS_BUCKET = 'admin-assets';
+
+/** Placement report Excel: admin-assets/placement-reports/{reportId}/report.xlsx */
+async function uploadPlacementReport(buffer, reportId, fileName = 'placement-report.xlsx') {
+  const storagePath = `placement-reports/${String(reportId).replace(/[^0-9]/g, '')}/${fileName}`;
+
+  try {
+    const { error } = await supabase.storage.from(REPORTS_BUCKET).upload(storagePath, buffer, {
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      upsert: true,
+    });
+    if (error) throw error;
+
+    const signedUrl = await getSignedUrl(REPORTS_BUCKET, storagePath, 60 * 60 * 24 * 7);
+    const baseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+    const publicStyleUrl = `${baseUrl}/storage/v1/object/${REPORTS_BUCKET}/${storagePath}`;
+
+    return {
+      url: signedUrl || publicStyleUrl,
+      path: storagePath,
+      bucket: REPORTS_BUCKET,
+    };
+  } catch (err) {
+    throw wrapStorageError(err, 'uploadPlacementReport', { bucket: REPORTS_BUCKET, path: storagePath });
+  }
+}
+
+async function deletePlacementReportFile(storagePath) {
+  if (!storagePath) return;
+  try {
+    const { error } = await supabase.storage.from(REPORTS_BUCKET).remove([storagePath]);
+    if (error) throw error;
+  } catch (err) {
+    logStorageOperationFailure('deletePlacementReport', {
+      bucket: REPORTS_BUCKET,
+      path: storagePath,
+      message: err.message,
+    });
+  }
+}
+
+async function downloadPlacementReportBuffer(storagePath) {
+  const { data, error } = await supabase.storage.from(REPORTS_BUCKET).download(storagePath);
+  if (error) throw error;
+  const buf = Buffer.from(await data.arrayBuffer());
+  return buf;
+}
+
 async function uploadVariant(buffer, assetId, variantType) {
   const sanitized = String(variantType || 'variant').replace(/[^A-Z0-9_]/gi, '_').toUpperCase() || 'variant';
   const storagePath = `${VARIANT_FOLDER}/${assetId}/${sanitized}.webp`;
@@ -173,6 +221,9 @@ async function uploadVariant(buffer, assetId, variantType) {
 module.exports = {
   upload,
   uploadEventImage,
+  uploadPlacementReport,
+  deletePlacementReportFile,
+  downloadPlacementReportBuffer,
   getSignedUrl,
   getBucket,
   generateRandomFileName,

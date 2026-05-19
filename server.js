@@ -106,6 +106,7 @@ const ensureEligibilityCriteriaColumn = require('./migrations/ensureEligibilityC
 const ensureNotificationNodesRecipientEntityId = require('./migrations/ensureNotificationNodesRecipientEntityId');
 const ensureProjectsVisibilityPublicLink = require('./migrations/ensureProjectsVisibilityPublicLink');
 const ensurePlacementPerformanceIndexes = require('./migrations/ensurePlacementPerformanceIndexes');
+const ensurePlacementReportsTable = require('./migrations/ensurePlacementReportsTable');
 app.use('/api/test', testRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/placement', placementRoutes);
@@ -233,6 +234,7 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     } catch (idxErr) {
       console.warn('[startup] placement performance indexes:', idxErr.message);
     }
+    await ensurePlacementReportsTable();
 
     // Storage is optional at startup — never terminate the process if REST/Storage is down.
     await probeStorageAtStartup();

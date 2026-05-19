@@ -2530,16 +2530,19 @@ exports.getPlacementOverview = async (req, res) => {
         ctcBySchool[schoolName].push(ctc);
       }
     });
+    const roundLpa = (n) => Math.round(Number(n) * 100) / 100;
     Object.keys(ctcBySchool).forEach((name) => {
       const vals = ctcBySchool[name].sort((a, b) => a - b);
       if (vals.length > 0) {
         schoolOverview[name] = schoolOverview[name] || { max: 0, min: 0, avg: 0, median: 0, paidInternships: 0 };
-        schoolOverview[name].max = Math.max(...vals);
-        schoolOverview[name].min = Math.min(...vals);
-        schoolOverview[name].avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-        schoolOverview[name].median = vals.length % 2 === 1
+        const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+        const median = vals.length % 2 === 1
           ? vals[Math.floor(vals.length / 2)]
           : (vals[vals.length / 2 - 1] + vals[vals.length / 2]) / 2;
+        schoolOverview[name].max = roundLpa(Math.max(...vals));
+        schoolOverview[name].min = roundLpa(Math.min(...vals));
+        schoolOverview[name].avg = roundLpa(avg);
+        schoolOverview[name].median = roundLpa(median);
       }
     });
 

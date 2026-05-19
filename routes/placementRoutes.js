@@ -188,6 +188,11 @@ router.put('/job-offers/:id', authenticateToken, authorizeRoles('admin'), placem
 router.get('/dashboard/stats', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getDashboardOfferStats);
 
 // Placement Reports (admin)
+router.get('/reports/history', authenticateToken, authorizeRoles('admin'), placementReportsController.getReportHistory);
+router.post('/reports/generate', authenticateToken, authorizeRoles('admin'), placementReportsController.generateReport);
+router.get('/reports/:id/download', authenticateToken, authorizeRoles('admin'), placementReportsController.downloadReport);
+router.get('/reports/:id/view', authenticateToken, authorizeRoles('admin'), placementReportsController.viewReport);
+router.delete('/reports/:id', authenticateToken, authorizeRoles('admin'), placementReportsController.deleteReport);
 router.get('/reports', authenticateToken, authorizeRoles('admin'), placementReportsController.getPlacementReport);
 
 // HR Recommendations (admin)
