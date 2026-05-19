@@ -2988,52 +2988,66 @@ exports.getAlumniConversions = async (req, res) => {
   try {
     const schoolId = req.query.school_id ? parseInt(req.query.school_id, 10) : null;
     const programId = req.query.program_id ? parseInt(req.query.program_id, 10) : null;
+    const batch = req.query.batch ?? req.query.year_of_joining;
+    const filters = {
+      year_of_joining: batch,
+      current_year: req.query.current_year,
+      section: req.query.section,
+      opt_in: req.query.opt_in,
+      is_placed: req.query.is_placed,
+      search: req.query.search,
+      has_personal_email:
+        req.query.has_personal_email === 'true' || req.query.personal_email === '1' ? 'true' : undefined,
+    };
 
     const { schools: schoolsList, programs: programsList } = await alumniDb.getAlumniConversionsMeta();
+    const programsPayload = (programsList || []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      school_id: p.school_id,
+    }));
 
     if (schoolId == null || programId == null || Number.isNaN(schoolId) || Number.isNaN(programId)) {
       return res.json({
         schools: schoolsList || [],
-        programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })),
-        rows: []
+        programs: programsPayload,
+        rows: [],
+        filter_meta: { years: [], current_years: [], sections: [] },
       });
     }
 
-    const studentList = await alumniDb.getStudentsBySchoolProgram(schoolId, programId);
-    if (studentList.length === 0) {
-      return res.json({ schools: schoolsList || [], programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })), rows: [] });
-    }
-
-    const usns = studentList.map((s) => s.usn).filter(Boolean);
-    const existingAlumni = await alumniDb.getAlumniByStudentIds(usns);
-    const convertedUsns = new Set(existingAlumni.map((a) => a.student_id).filter(Boolean));
-    const studentListNotConverted = studentList.filter((s) => !convertedUsns.has(s.usn));
+    const filterMeta = await alumniDb.getConversionFilterMeta(schoolId, programId);
+    const studentList = await alumniDb.getStudentsBySchoolProgram(schoolId, programId, filters);
 
     const program = (programsList || []).find((p) => p.id === programId);
     const minY = program?.min_duration_years ?? 3;
     const maxY = program?.max_duration_years ?? 4;
     const programName = program?.name ?? null;
 
-    const placedIds = await alumniDb.getAcceptedOfferStudentIds(usns);
+    const usns = studentList.map((s) => s.usn).filter(Boolean);
+    const placedIds = usns.length ? await alumniDb.getAcceptedOfferStudentIds(usns) : [];
     const placedUsns = new Set(placedIds.filter(Boolean));
 
-    const rows = studentListNotConverted.map((s) => ({
+    const rows = studentList.map((s) => ({
       usn: s.usn,
       full_name: s.full_name,
       college_email: s.college_email,
       personal_email: s.personal_email,
       program: programName,
       year_of_joining: s.year_of_joining,
+      current_year: s.current_year,
+      section: s.section,
       course_year_min: minY,
       course_year_max: maxY,
       is_placed: placedUsns.has(s.usn),
-      opt_in: !!s.opt_in
+      opt_in: !!s.opt_in,
     }));
 
     res.json({
       schools: schoolsList || [],
-      programs: (programsList || []).map((p) => ({ id: p.id, name: p.name, school_id: p.school_id })),
-      rows
+      programs: programsPayload,
+      rows,
+      filter_meta: filterMeta,
     });
   } catch (err) {
     logger.error('getAlumniConversions:', err);
@@ -3043,8 +3057,9 @@ exports.getAlumniConversions = async (req, res) => {
 
 /**
  * POST /placement/alumni/convert
- * Body: { usns: string[] }. Converts student → alumni: update user_login role (RVU email only, no new login row),
- * insert into alumni table. Logs to alumni_conversion_log and admin_audit_logs. Reverts failed at end.
+ * Body: { usns: string[] }. Converts student → alumni: RVU login role → alumni, alumni record,
+ * and a second user_login row for personal email (Gmail) with the same password. Logs to alumni_conversion_log.
+ * Reverts failed at end. Re-run safe for alumni already migrated (repairs missing personal login).
  */
 exports.convertToAlumni = async (req, res) => {
   const usns = Array.isArray(req.body.usns) ? req.body.usns.filter((u) => u != null && String(u).trim()) : [];
@@ -3101,6 +3116,7 @@ exports.convertToAlumni = async (req, res) => {
       const rvuEmail = student.college_email;
       const personalEmail = student.personal_email;
       let logId;
+      let personalLoginCreated = false;
 
       try {
         const logIns = await pool.query(
@@ -3112,44 +3128,80 @@ exports.convertToAlumni = async (req, res) => {
         logId = logIns.rows[0].id;
 
         const loginRow = await pool.query(
-          'SELECT id FROM user_login WHERE email_id = $1 AND role_id = $2 AND is_active = true',
-          [rvuEmail, studentRoleId]
+          `SELECT id, password_hash, role_id FROM user_login
+           WHERE lower(email_id) = lower($1) AND is_active = true`,
+          [rvuEmail]
         );
         if (loginRow.rows.length === 0) {
           await pool.query(
             'UPDATE alumni_conversion_log SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3',
-            ['failed', 'No active student login found for this college email', logId]
+            ['failed', 'No active login found for this college email', logId]
           );
-          results.push({ usn, success: false, error_message: 'No active student login found for college email' });
+          results.push({ usn, success: false, error_message: 'No active login found for college email' });
           continue;
         }
 
-        const collegeLoginId = loginRow.rows[0].id;
+        const collegeLogin = loginRow.rows[0];
+        const collegeLoginId = collegeLogin.id;
+        const passwordHash = collegeLogin.password_hash;
 
-        await pool.query(
-          'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE id = $2',
-          [alumniRoleId, collegeLoginId]
-        );
+        if (Number(collegeLogin.role_id) === Number(studentRoleId)) {
+          await pool.query(
+            'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE id = $2',
+            [alumniRoleId, collegeLoginId]
+          );
+        } else if (Number(collegeLogin.role_id) !== Number(alumniRoleId)) {
+          throw new Error('College email login is not a student or alumni account');
+        }
+
+        const offerCareer = await alumniDb.getAcceptedOfferCareerForStudent(usn);
 
         const alumniCheck = await pool.query('SELECT id FROM alumni WHERE student_id = $1', [usn]);
         if (alumniCheck.rows.length === 0) {
           await pool.query(
-            `INSERT INTO alumni (student_id, full_name, graduation_year, institution_name, personal_email, phone_number, is_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, true)`,
+            `INSERT INTO alumni (
+               student_id, full_name, graduation_year, institution_name, personal_email, phone_number,
+               current_company, current_designation, is_verified
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)`,
             [
               usn,
               student.full_name || usn,
               student.graduation_year,
               student.institution_name,
               personalEmail,
-              student.phone_number
+              student.phone_number,
+              offerCareer?.company_name || null,
+              offerCareer?.designation || null,
             ]
+          );
+        } else if (offerCareer) {
+          await pool.query(
+            `UPDATE alumni
+             SET current_company = COALESCE(NULLIF(TRIM(current_company), ''), $2),
+                 current_designation = COALESCE(NULLIF(TRIM(current_designation), ''), $3),
+                 updated_at = NOW()
+             WHERE student_id = $1`,
+            [usn, offerCareer.company_name, offerCareer.designation]
           );
         }
 
+        const personalLogin = await alumniDb.ensurePersonalAlumniLogin({
+          personalEmail,
+          alumniRoleId,
+          passwordHash,
+        });
+        if (personalLogin.error && !personalLogin.loginId) {
+          throw new Error(personalLogin.error);
+        }
+        personalLoginCreated = !!personalLogin.created;
+
+        const personalRowReady = !!personalLogin.loginId;
         await pool.query(
-          `UPDATE alumni_conversion_log SET role_converted = true, personal_mail_row_created = false, status = 'success', updated_at = NOW() WHERE id = $1`,
-          [logId]
+          `UPDATE alumni_conversion_log
+           SET role_converted = true, personal_mail_row_created = $2, status = 'success', updated_at = NOW()
+           WHERE id = $1`,
+          [logId, personalRowReady]
         );
 
         if (adminUserId != null) {
@@ -3161,22 +3213,51 @@ exports.convertToAlumni = async (req, res) => {
               'alumni_conversion',
               'alumni',
               usn,
-              JSON.stringify({ batch_id: batchId, rvu_email: rvuEmail, personal_email: personalEmail, role_converted: true })
+              JSON.stringify({
+                batch_id: batchId,
+                rvu_email: rvuEmail,
+                personal_email: personalEmail,
+                role_converted: true,
+                personal_mail_row_created: personalRowReady,
+                personal_login_created: personalLoginCreated,
+              })
             ]
           );
         }
 
-        results.push({ usn, success: true });
+        results.push({
+          usn,
+          success: true,
+          personal_login_created: personalLoginCreated,
+          personal_mail_row_created: personalRowReady,
+        });
       } catch (err) {
         logger.error('convertToAlumni single:', usn, err);
         const errMsg = err.message || 'Conversion failed';
+        try {
+          await pool.query(
+            'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE lower(email_id) = lower($2) AND role_id = $3',
+            [studentRoleId, rvuEmail, alumniRoleId]
+          );
+        } catch (_) { /* ignore */ }
+        try {
+          await pool.query('DELETE FROM alumni WHERE student_id = $1', [usn]);
+        } catch (_) { /* ignore */ }
+        if (personalLoginCreated) {
+          try {
+            await pool.query(
+              'DELETE FROM user_login WHERE lower(email_id) = lower($1) AND role_id = $2',
+              [personalEmail, alumniRoleId]
+            );
+          } catch (_) { /* ignore */ }
+        }
         if (logId) {
           await pool.query(
             'UPDATE alumni_conversion_log SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3',
             ['failed', errMsg.substring(0, 500), logId]
           );
         }
-        results.push({ usn, success: false, error_message: errMsg });
+        results.push({ usn, success: false, error_message: errMsg, personal_login_created: false });
       }
     }
 
@@ -3185,15 +3266,24 @@ exports.convertToAlumni = async (req, res) => {
       const student = studentMap.get(f.usn);
       if (!student) continue;
       const rvuEmail = student.college_email;
+      const personalEmail = student.personal_email;
       try {
         await pool.query(
-          'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE email_id = $2 AND role_id = $3',
+          'UPDATE user_login SET role_id = $1, updated_at = NOW() WHERE lower(email_id) = lower($2) AND role_id = $3',
           [studentRoleId, rvuEmail, alumniRoleId]
         );
       } catch (_) { /* ignore */ }
       try {
         await pool.query('DELETE FROM alumni WHERE student_id = $1', [f.usn]);
       } catch (_) { /* ignore */ }
+      if (f.personal_login_created) {
+        try {
+          await pool.query(
+            'DELETE FROM user_login WHERE lower(email_id) = lower($1) AND role_id = $2',
+            [personalEmail, alumniRoleId]
+          );
+        } catch (_) { /* ignore */ }
+      }
       await pool.query(
         "UPDATE alumni_conversion_log SET status = 'reverted', updated_at = NOW() WHERE usn = $1 AND batch_id = $2 AND status = 'failed'",
         [f.usn, batchId]
@@ -3258,17 +3348,28 @@ exports.getAlumniConversionLogs = async (req, res) => {
 exports.getAllAlumni = async (req, res) => {
   try {
     const data = await alumniDb.getAllAlumniOrdered();
+    const usns = (data || []).map((a) => a.student_id).filter(Boolean);
+    const [offerByUsn, studentByUsn] = await Promise.all([
+      alumniDb.getAcceptedOffersByUsns(usns),
+      alumniDb.getStudentContextByUsns(usns),
+    ]);
     const hasProfileData = (a) => {
       const hasEmail = !!(a.personal_email && String(a.personal_email).trim());
       const hasCareer = !!(a.current_company && String(a.current_company).trim()) || !!(a.current_designation && String(a.current_designation).trim());
       const hasPhone = !!(a.phone_number && String(a.phone_number).trim());
       return hasEmail && (hasCareer || hasPhone);
     };
-    const list = (data || []).map((a) => ({
-      ...a,
-      usn: a.student_id,
-      profile_data_added: hasProfileData(a)
-    }));
+    const list = (data || []).map((a) => {
+      const item = alumniDb.buildAlumniListItem(
+        a,
+        offerByUsn.get(a.student_id),
+        studentByUsn.get(a.student_id)
+      );
+      return {
+        ...item,
+        profile_data_added: hasProfileData(item),
+      };
+    });
     res.json(list);
   } catch (err) {
     logger.error('getAllAlumni:', err);
@@ -3315,15 +3416,103 @@ exports.addAlumni = async (req, res) => {
 exports.getAlumniByIdOrUsn = async (req, res) => {
   try {
     const { identifier } = req.params;
-    const idNum = parseInt(identifier, 10);
-    const byId = !Number.isNaN(idNum);
+    const { byId, value } = alumniDb.parseAlumniIdentifier(identifier);
 
-    const data = await alumniDb.getAlumniByIdentifier(byId ? idNum : identifier, byId);
+    const data = await alumniDb.getAlumniByIdentifier(value, byId);
     if (!data) return res.status(404).json({ message: 'Alumni not found' });
-    res.json({ ...data, usn: data.student_id });
+
+    const usn = data.student_id;
+    const [offerByUsn, studentByUsn] = await Promise.all([
+      usn ? alumniDb.getAcceptedOffersByUsns([usn]) : Promise.resolve(new Map()),
+      usn ? alumniDb.getStudentContextByUsns([usn]) : Promise.resolve(new Map()),
+    ]);
+    const item = alumniDb.buildAlumniListItem(
+      data,
+      usn ? offerByUsn.get(usn) : null,
+      usn ? studentByUsn.get(usn) : null
+    );
+    const hasProfileData = (a) => {
+      const hasEmail = !!(a.personal_email && String(a.personal_email).trim());
+      const hasCareer =
+        !!(a.current_company && String(a.current_company).trim()) ||
+        !!(a.current_designation && String(a.current_designation).trim());
+      const hasPhone = !!(a.phone_number && String(a.phone_number).trim());
+      return hasEmail && (hasCareer || hasPhone);
+    };
+    res.json({ ...item, profile_data_added: hasProfileData(item) });
   } catch (err) {
     logger.error('getAlumniByIdOrUsn:', err);
     res.status(500).json({ message: err.message || 'Server error' });
+  }
+};
+
+/**
+ * DELETE /placement/alumni/:identifier - remove alumni (admin).
+ * Deletes alumni row, alumni-role logins for personal email, and reverts converted students' RVU login to student.
+ */
+exports.deleteAlumni = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { identifier } = req.params;
+    const { byId, value } = alumniDb.parseAlumniIdentifier(identifier);
+    const existing = await alumniDb.getAlumniByIdentifier(value, byId);
+    if (!existing) {
+      return res.status(404).json({ message: 'Alumni not found' });
+    }
+
+    const roleRes = await pool.query("SELECT id, name FROM roles WHERE name IN ('student', 'alumni')");
+    const roleMap = {};
+    roleRes.rows.forEach((r) => {
+      roleMap[r.name] = r.id;
+    });
+    const studentRoleId = roleMap.student;
+    const alumniRoleId = roleMap.alumni;
+
+    await client.query('BEGIN');
+
+    if (existing.student_id && studentRoleId && alumniRoleId) {
+      const sRow = await client.query(
+        'SELECT college_email FROM student_basic_details WHERE usn = $1',
+        [existing.student_id]
+      );
+      const collegeEmail = sRow.rows[0]?.college_email
+        ? String(sRow.rows[0].college_email).trim().toLowerCase()
+        : null;
+      if (collegeEmail) {
+        await client.query(
+          `UPDATE user_login SET role_id = $1, updated_at = NOW()
+           WHERE lower(email_id) = lower($2) AND role_id = $3`,
+          [studentRoleId, collegeEmail, alumniRoleId]
+        );
+      }
+    }
+
+    const emailsToClear = new Set();
+    if (existing.personal_email) {
+      emailsToClear.add(String(existing.personal_email).trim().toLowerCase());
+    }
+    if (alumniRoleId) {
+      for (const email of emailsToClear) {
+        await client.query(
+          `DELETE FROM user_login
+           WHERE lower(email_id) = lower($1) AND role_id = $2
+             AND ($3::text IS NULL OR usn IS DISTINCT FROM $3)`,
+          [email, alumniRoleId, existing.student_id || null]
+        );
+      }
+    }
+
+    await client.query('DELETE FROM hr_recommendations WHERE alumni_id = $1', [existing.id]);
+    await client.query('DELETE FROM alumni WHERE id = $1', [existing.id]);
+
+    await client.query('COMMIT');
+    res.json({ message: 'Alumni removed successfully', id: existing.id, student_id: existing.student_id });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('deleteAlumni:', err);
+    res.status(500).json({ message: err.message || 'Failed to remove alumni' });
+  } finally {
+    client.release();
   }
 };
 
@@ -3334,10 +3523,9 @@ exports.updateAlumni = async (req, res) => {
   try {
     const { identifier } = req.params;
     const b = req.body;
-    const idNum = parseInt(identifier, 10);
-    const byId = !Number.isNaN(idNum);
+    const { byId, value } = alumniDb.parseAlumniIdentifier(identifier);
 
-    const existing = await alumniDb.getAlumniIdByIdentifier(byId ? idNum : identifier, byId);
+    const existing = await alumniDb.getAlumniIdByIdentifier(value, byId);
     if (!existing) return res.status(404).json({ message: 'Alumni not found' });
 
     const payload = {
@@ -3375,7 +3563,11 @@ exports.getAlumniMe = async (req, res) => {
     }
     const data = await alumniDb.getAlumniByEmail(email);
     if (!data) return res.status(404).json({ message: 'Alumni profile not found.' });
-    res.json({ ...data, usn: data.student_id });
+    const offerCareer = data.student_id
+      ? await alumniDb.getAcceptedOfferCareerForStudent(data.student_id)
+      : null;
+    const merged = alumniDb.mergeAlumniCareerFields(data, offerCareer);
+    res.json({ ...merged, usn: merged.student_id });
   } catch (err) {
     logger.error('getAlumniMe:', err);
     res.status(500).json({ message: err.message || 'Server error' });

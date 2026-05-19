@@ -2353,33 +2353,64 @@ exports.getProjects = async (req, res) => {
  */
 exports.updateProjects = async (req, res) => {
     try {
-        const { usn } = req.params;
+        const { usn: usnParam } = req.params;
         let data = req.body;
 
-        // Resolve authenticated user + canonical USN (identity: user_id primary, USN secondary)
         const userId = req.user?.id ?? req.user?.user_id;
         if (!userId) {
             return sendError(res, 401, 'Authentication required');
         }
-        const usnRow = await pool.query('SELECT usn FROM public.user_login WHERE id = $1', [userId]);
-        const ownerUsn = usnRow.rows.length && usnRow.rows[0].usn ? usnRow.rows[0].usn : null;
-        if (!ownerUsn) {
-            return sendError(res, 403, 'Only students with USN can update projects');
+
+        const role = (req.user?.role && String(req.user.role).toLowerCase()) || '';
+        const isPrivileged = role === 'admin' || role === 'vc' || role === 'placement';
+        const targetUsn = String(usnParam || '').trim().toUpperCase();
+        if (!targetUsn) {
+            return sendValidationError(res, 'USN is required.', { usn: 'USN is required.' });
         }
 
-        // Enforce projects section lock (student_edit_control.is_projects_locked)
-        const client = await pool.connect();
-        try {
-            const { rows } = await client.query(
-                'SELECT is_projects_locked FROM public.student_edit_control WHERE usn = $1',
-                [String(ownerUsn || '').toUpperCase()]
-            );
-            if (rows && rows.length > 0 && rows[0].is_projects_locked === true) {
-                sendLocked(res, 'This section is locked by the administrator. You have view-only access.');
-                return;
+        let ownerUsn = targetUsn;
+        let ownerUserId = userId;
+
+        if (!isPrivileged) {
+            const usnRow = await pool.query('SELECT usn FROM public.user_login WHERE id = $1', [userId]);
+            const studentUsn = usnRow.rows.length && usnRow.rows[0].usn
+                ? String(usnRow.rows[0].usn).trim().toUpperCase()
+                : null;
+            if (!studentUsn) {
+                return sendError(res, 403, 'Only students with USN can update projects');
             }
-        } finally {
-            client.release();
+            if (studentUsn !== targetUsn) {
+                return sendAccessDenied(res, 'You can only modify your own projects.');
+            }
+            ownerUsn = studentUsn;
+            ownerUserId = userId;
+        } else {
+            const ownerRow = await pool.query(
+                'SELECT id, usn FROM public.user_login WHERE UPPER(TRIM(usn)) = $1 LIMIT 1',
+                [targetUsn]
+            );
+            if (!ownerRow.rows.length) {
+                return sendNotFound(res, 'Student not found for this USN.');
+            }
+            ownerUsn = String(ownerRow.rows[0].usn).trim().toUpperCase();
+            ownerUserId = ownerRow.rows[0].id;
+        }
+
+        // Enforce projects section lock for students only
+        if (!isPrivileged) {
+            const client = await pool.connect();
+            try {
+                const { rows } = await client.query(
+                    'SELECT is_projects_locked FROM public.student_edit_control WHERE usn = $1',
+                    [ownerUsn]
+                );
+                if (rows && rows.length > 0 && rows[0].is_projects_locked === true) {
+                    sendLocked(res, 'This section is locked by the administrator. You have view-only access.');
+                    return;
+                }
+            } finally {
+                client.release();
+            }
         }
 
         // --- 1. Input shape ---
@@ -2573,8 +2604,7 @@ exports.updateProjects = async (req, res) => {
         });
 
         // --- 4. Bulk replace: write to public.projects + project_assets ---
-        const usnNorm = String(ownerUsn || '').trim().toUpperCase();
-        const ownerUserId = userId ?? null;
+        const usnNorm = ownerUsn;
 
         const dbClient = await pool.connect();
         try {

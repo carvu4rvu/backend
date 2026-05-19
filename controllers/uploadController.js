@@ -12,6 +12,20 @@ exports.uploadFile = async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded', error: 'No file uploaded', hint });
     }
 
+    const role = (req.user?.role && String(req.user.role).toLowerCase()) || '';
+    const isPrivileged = role === 'admin' || role === 'vc' || role === 'placement' || role === 'company' || role === 'alumni';
+
+    if (usn && !isPrivileged) {
+      const requestUsn = String(usn).trim().toUpperCase();
+      const actorUsn = req.user?.usn ? String(req.user.usn).trim().toUpperCase() : '';
+      if (!actorUsn || requestUsn !== actorUsn) {
+        return res.status(403).json({
+          message: 'You can only upload files for your own profile.',
+          error: 'Access denied',
+        });
+      }
+    }
+
     const entityId = usn || project_id || alumni_id || company_id;
     if (!entityId) {
       return res.status(400).json({ error: 'USN, project_id, alumni_id, or company_id is required' });

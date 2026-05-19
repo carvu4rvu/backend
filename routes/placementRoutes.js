@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const placementController = require('../controllers/placementController');
 const placementReportsController = require('../controllers/placementReportsController');
-const emailRecipientsController = require('../controllers/emailRecipientsController');
 const violationsController = require('../controllers/violationsController');
 const studentEditControlController = require('../controllers/studentEditControlController');
 const semesterUnlockRequestController = require('../controllers/semesterUnlockRequestController');
@@ -126,9 +125,6 @@ router.get('/policies/me', authenticateToken, placementController.getMyPolicy);
 router.post('/policies', authenticateToken, placementController.upsertPolicy);
 router.post('/policies/sync', authenticateToken, placementController.syncPolicies);
 
-// Email recipients for bulk email (filter by category: students, parents, alumni, staff)
-router.get('/email-recipients', authenticateToken, emailRecipientsController.getEmailRecipients);
-
 // Projects: alumni feed, view increment, like (alumni or authenticated)
 router.get('/projects/alumni', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniProjects);
 router.get('/projects/alumni/:projectId', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniProjectById);
@@ -162,6 +158,7 @@ router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles(
 router.get('/vc/events', authenticateToken, authorizeRoles('vc'), placementController.getVcEvents);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
+router.delete('/alumni/:identifier', authenticateToken, authorizeRoles('admin'), placementController.deleteAlumni);
 
 // Violations: eligibility logs, placement violations, disciplinary records
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);
