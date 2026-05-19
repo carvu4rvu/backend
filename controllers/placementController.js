@@ -4,6 +4,7 @@ const dashboardDb = require('../db/dashboardDb');
 const catalogDb = require('../db/catalogDb');
 const policiesDb = require('../db/policiesDb');
 const alumniDb = require('../db/alumniDb');
+const { alumniShowcaseWhere, canShowOnAlumniShowcase } = require('../utils/projectShowcase');
 const studentDb = require('../db/studentDb');
 const logger = require('../utils/logger');
 const { createAndSendToUsns } = require('../utils/notificationHelper');
@@ -4091,7 +4092,7 @@ exports.getStudentProfileForAlumni = async (req, res) => {
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
         p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.priority
        FROM projects p
-       WHERE p.owner_usn = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'
+       WHERE p.owner_usn = $1 AND ${alumniShowcaseWhere('p')}
        ORDER BY p.priority ASC NULLS LAST, p.id ASC`,
       [ownerUsn]
     );
@@ -4356,12 +4357,12 @@ exports.getAlumniProjects = async (req, res) => {
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
-        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility,
+        p.project_status
        FROM projects p
        LEFT JOIN project_metrics m ON m.project_id = p.id
-       WHERE LOWER(TRIM(p.project_status::text)) = 'approved'
-       ORDER BY COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC
-       LIMIT 100`
+       WHERE ${alumniShowcaseWhere('p')}
+       ORDER BY COALESCE(m.likes, 0) DESC, COALESCE(m.views, 0) DESC, p.published_at DESC NULLS LAST, p.id DESC`
     );
     const rows = projRes.rows || [];
     const projectIds = rows.map((r) => r.id);
@@ -4374,7 +4375,8 @@ exports.getAlumniProjects = async (req, res) => {
         pool.query(
           `SELECT project_id, original_url, position
            FROM project_assets
-           WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
+           WHERE project_id = ANY($1::bigint[])
+             AND (asset_type IS NULL OR UPPER(TRIM(asset_type::text)) IN ('IMAGE', ''))
            ORDER BY project_id, position`,
           [projectIds]
         ),
@@ -4388,8 +4390,10 @@ exports.getAlumniProjects = async (req, res) => {
         ),
       ]);
       (assetRes.rows || []).forEach((a) => {
+        const url = a.original_url && String(a.original_url).trim();
+        if (!url) return;
         if (!assetsByProj[a.project_id]) assetsByProj[a.project_id] = [];
-        assetsByProj[a.project_id].push(a.original_url);
+        assetsByProj[a.project_id].push(url);
       });
       (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
       (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
@@ -4404,6 +4408,7 @@ exports.getAlumniProjects = async (req, res) => {
 
     const list = rows.map((p) => {
       const m = metricMap[p.id] || {};
+      const snaps = assetsByProj[p.id] || [];
       return {
         id: p.id,
         owner_usn: p.owner_usn,
@@ -4423,8 +4428,10 @@ exports.getAlumniProjects = async (req, res) => {
         tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
         technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
         published_at: p.published_at,
-        project_snaps: assetsByProj[p.id] || [],
-        cover_url: (assetsByProj[p.id] && assetsByProj[p.id][0]) || null,
+        visibility: p.visibility || 'PRIVATE',
+        project_status: p.project_status,
+        project_snaps: snaps,
+        cover_url: snaps[0] || null,
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
         favorites_count: m.favorites ?? 0,
@@ -4457,9 +4464,10 @@ exports.getAlumniProjectById = async (req, res) => {
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
-        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.project_status, p.created_at
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.project_status,
+        p.visibility, p.created_at
        FROM projects p
-       WHERE p.id = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'`,
+       WHERE p.id = $1 AND ${alumniShowcaseWhere('p')}`,
       [projectId]
     );
     if (!projRes.rows.length) {
@@ -4471,7 +4479,8 @@ exports.getAlumniProjectById = async (req, res) => {
       pool.query(
         `SELECT project_id, original_url, position
          FROM project_assets
-         WHERE project_id = $1 AND asset_role IN ('COVER','GALLERY')
+         WHERE project_id = $1
+           AND (asset_type IS NULL OR UPPER(TRIM(asset_type::text)) IN ('IMAGE', ''))
          ORDER BY position`,
         [projectId]
       ),
@@ -4560,8 +4569,11 @@ exports.incrementProjectView = async (req, res) => {
     const userId = req.user ? (req.user.id || req.user.user_id) : null;
     const ipAddress = (req.headers['x-forwarded-for'] || req.connection?.remoteAddress || '').toString().split(',')[0].trim() || null;
 
-    const projRes = await pool.query('SELECT id FROM projects WHERE id = $1', [projectId]);
-    if (!projRes.rows.length) {
+    const projRes = await pool.query(
+      'SELECT id, visibility, project_status FROM projects WHERE id = $1',
+      [projectId]
+    );
+    if (!projRes.rows.length || !canShowOnAlumniShowcase(projRes.rows[0])) {
       return res.status(404).json({ message: 'Project not found.' });
     }
 
@@ -4628,8 +4640,7 @@ exports.toggleProjectLike = async (req, res) => {
       return res.status(404).json({ message: 'Project not found.' });
     }
     const p = projRes.rows[0];
-    const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
-    if (!canView) {
+    if (!canShowOnAlumniShowcase(p)) {
       return res.status(404).json({ message: 'Project not found.' });
     }
 

@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const { enqueueVariantJob } = require('../services/variantJobProcessor');
 
 const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC'];
+const { canShowOnAlumniShowcase } = require('../utils/projectShowcase');
 const VALID_ASSET_TYPES = ['IMAGE', 'VIDEO'];
 const VALID_ASSET_ROLES = ['LOGO', 'COVER', 'GALLERY', 'VIDEO'];
 const VALID_PROJECT_STATUS = ['not_approved', 'approved', 'rejected', 'archived'];
@@ -403,7 +404,7 @@ exports.create = async (req, res) => {
     const description = (body.description || '').trim() || null;
     const category = (body.category || '').trim() || null;
     const tags = Array.isArray(body.tags) ? body.tags : [];
-    const visibility = (body.visibility || 'PRIVATE').toString().toUpperCase().trim();
+    const visibility = (body.visibility || 'PUBLIC').toString().toUpperCase().trim();
     const hosted_url = (body.hosted_url || '').trim() || null;
     const github_url = (body.github_url || '').trim() || null;
     const mentor_name = (body.mentor_name || '').trim() || null;
@@ -513,6 +514,9 @@ exports.update = async (req, res) => {
           if (!VALID_VISIBILITY.includes(v)) continue;
           updates.push(`${field} = $${idx}`);
           values.push(v);
+          if (v === 'PUBLIC') {
+            updates.push(`published_at = COALESCE(published_at, NOW())`);
+          }
         } else if (field === 'priority') {
           const p = body[field];
           if (p !== null && p !== undefined) {
@@ -911,9 +915,9 @@ exports.addReview = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-
-      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
-      if (!canView) {
+      const role = (req.user?.role && String(req.user.role).toLowerCase()) || '';
+      const isPrivileged = role === 'admin' || role === 'vc' || role === 'placement';
+      if (!isPrivileged && !canShowOnAlumniShowcase(p)) {
         return sendNotFound(res, 'Project not found.');
       }
 
@@ -1011,8 +1015,9 @@ exports.toggleLike = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
-      if (!canView) {
+      const role = (req.user?.role && String(req.user.role).toLowerCase()) || '';
+      const isPrivileged = role === 'admin' || role === 'vc' || role === 'placement';
+      if (!isPrivileged && !canShowOnAlumniShowcase(p)) {
         return sendNotFound(res, 'Project not found.');
       }
 
@@ -1088,8 +1093,9 @@ exports.toggleFavorite = async (req, res) => {
         return sendNotFound(res, 'Project not found.');
       }
       const p = projRes.rows[0];
-      const canView = p.visibility === 'PUBLIC' || p.project_status === 'approved';
-      if (!canView) {
+      const role = (req.user?.role && String(req.user.role).toLowerCase()) || '';
+      const isPrivileged = role === 'admin' || role === 'vc' || role === 'placement';
+      if (!isPrivileged && !canShowOnAlumniShowcase(p)) {
         return sendNotFound(res, 'Project not found.');
       }
 
@@ -1290,10 +1296,20 @@ exports.adminUpdate = async (req, res) => {
       }
 
       if (projectStatus && VALID_PROJECT_STATUS.includes(projectStatus)) {
-        await client.query(
-          'UPDATE projects SET project_status = $1, updated_at = NOW() WHERE id = $2',
-          [projectStatus, projectId]
-        );
+        if (projectStatus === 'approved') {
+          await client.query(
+            `UPDATE projects SET project_status = $1,
+             published_at = COALESCE(published_at, NOW()),
+             updated_at = NOW()
+             WHERE id = $2`,
+            [projectStatus, projectId]
+          );
+        } else {
+          await client.query(
+            'UPDATE projects SET project_status = $1, updated_at = NOW() WHERE id = $2',
+            [projectStatus, projectId]
+          );
+        }
       }
 
       const project = await loadProject(client, projectId, {});
