@@ -46,6 +46,8 @@ router.post('/students', authenticateToken, authorizeRoles('admin'), studentProf
 router.post('/students/bulk/check-duplicates', authenticateToken, authorizeRoles('admin'), studentProfileController.checkBulkDuplicates);
 // Bulk: insert - admin only
 router.post('/students/bulk', authenticateToken, authorizeRoles('admin'), studentProfileController.bulkInsertStudents);
+// Delete student and all related records - admin only
+router.delete('/students/:usn', authenticateToken, authorizeRoles('admin'), studentProfileController.deleteStudent);
 
 // Personal Profile specific routes (protected)
 router.get('/profile/:usn/personal', authenticateToken, studentProfileController.getPersonalProfile);

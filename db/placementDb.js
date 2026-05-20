@@ -410,9 +410,105 @@ async function updateCompany(id, payload) {
   return rows[0] ?? null;
 }
 
-async function deleteCompany(id) {
-  await pool.query('DELETE FROM contacts WHERE company_id = $1', [id]);
-  await pool.query('DELETE FROM companies WHERE id = $1', [id]);
+async function deleteCompanyOffersForCompany(client, companyId) {
+  const { rows: capstoneRows } = await client.query(
+    `SELECT DISTINCT o.capstone_id AS id
+     FROM offers o
+     LEFT JOIN placement p ON p.id = o.placement_id
+     WHERE (o.company_id = $1 OR p.company_id = $1) AND o.capstone_id IS NOT NULL`,
+    [companyId]
+  );
+  const capstoneIds = capstoneRows.map((row) => row.id).filter(Boolean);
+
+  await client.query(
+    `DELETE FROM offers
+     WHERE company_id = $1
+        OR placement_id IN (SELECT id FROM placement WHERE company_id = $1)`,
+    [companyId]
+  );
+  if (capstoneIds.length) {
+    await client.query('DELETE FROM capstone WHERE id = ANY($1::bigint[])', [capstoneIds]);
+  }
+  await client.query('DELETE FROM placement WHERE company_id = $1', [companyId]);
+}
+
+async function convertCompanyOffersToOffCampus(client, companyId, companyName) {
+  const offCampusTag = `(Off-campus: ${companyName})`;
+
+  await client.query(
+    `UPDATE capstone cap
+     SET company_name = COALESCE(NULLIF(TRIM(cap.company_name), ''), $2)
+     WHERE cap.id IN (
+       SELECT o.capstone_id FROM offers o
+       LEFT JOIN placement p ON p.id = o.placement_id
+       WHERE (o.company_id = $1 OR p.company_id = $1) AND o.capstone_id IS NOT NULL
+     )`,
+    [companyId, companyName]
+  );
+
+  await client.query(
+    `UPDATE offers o
+     SET company_id = NULL,
+         job_type = 'Off Campus'
+     WHERE o.company_id = $1
+        OR o.placement_id IN (SELECT id FROM placement WHERE company_id = $1)`,
+    [companyId]
+  );
+
+  await client.query(
+    `UPDATE placement
+     SET company_id = NULL,
+         type_of_hiring = 'Off Campus',
+         remarks = CASE
+           WHEN remarks IS NULL OR TRIM(remarks) = '' THEN $2
+           WHEN remarks ILIKE '%off-campus:%' THEN remarks
+           ELSE TRIM(remarks) || ' ' || $2
+         END
+     WHERE company_id = $1`,
+    [companyId, offCampusTag]
+  );
+}
+
+/**
+ * Delete a company, its drives, contacts, and optionally offers.
+ * @param {number} id - company id
+ * @param {{ offersAction?: 'delete'|'keep_off_campus' }} options
+ * @param {object} client - pg client (transaction)
+ */
+async function deleteCompany(id, options = {}, client) {
+  const db = client || pool;
+  const offersAction = options.offersAction === 'keep_off_campus' ? 'keep_off_campus' : 'delete';
+
+  const companyRes = await db.query('SELECT id, company_name FROM companies WHERE id = $1', [id]);
+  if (!companyRes.rows.length) {
+    const err = new Error('Company not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  const companyName = companyRes.rows[0].company_name;
+
+  const { rows: driveRows } = await db.query(
+    'SELECT id FROM placements_drives WHERE company_id = $1',
+    [id]
+  );
+  const driveIds = driveRows.map((row) => row.id);
+  if (driveIds.length) {
+    await db.query(
+      'DELETE FROM student_placement_process WHERE placement_drive_id = ANY($1::bigint[])',
+      [driveIds]
+    );
+    await db.query('DELETE FROM placements_drives WHERE id = ANY($1::bigint[])', [driveIds]);
+  }
+
+  if (offersAction === 'keep_off_campus') {
+    await convertCompanyOffersToOffCampus(db, id, companyName);
+  } else {
+    await deleteCompanyOffersForCompany(db, id);
+  }
+
+  await db.query('DELETE FROM user_login WHERE company_id = $1', [id]);
+  await db.query('DELETE FROM contacts WHERE company_id = $1', [id]);
+  await db.query('DELETE FROM companies WHERE id = $1', [id]);
 }
 
 const JOB_OFFERS_SELECT = `

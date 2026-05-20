@@ -2393,15 +2393,26 @@ exports.updateCompany = async (req, res) => {
  * Delete a company and its contacts.
  */
 exports.deleteCompany = async (req, res) => {
+  const client = await pool.connect();
   try {
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return res.status(400).json({ message: 'Invalid company id' });
 
-    await placementDb.deleteCompany(id);
+    const offersAction = req.body?.offersAction === 'keep_off_campus' ? 'keep_off_campus' : 'delete';
+
+    await client.query('BEGIN');
+    await placementDb.deleteCompany(id, { offersAction }, client);
+    await client.query('COMMIT');
     res.status(204).send();
   } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.statusCode === 404) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
     logger.error('Error deleting company:', error);
     res.status(500).json({ message: error.message || 'Server error' });
+  } finally {
+    client.release();
   }
 };
 

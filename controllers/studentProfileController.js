@@ -7,7 +7,7 @@ const { ensureShareLink } = require('./projectController');
 const { computeCurrentYearSemester } = require('../utils/studentAcademic');
 const { getFriendlyMessage } = require('../utils/constraintErrors');
 const { normalizePhoneForDb } = require('../utils/phoneNormalizer');
-const { deleteStudentsByCriteria } = require('../utils/studentDeletion');
+const { deleteStudentsByCriteria, deleteStudentByUsn } = require('../utils/studentDeletion');
 const {
   sendError,
   sendNotFound,
@@ -4014,5 +4014,34 @@ exports.bulkInsertStudents = async (req, res) => {
         res.status(201).json({ inserted: inserted || [], count: (inserted || []).length });
     } catch (error) {
         return sendCaughtError(res, error, 'Failed to bulk insert students.');
+    }
+};
+
+/**
+ * DELETE /student/students/:usn - permanently delete a student and all related records (admin).
+ */
+exports.deleteStudent = async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const usn = String(req.params.usn || '').trim().toUpperCase();
+        if (!usn) {
+            return sendValidationError(res, 'USN is required.');
+        }
+
+        await client.query('BEGIN');
+        const result = await deleteStudentByUsn(client, usn);
+        await client.query('COMMIT');
+        res.json({ message: 'Student deleted successfully', usn: result.usn });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (error.statusCode === 404) {
+            return sendNotFound(res, 'Student not found.');
+        }
+        if (error.statusCode === 400) {
+            return sendValidationError(res, error.message);
+        }
+        return sendCaughtError(res, error, 'Failed to delete student.');
+    } finally {
+        client.release();
     }
 };
