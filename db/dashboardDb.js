@@ -72,6 +72,19 @@ offer_flags AS (
       OR (jt LIKE '%intern%' AND jt LIKE '%full%')
     ) AS is_ppo
   FROM offer_rows
+),
+student_buckets AS (
+  SELECT DISTINCT ON (student_id)
+    student_id,
+    school_id,
+    school_name,
+    CASE
+      WHEN is_ppo THEN 'ppo'
+      WHEN is_fulltime THEN 'fulltime'
+      WHEN is_internship THEN 'internship'
+    END AS placement_bucket
+  FROM offer_flags
+  ORDER BY student_id, is_ppo DESC, is_fulltime DESC, is_internship DESC
 )`;
 
 function pct(numerator, denominator, suffix = '%') {
@@ -141,25 +154,34 @@ async function getDriveCounts() {
 async function getGlobalOfferStats(seekingTotal) {
   const { rows } = await timedQuery(
     'global_offer_stats',
-    `WITH ${OFFER_ANALYTICS_CTE}
-     SELECT
-       COUNT(*)::int AS total_offers,
-       COUNT(DISTINCT student_id)::int AS placed_students,
-       COUNT(DISTINCT student_id) FILTER (WHERE is_fulltime)::int AS full_time,
-       COUNT(DISTINCT student_id) FILTER (WHERE is_internship)::int AS internships,
-       COUNT(DISTINCT student_id) FILTER (WHERE is_ppo)::int AS ppo,
-       COALESCE(MAX(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS max_ctc,
-       COALESCE(MIN(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS min_ctc,
-       COALESCE(AVG(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS avg_ctc,
-       COUNT(*) FILTER (WHERE ctc_lpa > 0 AND ctc_lpa < 4)::int AS ctc_b0,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 4 AND ctc_lpa < 8)::int AS ctc_b1,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 8 AND ctc_lpa < 12)::int AS ctc_b2,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 12 AND ctc_lpa < 16)::int AS ctc_b3,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 16 AND ctc_lpa < 20)::int AS ctc_b4,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 20 AND ctc_lpa < 24)::int AS ctc_b5,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 24 AND ctc_lpa < 28)::int AS ctc_b6,
-       COUNT(*) FILTER (WHERE ctc_lpa >= 28)::int AS ctc_b7
-     FROM offer_flags`
+    `WITH ${OFFER_ANALYTICS_CTE},
+     offer_totals AS (
+       SELECT
+         COUNT(*)::int AS total_offers,
+         COALESCE(MAX(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS max_ctc,
+         COALESCE(MIN(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS min_ctc,
+         COALESCE(AVG(ctc_lpa) FILTER (WHERE ctc_lpa > 0), 0)::float AS avg_ctc,
+         COUNT(*) FILTER (WHERE ctc_lpa > 0 AND ctc_lpa < 4)::int AS ctc_b0,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 4 AND ctc_lpa < 8)::int AS ctc_b1,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 8 AND ctc_lpa < 12)::int AS ctc_b2,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 12 AND ctc_lpa < 16)::int AS ctc_b3,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 16 AND ctc_lpa < 20)::int AS ctc_b4,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 20 AND ctc_lpa < 24)::int AS ctc_b5,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 24 AND ctc_lpa < 28)::int AS ctc_b6,
+         COUNT(*) FILTER (WHERE ctc_lpa >= 28)::int AS ctc_b7
+       FROM offer_flags
+     ),
+     bucket_totals AS (
+       SELECT
+         COUNT(*)::int AS placed_students,
+         COUNT(*) FILTER (WHERE placement_bucket = 'fulltime')::int AS full_time,
+         COUNT(*) FILTER (WHERE placement_bucket = 'internship')::int AS internships,
+         COUNT(*) FILTER (WHERE placement_bucket = 'ppo')::int AS ppo
+       FROM student_buckets
+     )
+     SELECT ot.*, bt.placed_students, bt.full_time, bt.internships, bt.ppo
+     FROM offer_totals ot
+     CROSS JOIN bucket_totals bt`
   );
   const r = rows[0] || {};
   const totalOffers = r.total_offers ?? 0;
@@ -177,11 +199,11 @@ async function getGlobalOfferStats(seekingTotal) {
     },
     breakdown: {
       fullTime,
-      fullTimePercent: pct(fullTime, totalOffers),
+      fullTimePercent: pct(fullTime, placed),
       internships,
-      internshipsPercent: pct(internships, totalOffers),
+      internshipsPercent: pct(internships, placed),
       internshipCumFulltime: ppo,
-      internshipCumFulltimePercent: pct(ppo, totalOffers),
+      internshipCumFulltimePercent: pct(ppo, placed),
     },
     ctc: {
       highest: formatLpa(r.max_ctc),
@@ -217,31 +239,38 @@ async function getPlacementBySchool() {
        GROUP BY sch.id, sch.name, sch.abbreviation
      ),
      ${OFFER_ANALYTICS_CTE},
-     school_offers AS (
+     school_offer_counts AS (
        SELECT
          COALESCE(of.school_name, 'Unknown') AS school,
-         COUNT(*)::int AS total_offers,
-         COUNT(DISTINCT of.student_id)::int AS placed,
-         COUNT(DISTINCT of.student_id) FILTER (WHERE of.is_fulltime)::int AS full_time,
-         COUNT(DISTINCT of.student_id) FILTER (WHERE of.is_internship)::int AS internship,
-         COUNT(DISTINCT of.student_id) FILTER (WHERE of.is_ppo)::int AS ppo
+         COUNT(*)::int AS total_offers
        FROM offer_flags of
        GROUP BY COALESCE(of.school_name, 'Unknown')
+     ),
+     school_buckets AS (
+       SELECT
+         COALESCE(sb.school_name, 'Unknown') AS school,
+         COUNT(*)::int AS placed,
+         COUNT(*) FILTER (WHERE sb.placement_bucket = 'fulltime')::int AS full_time,
+         COUNT(*) FILTER (WHERE sb.placement_bucket = 'internship')::int AS internship,
+         COUNT(*) FILTER (WHERE sb.placement_bucket = 'ppo')::int AS ppo
+       FROM student_buckets sb
+       GROUP BY COALESCE(sb.school_name, 'Unknown')
      )
      SELECT
        ss.school,
        ss.total,
-       COALESCE(so.full_time, 0)::int AS full_time,
-       COALESCE(so.internship, 0)::int AS internship,
-       COALESCE(so.ppo, 0)::int AS ppo,
-       COALESCE(so.total_offers, 0)::int AS total_offers,
-       COALESCE(so.placed, 0)::int AS placed,
+       COALESCE(sb.full_time, 0)::int AS full_time,
+       COALESCE(sb.internship, 0)::int AS internship,
+       COALESCE(sb.ppo, 0)::int AS ppo,
+       COALESCE(soc.total_offers, 0)::int AS total_offers,
+       COALESCE(sb.placed, 0)::int AS placed,
        CASE
-         WHEN ss.total > 0 THEN ROUND((COALESCE(so.placed, 0)::numeric / ss.total) * 100, 2)
+         WHEN ss.total > 0 THEN ROUND((COALESCE(sb.placed, 0)::numeric / ss.total) * 100, 2)
          ELSE 0
        END AS percent
      FROM school_students ss
-     LEFT JOIN school_offers so ON so.school = ss.school
+     LEFT JOIN school_buckets sb ON sb.school = ss.school
+     LEFT JOIN school_offer_counts soc ON soc.school = ss.school
      ORDER BY ss.school ASC`
   );
 

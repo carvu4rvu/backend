@@ -2838,9 +2838,7 @@ exports.updateStudentEligibility = async (req, res) => {
     }
 
     const body = req.body;
-    const payload = {
-      updated_at: new Date().toISOString()
-    };
+    const payload = {};
 
     // Only update fields that are explicitly provided
     if (typeof body.is_summer_immersion_eligible === 'boolean') {
@@ -2878,9 +2876,7 @@ exports.bulkUpdateStudentEligibility = async (req, res) => {
       return res.status(400).json({ message: 'USNs array is required' });
     }
 
-    const payload = {
-      updated_at: new Date().toISOString()
-    };
+    const payload = {};
 
     if (typeof eligibility.is_summer_immersion_eligible === 'boolean') {
       payload.is_summer_immersion_eligible = eligibility.is_summer_immersion_eligible;
