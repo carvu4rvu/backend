@@ -25,6 +25,19 @@ function canShowOnAlumniShowcase(project) {
   return isApprovedStatus(project.project_status) && isPublicVisibility(project.visibility);
 }
 
+/** Admin / VC / placement staff — may like or view any project on internal showcase */
+function isPrivilegedProjectRole(role) {
+  const r = String(role || '').toLowerCase().trim();
+  return r === 'admin' || r === 'vc' || r === 'placement';
+}
+
+/** Like, favorite, view: public rules OR privileged staff on manage/showcase */
+function canEngageWithProject(project, role) {
+  if (!project) return false;
+  if (isPrivilegedProjectRole(role)) return true;
+  return canShowOnAlumniShowcase(project);
+}
+
 /** SQL fragment for WHERE (use alias e.g. p) */
 function alumniShowcaseWhere(alias = 'p') {
   return `LOWER(TRIM(${alias}.project_status::text)) = 'approved'
@@ -37,5 +50,7 @@ module.exports = {
   isPublicVisibility,
   isApprovedStatus,
   canShowOnAlumniShowcase,
+  isPrivilegedProjectRole,
+  canEngageWithProject,
   alumniShowcaseWhere,
 };

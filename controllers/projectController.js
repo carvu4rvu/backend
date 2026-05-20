@@ -16,6 +16,7 @@ const {
 } = require('../utils/apiErrorResponse');
 const crypto = require('crypto');
 const { enqueueVariantJob } = require('../services/variantJobProcessor');
+const { attachSnapVariantsToProjects } = require('../utils/projectSnapVariants');
 
 const VALID_VISIBILITY = ['PRIVATE', 'PUBLIC'];
 const { canShowOnAlumniShowcase } = require('../utils/projectShowcase');
@@ -1186,6 +1187,7 @@ exports.adminList = async (req, res) => {
       let metricsByProj = {};
       let likedProjectIds = new Set();
       let favoritedProjectIds = new Set();
+      const staffFavoriteCountByProject = {};
       const userId = req.user?.id ?? req.user?.user_id;
 
       if (projectIds.length > 0) {
@@ -1196,6 +1198,16 @@ exports.adminList = async (req, res) => {
           ),
           client.query(
             'SELECT project_id, views, likes, favorites FROM project_metrics WHERE project_id = ANY($1::bigint[])',
+            [projectIds]
+          ),
+          client.query(
+            `SELECT pf.project_id, COUNT(*)::int AS staff_favorite_count
+             FROM project_favorites pf
+             INNER JOIN user_login ul ON ul.id = pf.user_id
+             INNER JOIN roles r ON r.id = ul.role_id
+             WHERE LOWER(TRIM(r.name)) IN ('admin', 'vc', 'placement')
+               AND pf.project_id = ANY($1::bigint[])
+             GROUP BY pf.project_id`,
             [projectIds]
           ),
         ];
@@ -1216,11 +1228,14 @@ exports.adminList = async (req, res) => {
         (results[1].rows || []).forEach((m) => {
           metricsByProj[m.project_id] = m;
         });
-        if (userId && results[2]) {
-          (results[2].rows || []).forEach((r) => likedProjectIds.add(r.project_id));
-        }
+        (results[2].rows || []).forEach((r) => {
+          staffFavoriteCountByProject[r.project_id] = r.staff_favorite_count ?? 1;
+        });
         if (userId && results[3]) {
-          (results[3].rows || []).forEach((r) => favoritedProjectIds.add(r.project_id));
+          (results[3].rows || []).forEach((r) => likedProjectIds.add(r.project_id));
+        }
+        if (userId && results[4]) {
+          (results[4].rows || []).forEach((r) => favoritedProjectIds.add(r.project_id));
         }
       }
 
@@ -1249,11 +1264,18 @@ exports.adminList = async (req, res) => {
           views_count: m.views ?? 0,
           likes_count: m.likes ?? 0,
           favorites_count: m.favorites ?? 0,
+          comments_count: m.comments ?? 0,
+          created_at: p.created_at,
+          published_at: p.published_at,
           is_liked: likedProjectIds.has(p.id),
           is_favorited: favoritedProjectIds.has(p.id),
+          is_staff_favorited: (staffFavoriteCountByProject[p.id] || 0) > 0,
+          staff_favorite_count: staffFavoriteCountByProject[p.id] || 0,
           is_approved: p.project_status === 'approved',
         };
       });
+
+      await attachSnapVariantsToProjects(client, list);
 
       res.json(list);
     } finally {
@@ -1441,6 +1463,18 @@ exports.adminGetById = async (req, res) => {
         .sort((a, b) => a.position - b.position)
         .map((a) => a.original_url);
 
+      const snap_variants = {};
+      assets.forEach((a) => {
+        const url = a.original_url && String(a.original_url).trim();
+        if (!url) return;
+        const vars = variantsByAsset[a.id] || [];
+        if (!vars.length) return;
+        snap_variants[url] = {};
+        vars.forEach((v) => {
+          snap_variants[url][v.variant_type] = { url: v.variant_url, width: v.width };
+        });
+      });
+
       res.json({
         id: p.id,
         owner_usn: p.owner_usn,
@@ -1461,6 +1495,7 @@ exports.adminGetById = async (req, res) => {
         priority: p.priority,
         project_status: p.project_status,
         project_snaps,
+        snap_variants,
         assets: assetsWithVariants,
         metrics: {
           views: metrics.views ?? 0,

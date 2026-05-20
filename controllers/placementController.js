@@ -4,7 +4,8 @@ const dashboardDb = require('../db/dashboardDb');
 const catalogDb = require('../db/catalogDb');
 const policiesDb = require('../db/policiesDb');
 const alumniDb = require('../db/alumniDb');
-const { alumniShowcaseWhere, canShowOnAlumniShowcase } = require('../utils/projectShowcase');
+const { alumniShowcaseWhere, canShowOnAlumniShowcase, canEngageWithProject } = require('../utils/projectShowcase');
+const { attachSnapVariantsToProjectsPool } = require('../utils/projectSnapVariants');
 const studentDb = require('../db/studentDb');
 const logger = require('../utils/logger');
 const { createAndSendToUsns } = require('../utils/notificationHelper');
@@ -4357,7 +4358,7 @@ exports.getAlumniProjects = async (req, res) => {
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
-        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility,
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.created_at, p.visibility,
         p.project_status
        FROM projects p
        LEFT JOIN project_metrics m ON m.project_id = p.id
@@ -4370,8 +4371,9 @@ exports.getAlumniProjects = async (req, res) => {
     let assetsByProj = {};
     let likedSet = new Set();
     let favoritedSet = new Set();
+    const staffFavoriteCountByProject = {};
     if (projectIds.length > 0) {
-      const [assetRes, likeRes, favRes] = await Promise.all([
+      const [assetRes, likeRes, favRes, staffFavRes] = await Promise.all([
         pool.query(
           `SELECT project_id, original_url, position
            FROM project_assets
@@ -4388,7 +4390,20 @@ exports.getAlumniProjects = async (req, res) => {
           'SELECT project_id FROM project_favorites WHERE project_id = ANY($1::bigint[]) AND user_id = $2',
           [projectIds, userId]
         ),
+        pool.query(
+          `SELECT pf.project_id, COUNT(*)::int AS staff_favorite_count
+           FROM project_favorites pf
+           INNER JOIN user_login ul ON ul.id = pf.user_id
+           INNER JOIN roles r ON r.id = ul.role_id
+           WHERE LOWER(TRIM(r.name)) IN ('admin', 'vc', 'placement')
+             AND pf.project_id = ANY($1::bigint[])
+           GROUP BY pf.project_id`,
+          [projectIds]
+        ),
       ]);
+      (staffFavRes.rows || []).forEach((r) => {
+        staffFavoriteCountByProject[r.project_id] = r.staff_favorite_count ?? 1;
+      });
       (assetRes.rows || []).forEach((a) => {
         const url = a.original_url && String(a.original_url).trim();
         if (!url) return;
@@ -4435,10 +4450,17 @@ exports.getAlumniProjects = async (req, res) => {
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
         favorites_count: m.favorites ?? 0,
+        comments_count: m.comments ?? 0,
+        created_at: p.created_at,
+        published_at: p.published_at,
         is_liked: likedSet.has(p.id),
         is_favorited: favoritedSet.has(p.id),
+        is_staff_favorited: (staffFavoriteCountByProject[p.id] || 0) > 0,
+        staff_favorite_count: staffFavoriteCountByProject[p.id] || 0,
       };
     });
+
+    await attachSnapVariantsToProjectsPool(list);
 
     res.json(list);
   } catch (err) {
@@ -4573,7 +4595,8 @@ exports.incrementProjectView = async (req, res) => {
       'SELECT id, visibility, project_status FROM projects WHERE id = $1',
       [projectId]
     );
-    if (!projRes.rows.length || !canShowOnAlumniShowcase(projRes.rows[0])) {
+    const userRole = req.user?.role;
+    if (!projRes.rows.length || !canEngageWithProject(projRes.rows[0], userRole)) {
       return res.status(404).json({ message: 'Project not found.' });
     }
 
@@ -4640,7 +4663,8 @@ exports.toggleProjectLike = async (req, res) => {
       return res.status(404).json({ message: 'Project not found.' });
     }
     const p = projRes.rows[0];
-    if (!canShowOnAlumniShowcase(p)) {
+    const userRole = req.user?.role;
+    if (!canEngageWithProject(p, userRole)) {
       return res.status(404).json({ message: 'Project not found.' });
     }
 
