@@ -773,7 +773,7 @@ async function insertPlacementDrive(row) {
        company_id, academic_year, year, job_type, type_of_hiring, job_description, job_location,
        ctc_structure, stipend_structure, process_rounds, number_of_openings, number_of_registrations,
        placement_status, last_date_to_registration, event_datetime, onboarded_date, tpo, company_remarks
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::text[],$11,$12,$13,$14,$15,$16,$17,$18)
      RETURNING *`,
     [
       row.company_id,
@@ -785,7 +785,7 @@ async function insertPlacementDrive(row) {
       row.job_location,
       row.ctc_structure ? JSON.stringify(row.ctc_structure) : null,
       row.stipend_structure ? JSON.stringify(row.stipend_structure) : null,
-      row.process_rounds ? JSON.stringify(row.process_rounds) : null,
+      Array.isArray(row.process_rounds) ? row.process_rounds : null,
       row.number_of_openings,
       row.number_of_registrations,
       row.placement_status,
@@ -804,7 +804,7 @@ async function updatePlacementDrive(id, row) {
     `UPDATE placements_drives SET
        company_id = $2, academic_year = $3, year = $4, job_type = $5, type_of_hiring = $6,
        job_description = $7, job_location = $8, ctc_structure = $9::jsonb, stipend_structure = $10::jsonb,
-       process_rounds = $11::jsonb, number_of_openings = $12, number_of_registrations = $13,
+       process_rounds = $11::text[], number_of_openings = $12, number_of_registrations = $13,
        placement_status = $14, last_date_to_registration = $15, event_datetime = $16,
        onboarded_date = $17, tpo = $18, company_remarks = $19, updated_at = NOW()
      WHERE id = $1 RETURNING *`,
@@ -819,7 +819,7 @@ async function updatePlacementDrive(id, row) {
       row.job_location,
       row.ctc_structure ? JSON.stringify(row.ctc_structure) : null,
       row.stipend_structure ? JSON.stringify(row.stipend_structure) : null,
-      row.process_rounds ? JSON.stringify(row.process_rounds) : null,
+      Array.isArray(row.process_rounds) ? row.process_rounds : null,
       row.number_of_openings,
       row.number_of_registrations,
       row.placement_status,
