@@ -165,8 +165,14 @@ router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('ad
 router.get('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.getPlacementViolations);
 router.get('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.getDisciplinaryRecords);
 router.post('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.createEligibilityDecisionLog);
+router.put('/violations/eligibility-logs/:id', authenticateToken, authorizeRoles('admin'), violationsController.updateEligibilityDecisionLog);
+router.delete('/violations/eligibility-logs/:id', authenticateToken, authorizeRoles('admin'), violationsController.deleteEligibilityDecisionLog);
 router.post('/violations/placement-violations', authenticateToken, authorizeRoles('admin'), violationsController.createPlacementViolation);
+router.put('/violations/placement-violations/:id', authenticateToken, authorizeRoles('admin'), violationsController.updatePlacementViolation);
+router.delete('/violations/placement-violations/:id', authenticateToken, authorizeRoles('admin'), violationsController.deletePlacementViolation);
 router.post('/violations/disciplinary-records', authenticateToken, authorizeRoles('admin'), violationsController.createDisciplinaryRecord);
+router.put('/violations/disciplinary-records/:id', authenticateToken, authorizeRoles('admin'), violationsController.updateDisciplinaryRecord);
+router.delete('/violations/disciplinary-records/:id', authenticateToken, authorizeRoles('admin'), violationsController.deleteDisciplinaryRecord);
 
 // Job Offers - ensure handlers exist before registering (avoids "argument handler must be a function" crash)
 const getAllJobOffersHandler = placementController.getAllJobOffers;

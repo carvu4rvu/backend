@@ -68,6 +68,84 @@ async function insertDisciplinaryRecord(payload) {
   return rows[0];
 }
 
+async function updateRowById(table, id, payload) {
+  const cols = Object.keys(payload);
+  if (!cols.length) return null;
+  const sets = cols.map((c, i) => `${c} = $${i + 2}`);
+  const { rows } = await pool.query(
+    `UPDATE ${table} SET ${sets.join(', ')} WHERE id = $1 RETURNING *`,
+    [id, ...cols.map((c) => payload[c])]
+  );
+  return rows[0] || null;
+}
+
+async function deleteRowById(table, id) {
+  const { rowCount } = await pool.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
+  return rowCount > 0;
+}
+
+async function getEligibilityDecisionLogById(id) {
+  const rows = await queryMany(
+    `SELECT edl.*,
+            pd.id AS drive_id_ref,
+            pd.job_type AS drive_job_type,
+            pd.placement_status AS drive_placement_status,
+            c.id AS company_id,
+            c.company_name
+     FROM eligibility_decision_logs edl
+     LEFT JOIN placements_drives pd ON pd.id = edl.placement_drive_id
+     LEFT JOIN companies c ON c.id = pd.company_id
+     WHERE edl.id = $1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+
+async function getPlacementViolationById(id) {
+  const rows = await queryMany(
+    `SELECT spv.*,
+            pd.id AS drive_id_ref,
+            pd.job_type AS drive_job_type,
+            c.id AS company_id,
+            c.company_name
+     FROM student_placement_violations spv
+     LEFT JOIN placements_drives pd ON pd.id = spv.placement_drive_id
+     LEFT JOIN companies c ON c.id = pd.company_id
+     WHERE spv.id = $1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+
+async function getDisciplinaryRecordById(id) {
+  const rows = await queryMany('SELECT * FROM student_disciplinary_records WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
+async function updateEligibilityDecisionLog(id, payload) {
+  return updateRowById('eligibility_decision_logs', id, payload);
+}
+
+async function deleteEligibilityDecisionLog(id) {
+  return deleteRowById('eligibility_decision_logs', id);
+}
+
+async function updatePlacementViolation(id, payload) {
+  return updateRowById('student_placement_violations', id, payload);
+}
+
+async function deletePlacementViolation(id) {
+  return deleteRowById('student_placement_violations', id);
+}
+
+async function updateDisciplinaryRecord(id, payload) {
+  return updateRowById('student_disciplinary_records', id, payload);
+}
+
+async function deleteDisciplinaryRecord(id) {
+  return deleteRowById('student_disciplinary_records', id);
+}
+
 function shapeLogRow(row) {
   return {
     ...row,
@@ -153,6 +231,15 @@ module.exports = {
   insertPlacementViolation,
   insertEligibilityDecisionLog,
   insertDisciplinaryRecord,
+  getEligibilityDecisionLogById,
+  getPlacementViolationById,
+  getDisciplinaryRecordById,
+  updateEligibilityDecisionLog,
+  deleteEligibilityDecisionLog,
+  updatePlacementViolation,
+  deletePlacementViolation,
+  updateDisciplinaryRecord,
+  deleteDisciplinaryRecord,
   shapeLogRow,
   shapeViolationRow,
 };
