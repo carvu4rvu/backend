@@ -14,6 +14,7 @@
     "seed:socse-bsc-academics": "node scripts/seedSocseBscStudentAcademics.js",
     "seed:students:full": "node scripts/seedStudentsFullProfiles.js",
     "seed:roles": "node scripts/seedRoleCredentials.js",
+    "seed:alumni-gmail": "node scripts/seedAlumniGmailLogin.js",
     "storage:test": "node ../scripts/test-storage-connectivity.js",
     "storage:migrate": "node ../scripts/migrate-to-supabase-storage.js",
     "storage:verify": "node ../scripts/verify-db-storage-urls.js",

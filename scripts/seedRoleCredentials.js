@@ -17,15 +17,15 @@ const DEFAULT_PASSWORD = '123123';
 
 const SEED = {
   alumni: {
-    email: 'alumni.seed@rvu-demo.com',
+    email: 'alumni@gmail.com',
     profile: {
-      full_name: 'Daniel Foster',
-      graduation_year: 2021,
+      full_name: 'Alex Rivera',
+      graduation_year: 2022,
       institution_name: 'RV University',
-      current_company: 'Asterion Tech',
-      current_designation: 'Senior Product Analyst',
+      current_company: 'TechVentures India',
+      current_designation: 'Senior Software Engineer',
       current_work_location: 'Bengaluru',
-      personal_email: 'daniel.foster.personal@gmail.com',
+      personal_email: 'alumni@gmail.com',
       phone_number: '+91 9876501122',
       linkedin: 'https://www.linkedin.com/in/danielfoster-analytics',
       other_links: { portfolio: 'https://danielfoster.me', medium: 'https://medium.com/@danielfoster' },
