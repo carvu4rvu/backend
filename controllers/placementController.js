@@ -1885,7 +1885,14 @@ exports.getStudentsForPlacement = async (req, res) => {
         opt_in: s.opt_in,
         is_placement_eligible: s.is_placement_eligible,
         admin_hold: s.admin_hold,
-        is_in_process: s.is_in_process ?? false
+        is_in_process: s.is_in_process ?? false,
+        ...(needsAcademicsLateral
+          ? {
+              latest_sgpa: s.latest_sgpa,
+              live_backlogs: s.live_backlogs,
+              closed_backlogs: s.closed_backlogs,
+            }
+          : {}),
       };
     });
 
