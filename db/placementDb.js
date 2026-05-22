@@ -689,6 +689,14 @@ async function getExportProcessRows(driveId) {
   );
 }
 
+async function getProcessesByDriveAndUsns(driveId, usns) {
+  if (!usns?.length) return [];
+  return queryMany(
+    'SELECT * FROM student_placement_process WHERE placement_drive_id = $1 AND usn = ANY($2::text[])',
+    [driveId, usns]
+  );
+}
+
 async function getStudentsBasicByUsns(usns) {
   if (!usns.length) return [];
   return forEachChunk(usns, (chunk) =>
@@ -1055,6 +1063,7 @@ module.exports = {
   getPlacementById,
   getOverviewStatsForUsns,
   getExportProcessRows,
+  getProcessesByDriveAndUsns,
   getStudentsBasicByUsns,
   getProfilesByUsns,
   getEducationByUsns,

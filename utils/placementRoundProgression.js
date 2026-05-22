@@ -158,17 +158,28 @@ function getEffectiveRoundStatus(process, field, roundFields = []) {
   return { key: 'pending', label: 'PENDING', cssClass: 'status-pending' };
 }
 
-/** Whether student may appear on round tab (includes eliminated for NQ display). */
+function isComplianceViolation(process) {
+  return getComplianceCategory(process) != null;
+}
+
+function countSelectionRoundsPassed(process, roundFields = []) {
+  let count = 0;
+  if (process?.approved_status === 'Qualified') count += 1;
+  for (const f of roundFields) {
+    if (f && process[f] === true) count += 1;
+  }
+  return count;
+}
+
+/** Individual round tabs: passed all prior rounds only; violations only in All Rounds. */
 function isVisibleOnRoundTab(process, roundIndex, roundFields) {
   if (!isRegistered(process)) return roundIndex === -2;
   if (roundIndex === -3) return isRegistered(process);
   if (roundIndex < 0) return true;
-  if (process.approved_status !== 'Qualified') return roundIndex <= -3;
 
-  for (let j = 0; j < roundIndex; j++) {
-    const f = roundFields[j];
-    if (f && process[f] === false) return true;
-  }
+  if (roundIndex >= 0 && isComplianceViolation(process)) return false;
+
+  if (process.approved_status !== 'Qualified') return false;
 
   for (let j = 0; j < roundIndex; j++) {
     const f = roundFields[j];
@@ -214,6 +225,8 @@ module.exports = {
   getEffectiveRoundStatus,
   findPriorTerminal,
   isVisibleOnRoundTab,
+  isComplianceViolation,
+  countSelectionRoundsPassed,
   enrichProcessRoundDisplays,
   formatStatusForExport,
   roundLabelsToFields,

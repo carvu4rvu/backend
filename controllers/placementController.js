@@ -1051,6 +1051,11 @@ exports.getDriveExportData = async (req, res) => {
 
     const stage = (req.query.stage || 'approved').toLowerCase();
     const columns = req.query.columns ? String(req.query.columns).split(',').map((c) => c.trim()).filter(Boolean) : null;
+    const roundIndexRaw = req.query.round_index;
+    const roundIndex =
+      roundIndexRaw != null && roundIndexRaw !== '' ? parseInt(roundIndexRaw, 10) : null;
+    const roundFieldParam = (req.query.round_field || '').trim();
+    const roundOutcome = (req.query.round_outcome || 'selected').toLowerCase();
 
     let processes = await placementDb.getExportProcessRows(driveId);
     if (stage === 'approved') {
@@ -1062,7 +1067,53 @@ exports.getDriveExportData = async (req, res) => {
       [driveId]
     );
     const exportProcessRounds = sanitizeProcessRounds(driveMetaRows[0]?.process_rounds);
-    const { formatStatusForExport } = require('../utils/placementRoundProgression');
+    const {
+      formatStatusForExport,
+      isVisibleOnRoundTab,
+      roundLabelsToFields,
+    } = require('../utils/placementRoundProgression');
+    const roundFields = roundLabelsToFields(exportProcessRounds);
+    const { isRoundFieldAllowed } = require('../utils/roundBulkStatus');
+    let activeRoundField =
+      roundIndex != null && !Number.isNaN(roundIndex) && roundIndex >= 0
+        ? roundFields[roundIndex]
+        : null;
+    let visibilityTabIndex = roundIndex;
+    if (
+      roundFieldParam === 'registration_status' ||
+      (roundFieldParam && isRoundFieldAllowed(roundFieldParam))
+    ) {
+      activeRoundField = roundFieldParam;
+      if (roundFieldParam === 'approved_status') {
+        visibilityTabIndex = -3;
+      } else if (roundFieldParam === 'registration_status') {
+        visibilityTabIndex = -2;
+      } else {
+        visibilityTabIndex = roundFields.indexOf(roundFieldParam);
+      }
+    }
+
+    if (
+      stage === 'round' &&
+      activeRoundField &&
+      visibilityTabIndex != null &&
+      !Number.isNaN(visibilityTabIndex)
+    ) {
+      processes = processes.filter((p) => isVisibleOnRoundTab(p, visibilityTabIndex, roundFields));
+      if (activeRoundField && roundOutcome === 'selected') {
+        processes = processes.filter((p) =>
+          activeRoundField === 'approved_status'
+            ? p.approved_status === 'Qualified'
+            : p[activeRoundField] === true
+        );
+      } else if (activeRoundField && roundOutcome === 'rejected') {
+        processes = processes.filter((p) =>
+          activeRoundField === 'approved_status'
+            ? p.approved_status === 'Not Qualified'
+            : p[activeRoundField] === false
+        );
+      }
+    }
     processes = await attachDriveComplianceDetails(processes, driveId);
 
     const usns = [...new Set(processes.map((p) => p.usn).filter(Boolean))];
@@ -1131,7 +1182,7 @@ exports.getDriveExportData = async (req, res) => {
       'internships_summary', 'brief_summary', 'key_expertise', 'career_objective',
       'registration_status', 'approved_status', 'is_eligible',
       'oa_status', 'gd_status', 'technical_round_status', 'interview_status', 'hr_round_status', 'final_select_status',
-      'malpractice', 'remarks'
+      'round_status', 'malpractice', 'remarks'
     ];
 
     const data = processes.map((proc) => {
@@ -1177,6 +1228,9 @@ exports.getDriveExportData = async (req, res) => {
         interview_status: formatStatusForExport(proc, 'interview_status', exportProcessRounds),
         hr_round_status: formatStatusForExport(proc, 'hr_round_status', exportProcessRounds),
         final_select_status: proc.final_select_status === true ? 'SELECTED' : proc.final_select_status === false ? 'NOT SELECTED' : 'PENDING',
+        round_status: activeRoundField
+          ? formatStatusForExport(proc, activeRoundField, exportProcessRounds)
+          : null,
         malpractice: proc.malpractice === true ? 'YES' : 'NO',
         remarks: proc.remarks || null,
       };
@@ -1190,6 +1244,77 @@ exports.getDriveExportData = async (req, res) => {
   } catch (err) {
     logger.error('getDriveExportData:', err);
     res.status(500).json({ message: apiMessage(err, 'Server error') });
+  }
+};
+
+/**
+ * POST /placement/drives/:driveId/process/bulk-round-status
+ * Body: { round_field, updates: [{ usn, status }] } — bulk update one round from spreadsheet.
+ */
+exports.bulkUpdateRoundStatus = async (req, res) => {
+  try {
+    const driveId = parseInt(req.params.driveId, 10);
+    if (Number.isNaN(driveId)) return res.status(400).json({ message: 'Invalid drive ID' });
+
+    const { round_field: roundField, updates } = req.body || {};
+    const {
+      parseBulkRoundStatus,
+      isRoundFieldAllowed,
+      clearLaterRoundFields,
+    } = require('../utils/roundBulkStatus');
+    const { roundLabelsToFields } = require('../utils/placementRoundProgression');
+
+    if (!isRoundFieldAllowed(roundField)) {
+      return res.status(400).json({ message: 'Invalid round_field for bulk update.' });
+    }
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ message: 'updates array is required.' });
+    }
+
+    const { rows: driveMetaRows } = await pool.query(
+      'SELECT process_rounds FROM placements_drives WHERE id = $1',
+      [driveId]
+    );
+    const roundFields = roundLabelsToFields(sanitizeProcessRounds(driveMetaRows[0]?.process_rounds));
+
+    const usns = [...new Set(updates.map((u) => String(u?.usn || '').trim()).filter(Boolean))];
+    const processRows = await placementDb.getProcessesByDriveAndUsns(driveId, usns);
+    const byUsn = new Map(processRows.map((r) => [r.usn, r]));
+
+    const result = { updated: [], skipped: [], errors: [] };
+
+    for (const row of updates) {
+      const usn = String(row?.usn || '').trim();
+      if (!usn) continue;
+      const proc = byUsn.get(usn);
+      if (!proc) {
+        result.skipped.push({ usn, reason: 'Not found on this drive' });
+        continue;
+      }
+      const value = parseBulkRoundStatus(row.status, roundField);
+      if (value === undefined) {
+        result.errors.push({ usn, status: row.status, reason: 'Invalid status (use Selected or Rejected)' });
+        continue;
+      }
+      let payload = { [roundField]: value };
+      const rejected =
+        roundField === 'approved_status'
+          ? value === 'Not Qualified'
+          : value === false;
+      if (rejected) {
+        payload = clearLaterRoundFields(payload, roundField, roundFields);
+      }
+      await placementDb.updateProcessStatusById(proc.id, payload);
+      result.updated.push({ usn, status: row.status, value });
+    }
+
+    res.json({
+      message: `Updated ${result.updated.length} student(s).`,
+      ...result,
+    });
+  } catch (err) {
+    logger.error('bulkUpdateRoundStatus:', err);
+    res.status(500).json({ message: apiMessage(err, 'Server error during bulk update') });
   }
 };
 
@@ -3325,35 +3450,225 @@ exports.convertToAlumni = async (req, res) => {
 
 /**
  * GET /placement/alumni/conversion-logs
- * Returns alumni_conversion_log rows for the Conversion logs tab.
+ * Flat list: { logs: [...] }
+ * Grouped by bulk batch (?grouped=true): { batches: [{ batch_id, total, success, failed, logs: [...] }] }
  */
 exports.getAlumniConversionLogs = async (req, res) => {
   try {
-    const { batch_id, status, limit = 200 } = req.query;
-    let query = 'SELECT id, batch_id, usn, rvu_email, personal_email, role_converted, personal_mail_row_created, status, error_message, created_at, updated_at FROM alumni_conversion_log';
+    const { batch_id, status, limit = 200, grouped } = req.query;
+    const groupedMode = grouped === 'true' || grouped === '1';
+    let query = `
+      SELECT l.id, l.batch_id, l.usn, l.rvu_email, l.personal_email,
+             l.role_converted, l.personal_mail_row_created, l.status, l.error_message,
+             l.created_at, l.updated_at, s.full_name AS student_name
+      FROM alumni_conversion_log l
+      LEFT JOIN student_basic_details s ON s.usn = l.usn`;
     const params = [];
     const conditions = [];
     let idx = 1;
     if (batch_id) {
-      conditions.push(`batch_id = $${idx}`);
+      conditions.push(`l.batch_id = $${idx}`);
       params.push(batch_id);
       idx++;
     }
     if (status) {
-      conditions.push(`status = $${idx}`);
+      conditions.push(`l.status = $${idx}`);
       params.push(status);
       idx++;
     }
     if (conditions.length) query += ' WHERE ' + conditions.join(' AND ');
-    query += ' ORDER BY created_at DESC';
-    const limitVal = Math.min(500, Math.max(1, parseInt(limit, 10) || 200));
-    query += ` LIMIT ${limitVal}`;
+    query += ' ORDER BY l.created_at DESC';
+    const limitVal = Math.min(2000, Math.max(1, parseInt(limit, 10) || 200));
+    if (!groupedMode) query += ` LIMIT ${limitVal}`;
 
     const result = await pool.query(query, params);
-    res.json({ logs: result.rows || [] });
+    const rows = result.rows || [];
+
+    if (!groupedMode) {
+      return res.json({ logs: rows.slice(0, limitVal) });
+    }
+
+    const byBatch = new Map();
+    rows.forEach((row) => {
+      const bid = row.batch_id;
+      if (!byBatch.has(bid)) {
+        byBatch.set(bid, { batch_id: bid, logs: [], created_at: row.created_at });
+      }
+      const batch = byBatch.get(bid);
+      batch.logs.push(row);
+      if (row.created_at && (!batch.created_at || new Date(row.created_at) > new Date(batch.created_at))) {
+        batch.created_at = row.created_at;
+      }
+    });
+
+    const batches = Array.from(byBatch.values())
+      .map((b) => {
+        const logs = b.logs.sort((a, c) => String(a.usn || '').localeCompare(String(c.usn || '')));
+        return {
+          batch_id: b.batch_id,
+          created_at: b.created_at,
+          total: logs.length,
+          success: logs.filter((l) => l.status === 'success').length,
+          failed: logs.filter((l) => l.status === 'failed').length,
+          pending: logs.filter((l) => l.status === 'pending').length,
+          reverted: logs.filter((l) => l.status === 'reverted').length,
+          logs,
+        };
+      })
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+      .slice(0, Math.min(100, limitVal));
+
+    res.json({ batches });
   } catch (err) {
     logger.error('getAlumniConversionLogs:', err);
     res.status(500).json({ message: err.message || 'Server error fetching conversion logs' });
+  }
+};
+
+/**
+ * POST /placement/alumni/conversion-logs/revert
+ * Body: { batch_id: uuid }. Undoes successful conversions in a bulk batch and marks all
+ * rows in alumni_conversion_log as status 'reverted' (audit trail preserved).
+ */
+exports.revertAlumniConversionBatch = async (req, res) => {
+  const batchId = (req.body?.batch_id || req.params?.batchId || '').trim();
+  if (!batchId) {
+    return res.status(400).json({ message: 'batch_id is required.' });
+  }
+
+  const adminUserId = req.user && req.user.id != null ? req.user.id : null;
+  const client = await pool.connect();
+  const results = [];
+
+  try {
+    const logsRes = await client.query(
+      'SELECT * FROM alumni_conversion_log WHERE batch_id = $1 ORDER BY id ASC',
+      [batchId]
+    );
+    const logs = logsRes.rows || [];
+    if (!logs.length) {
+      return res.status(404).json({ message: 'No conversion logs found for this batch.' });
+    }
+
+    const revertable = logs.filter((l) => l.status === 'success');
+    if (!revertable.length && logs.every((l) => l.status === 'reverted')) {
+      return res.status(400).json({ message: 'This batch has already been fully reverted.' });
+    }
+
+    const roleRes = await client.query("SELECT id, name FROM roles WHERE name IN ('student', 'alumni')");
+    const roleMap = {};
+    roleRes.rows.forEach((r) => {
+      roleMap[r.name] = r.id;
+    });
+    const studentRoleId = roleMap.student;
+    const alumniRoleId = roleMap.alumni;
+    if (!studentRoleId || !alumniRoleId) {
+      return res.status(500).json({ message: 'Student or alumni role not found in roles table' });
+    }
+
+    await client.query('BEGIN');
+
+    for (const log of logs) {
+      if (log.status === 'reverted') {
+        results.push({ usn: log.usn, status: 'reverted', skipped: true });
+        continue;
+      }
+
+      if (log.status === 'success') {
+        try {
+          if (log.rvu_email) {
+            await client.query(
+              `UPDATE user_login SET role_id = $1, updated_at = NOW()
+               WHERE lower(email_id) = lower($2) AND role_id = $3`,
+              [studentRoleId, log.rvu_email, alumniRoleId]
+            );
+          }
+
+          if (log.personal_mail_row_created && log.personal_email) {
+            await client.query(
+              `DELETE FROM user_login
+               WHERE lower(email_id) = lower($1) AND role_id = $2
+                 AND ($3::text IS NULL OR usn IS DISTINCT FROM $3)`,
+              [log.personal_email, alumniRoleId, log.usn || null]
+            );
+          }
+
+          const alumRes = await client.query('SELECT id FROM alumni WHERE student_id = $1', [log.usn]);
+          const alumniId = alumRes.rows[0]?.id;
+          if (alumniId) {
+            await client.query('DELETE FROM alumni_connection_requests WHERE alumni_id = $1', [alumniId]);
+            await client.query('DELETE FROM hr_recommendations WHERE alumni_id = $1', [alumniId]);
+            await client.query('DELETE FROM alumni WHERE id = $1', [alumniId]);
+          }
+
+          await client.query(
+            `UPDATE alumni_conversion_log
+             SET status = 'reverted',
+                 role_converted = false,
+                 personal_mail_row_created = false,
+                 error_message = $2,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [log.id, 'Reverted by administrator — conversion undone']
+          );
+
+          results.push({ usn: log.usn, status: 'reverted', undone: true });
+        } catch (err) {
+          logger.error('revertAlumniConversionBatch single:', log.usn, err);
+          results.push({ usn: log.usn, status: log.status, undone: false, error_message: err.message });
+        }
+      } else {
+        await client.query(
+          `UPDATE alumni_conversion_log
+           SET status = 'reverted',
+               error_message = COALESCE(NULLIF(TRIM(error_message), ''), 'Marked reverted with batch'),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [log.id]
+        );
+        results.push({ usn: log.usn, status: 'reverted', log_only: true });
+      }
+    }
+
+    const failedUndo = results.filter((r) => r.undone === false);
+    if (failedUndo.length) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({
+        message: 'Revert failed for one or more students. No changes were saved.',
+        results: failedUndo,
+      });
+    }
+
+    if (adminUserId != null) {
+      await client.query(
+        `INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, metadata)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          adminUserId,
+          'alumni_conversion_revert',
+          'alumni_conversion_batch',
+          batchId,
+          JSON.stringify({ batch_id: batchId, reverted: results.filter((r) => !r.skipped).length }),
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const revertedCount = results.filter((r) => !r.skipped).length;
+    res.json({
+      batch_id: batchId,
+      reverted_count: revertedCount,
+      undone_count: results.filter((r) => r.undone).length,
+      results,
+      message: `Reverted ${revertedCount} log(s) in this batch. Records remain visible as reverted.`,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('revertAlumniConversionBatch:', err);
+    res.status(500).json({ message: err.message || 'Server error during batch revert' });
+  } finally {
+    client.release();
   }
 };
 

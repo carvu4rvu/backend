@@ -21,6 +21,7 @@ router.get('/drives', authenticateToken, placementController.getAllDrives);
 router.post('/drives/sync-status', authenticateToken, authorizeRoles('admin'), placementController.syncDriveStatuses);
 router.get('/drives/:driveId/registrations', authenticateToken, authorizeRoles('admin'), placementController.getDriveRegistrations);
 router.get('/drives/:driveId/export', authenticateToken, authorizeRoles('admin'), placementController.getDriveExportData);
+router.post('/drives/:driveId/process/bulk-round-status', authenticateToken, authorizeRoles('admin'), placementController.bulkUpdateRoundStatus);
 router.delete('/drives/:driveId/registrations/:usn', authenticateToken, authorizeRoles('admin'), placementController.removeFromProcess);
 router.get('/drives/:driveId/eligibility', authenticateToken, placementController.getDriveEligibility);
 router.put('/drives/:driveId/eligibility', authenticateToken, authorizeRoles('admin'), placementController.upsertDriveEligibility);
@@ -149,6 +150,7 @@ router.post('/alumni/codes', authenticateToken, placementController.createRegist
 router.delete('/alumni/codes/:id', authenticateToken, placementController.deleteRegistrationCode);
 router.get('/alumni/conversions', authenticateToken, placementController.getAlumniConversions);
 router.get('/alumni/conversion-logs', authenticateToken, authorizeRoles('admin'), placementController.getAlumniConversionLogs);
+router.post('/alumni/conversion-logs/revert', authenticateToken, authorizeRoles('admin'), placementController.revertAlumniConversionBatch);
 router.post('/alumni/convert', authenticateToken, authorizeRoles('admin'), placementController.convertToAlumni);
 router.get('/alumni/events', authenticateToken, authorizeRoles('alumni', 'vc'), placementController.getAlumniEvents);
 router.get('/alumni/notifications/unread-count', authenticateToken, authorizeRoles('alumni', 'vc'), studentNotificationController.getUnreadCount);
