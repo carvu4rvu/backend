@@ -9,6 +9,7 @@ const { attachSnapVariantsToProjectsPool } = require('../utils/projectSnapVarian
 const studentDb = require('../db/studentDb');
 const logger = require('../utils/logger');
 const { createAndSendToUsns } = require('../utils/notificationHelper');
+const { formatDateTimeIST } = require('../utils/dateTime');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
@@ -24,11 +25,10 @@ async function getDriveForNotification(driveId) {
   };
 }
 
-/** Format date for notification message */
+/** Format date for notification message (IST) */
 function formatNotificationDate(iso) {
   if (!iso) return 'TBD';
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  return formatDateTimeIST(iso);
 }
 
 /** Round field key to display label */
@@ -537,7 +537,6 @@ exports.getStudentApplications = async (req, res) => {
     }
     const studentRow = await placementDb.getStudentOptIn(usn);
     if (!studentRow) return res.status(403).json({ message: 'Student record not found' });
-    if (studentRow.opt_in !== true) return res.status(403).json({ message: 'You must opt in to placement to view applications' });
 
     const formattedData = await placementDb.getStudentApplications(usn);
     res.json(formattedData);

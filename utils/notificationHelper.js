@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { formatDateTimeIST } = require('./dateTime');
 
 const TARGET_CUSTOM = 'CUSTOM';
 const NOTIFICATION_TYPE_PLACEMENT = 'PLACEMENT';
@@ -83,12 +84,11 @@ async function createAndSendToUserIds(opts, user_ids) {
   if (!notificationId) return { notificationId: null, sent: 0 };
 
   const recipientRows = await resolveRecipientEntityIds(user_ids);
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   for (const row of recipientRows) {
     await pool.query(
       `INSERT INTO notification_nodes (notification_id, user_id, user_role, recipient_entity_id, delivered, created_at)
-       VALUES ($1, $2, $3, $4, true, $5::timestamp)`,
-      [notificationId, row.user_id, row.user_role, row.recipient_entity_id, now]
+       VALUES ($1, $2, $3, $4, true, NOW())`,
+      [notificationId, row.user_id, row.user_role, row.recipient_entity_id]
     );
   }
   return { notificationId, sent: recipientRows.length };
@@ -112,8 +112,83 @@ async function createAndSendToUsns(opts, usns) {
   return createAndSendToUserIds(payload, user_ids);
 }
 
+/**
+ * Active user_login ids for a role name (e.g. vc).
+ */
+async function getActiveUserIdsByRole(roleName) {
+  if (!roleName || typeof roleName !== 'string') return [];
+  const result = await pool.query(
+    `SELECT ul.id FROM user_login ul
+     JOIN roles r ON r.id = ul.role_id
+     WHERE lower(r.name) = lower($1) AND ul.is_active = true`,
+    [roleName.trim()]
+  );
+  return (result.rows || []).map((r) => r.id);
+}
+
+function buildCampusEventVcNotification(event, frontendBase) {
+  const when = formatDateTimeIST(event?.event_datetime);
+  const title = event?.title ? `Campus event: ${event.title}` : 'Campus event';
+  const details = event?.details ? String(event.details) : '';
+  const message = [
+    event?.type ? `Type: ${event.type}` : null,
+    `When: ${when}`,
+    event?.status ? `Status: ${event.status}` : null,
+    details
+      ? details.slice(0, 500) + (details.length > 500 ? '…' : '')
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const link = `${frontendBase.replace(/\/$/, '')}/placement/vc-events`;
+  return {
+    title,
+    message,
+    link,
+    notification_type: 'EVENT',
+  };
+}
+
+/**
+ * Insert one notification per campus event and deliver to all VC users.
+ */
+async function notifyVcUsersForCampusEvents(events, createdBy = null) {
+  if (!Array.isArray(events) || events.length === 0) {
+    return { vcCount: 0, notificationsCreated: 0, eventCount: 0, notificationIds: [] };
+  }
+  const frontend = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+  const vcIds = await getActiveUserIdsByRole('vc');
+  if (!vcIds.length) {
+    return { vcCount: 0, notificationsCreated: 0, eventCount: events.length, notificationIds: [] };
+  }
+
+  const notificationIds = [];
+  let notificationsCreated = 0;
+  for (const ev of events) {
+    const payload = {
+      ...buildCampusEventVcNotification(ev, frontend),
+      created_by: createdBy,
+    };
+    const { notificationId, sent } = await createAndSendToUserIds(payload, vcIds);
+    if (notificationId && sent > 0) {
+      notificationsCreated += 1;
+      notificationIds.push(notificationId);
+    }
+  }
+
+  return {
+    vcCount: vcIds.length,
+    notificationsCreated,
+    eventCount: events.length,
+    notificationIds,
+  };
+}
+
 module.exports = {
   createAndSendToUsns,
   createAndSendToUserIds,
   getUserIdsByUsns,
+  getActiveUserIdsByRole,
+  buildCampusEventVcNotification,
+  notifyVcUsersForCampusEvents,
 };

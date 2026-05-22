@@ -1,5 +1,6 @@
 const { pool, queryOne, queryMany } = require('../db/query');
 const storageService = require('../services/storageService');
+const { notifyVcUsersForCampusEvents } = require('../utils/notificationHelper');
 
 function normalizeImages(images) {
   if (Array.isArray(images)) return images;
@@ -183,6 +184,74 @@ exports.uploadImage = async (req, res) => {
     console.error('Events uploadImage error:', err);
     const msg = err.userMessage || err.message || 'Failed to upload event image';
     res.status(500).json({ message: msg });
+  }
+};
+
+/**
+ * POST /events/notify-vc-digest
+ * Admin: one EVENT notification per campus event, each delivered to all VC users.
+ */
+exports.notifyVcDigest = async (req, res) => {
+  try {
+    const events = await queryMany('SELECT * FROM events ORDER BY event_datetime ASC NULLS LAST');
+    if (!events.length) {
+      return res.status(400).json({ message: 'No events to notify about' });
+    }
+
+    const createdBy = req.user?.id || null;
+    const result = await notifyVcUsersForCampusEvents(events, createdBy);
+
+    if (!result.vcCount) {
+      return res.status(400).json({ message: 'No active VC users found' });
+    }
+    if (!result.notificationsCreated) {
+      return res.status(500).json({ message: 'Failed to create VC notifications' });
+    }
+
+    res.json({
+      message: 'Notifications sent to VC',
+      notificationIds: result.notificationIds,
+      notificationsCreated: result.notificationsCreated,
+      vcCount: result.vcCount,
+      eventCount: result.eventCount,
+    });
+  } catch (err) {
+    console.error('Events notifyVcDigest error:', err);
+    res.status(500).json({ message: err.message || 'Failed to notify VC' });
+  }
+};
+
+/**
+ * POST /events/:id/notify-vc
+ * Admin: one EVENT notification for a single campus event to all VC users.
+ */
+exports.notifyVcForEvent = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const event = await queryOne('SELECT * FROM events WHERE id = $1', [id]);
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    const createdBy = req.user?.id || null;
+    const result = await notifyVcUsersForCampusEvents([event], createdBy);
+
+    if (!result.vcCount) {
+      return res.status(400).json({ message: 'No active VC users found' });
+    }
+    if (!result.notificationsCreated) {
+      return res.status(500).json({ message: 'Failed to create VC notification' });
+    }
+
+    res.json({
+      message: 'Notification sent to VC',
+      notificationId: result.notificationIds[0] ?? null,
+      vcCount: result.vcCount,
+      eventCount: 1,
+    });
+  } catch (err) {
+    console.error('Events notifyVcForEvent error:', err);
+    res.status(500).json({ message: err.message || 'Failed to notify VC' });
   }
 };
 

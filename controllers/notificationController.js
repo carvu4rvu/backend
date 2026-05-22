@@ -555,12 +555,11 @@ exports.send = async (req, res) => {
     );
     let inserted = 0;
     if (toInsert.length > 0) {
-      const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
       for (const row of toInsert) {
         await pool.query(
           `INSERT INTO notification_nodes (notification_id, user_id, user_role, recipient_entity_id, delivered, created_at)
-           VALUES ($1, $2, $3, $4, true, $5::timestamp)`,
-          [id, row.user_id, row.user_role, row.recipient_entity_id, now]
+           VALUES ($1, $2, $3, $4, true, NOW())`,
+          [id, row.user_id, row.user_role, row.recipient_entity_id]
         );
         inserted++;
       }
@@ -698,12 +697,11 @@ exports.resend = async (req, res) => {
       (r) => !existingKeys.has(r.recipient_entity_id != null ? `e:${r.recipient_entity_id}` : `u:${r.user_id}`)
     );
 
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
     for (const row of toInsert) {
       await pool.query(
         `INSERT INTO notification_nodes (notification_id, user_id, user_role, recipient_entity_id, delivered, created_at)
-         VALUES ($1, $2, $3, $4, true, $5::timestamp)`,
-        [id, row.user_id, row.user_role, row.recipient_entity_id, now]
+         VALUES ($1, $2, $3, $4, true, NOW())`,
+        [id, row.user_id, row.user_role, row.recipient_entity_id]
       );
     }
 

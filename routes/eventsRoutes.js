@@ -15,6 +15,8 @@ router.get('/notification-stats', eventsController.getNotificationStats);
 router.get('/:id', eventsController.getById);
 
 // Admin only
+router.post('/notify-vc-digest', authenticateToken, authorizeRoles('admin'), eventsController.notifyVcDigest);
+router.post('/:id/notify-vc', authenticateToken, authorizeRoles('admin'), eventsController.notifyVcForEvent);
 router.post('/', authenticateToken, authorizeRoles('admin'), eventsController.create);
 router.post(
   '/:id/image',
