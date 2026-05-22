@@ -191,6 +191,7 @@ async function updateAlumni(id, payload) {
 async function deleteAlumniRecord(id) {
   const row = await getAlumniById(id);
   if (!row) return null;
+  await pool.query('DELETE FROM alumni_connection_requests WHERE alumni_id = $1', [id]);
   await pool.query('DELETE FROM hr_recommendations WHERE alumni_id = $1', [id]);
   const { rowCount } = await pool.query('DELETE FROM alumni WHERE id = $1', [id]);
   return rowCount > 0 ? row : null;
@@ -208,7 +209,7 @@ async function insertRegistrationCode(payload) {
 
 async function deactivateRegistrationCode(id) {
   const { rows } = await pool.query(
-    `UPDATE alumni_registration_codes SET is_active = false, updated_at = NOW()
+    `UPDATE alumni_registration_codes SET is_active = false
      WHERE id = $1 RETURNING *`,
     [id]
   );
@@ -515,7 +516,7 @@ async function updateConnectionRequest(id, payload) {
   const sets = keys.map((k, i) => `${k} = $${i + 2}`);
   const values = [id, ...keys.map((k) => payload[k])];
   const { rows } = await pool.query(
-    `UPDATE alumni_connection_requests SET ${sets.join(', ')}, updated_at = NOW()
+    `UPDATE alumni_connection_requests SET ${sets.join(', ')}
      WHERE id = $1 RETURNING *`,
     values
   );

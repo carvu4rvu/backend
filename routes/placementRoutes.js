@@ -140,8 +140,8 @@ router.get('/alumni/hr-recommendations', authenticateToken, authorizeRoles('alum
 // Alumni: view student profile (limited access)
 router.get('/alumni/student/:usn', authenticateToken, authorizeRoles('alumni'), placementController.getStudentProfileForAlumni);
 router.post('/alumni/connect', authenticateToken, authorizeRoles('alumni'), placementController.createAlumniConnectionRequest);
-router.get('/alumni/connection-requests', authenticateToken, authorizeRoles('admin'), placementController.getAlumniConnectionRequests);
-router.patch('/alumni/connection-requests/:id', authenticateToken, authorizeRoles('admin'), placementController.updateAlumniConnectionRequest);
+router.get('/alumni/connection-requests', authenticateToken, authorizeRoles('admin', 'vc'), placementController.getAlumniConnectionRequests);
+router.patch('/alumni/connection-requests/:id', authenticateToken, authorizeRoles('admin', 'vc'), placementController.updateAlumniConnectionRequest);
 router.get('/alumni', authenticateToken, placementController.getAllAlumni);
 router.post('/alumni', authenticateToken, placementController.addAlumni);
 router.get('/alumni/codes', authenticateToken, placementController.getRegistrationCodes);
@@ -158,7 +158,7 @@ router.patch('/alumni/notifications/:nodeId', authenticateToken, authorizeRoles(
 router.get('/vc/events', authenticateToken, authorizeRoles('vc'), placementController.getVcEvents);
 router.get('/alumni/:identifier', authenticateToken, placementController.getAlumniByIdOrUsn);
 router.put('/alumni/:identifier', authenticateToken, placementController.updateAlumni);
-router.delete('/alumni/:identifier', authenticateToken, authorizeRoles('admin'), placementController.deleteAlumni);
+router.delete('/alumni/:identifier', authenticateToken, authorizeRoles('admin', 'vc'), placementController.deleteAlumni);
 
 // Violations: eligibility logs, placement violations, disciplinary records
 router.get('/violations/eligibility-logs', authenticateToken, authorizeRoles('admin'), violationsController.getEligibilityDecisionLogs);

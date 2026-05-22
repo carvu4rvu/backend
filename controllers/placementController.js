@@ -3519,6 +3519,7 @@ exports.deleteAlumni = async (req, res) => {
       }
     }
 
+    await client.query('DELETE FROM alumni_connection_requests WHERE alumni_id = $1', [existing.id]);
     await client.query('DELETE FROM hr_recommendations WHERE alumni_id = $1', [existing.id]);
     await client.query('DELETE FROM alumni WHERE id = $1', [existing.id]);
 
@@ -4294,20 +4295,20 @@ exports.getAlumniConnectionRequests = async (req, res) => {
     if (alumniIds.length > 0) {
       const alumniRows = await alumniDb.getAlumniByIds(alumniIds);
       alumniRows.forEach((a) => {
-        alumniMap[a.id] = a;
+        alumniMap[String(a.id)] = a;
       });
     }
 
     if (studentUsns.length > 0) {
       const studentRows = await alumniDb.getStudentsBriefByUsns(studentUsns);
       studentRows.forEach((s) => {
-        studentMap[s.usn] = s;
+        studentMap[String(s.usn)] = s;
       });
     }
 
     const enriched = rows.map((r) => {
-      const alum = alumniMap[r.alumni_id];
-      const stud = studentMap[r.student_usn];
+      const alum = alumniMap[String(r.alumni_id)];
+      const stud = studentMap[String(r.student_usn)];
       return {
         ...r,
         alumni_name: alum?.full_name || '—',
