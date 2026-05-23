@@ -221,6 +221,44 @@ function formatStatusForExport(row, field, processRounds) {
   return getEffectiveRoundStatus(row, field, roundFields).label;
 }
 
+function buildDriveRoundFunnel(processRounds, processes) {
+  const rounds = (Array.isArray(processRounds) ? processRounds : []).filter((r) => {
+    const s = String(r || '').trim();
+    return s !== '' && !/^aptitude$/i.test(s);
+  });
+
+  const list = processes || [];
+  const registered = list.filter(isRegistered);
+  const stages = [{ label: 'Registered', count: registered.length, key: 'registered' }];
+
+  let cohort = registered.filter((p) => p.approved_status === 'Qualified');
+  stages.push({ label: 'Qualified', count: cohort.length, key: 'qualified' });
+
+  const seenFields = new Set(['approved_status']);
+  for (const roundName of rounds) {
+    const field = roundLabelsToFields([roundName])[0];
+    if (!field || field === 'approved_status' || field === 'final_select_status') continue;
+    if (seenFields.has(field)) continue;
+    seenFields.add(field);
+
+    cohort = cohort.filter((p) => p[field] === true);
+    stages.push({
+      label: String(roundName).trim(),
+      count: cohort.length,
+      key: field,
+    });
+  }
+
+  const selectedCount = list.filter((p) => p.final_select_status === true).length;
+  stages.push({ label: 'Final Selection', count: selectedCount, key: 'final_select_status' });
+
+  const base = stages[0]?.count || 0;
+  return stages.map((stage) => ({
+    ...stage,
+    pct_of_registered: base > 0 ? Math.round((stage.count / base) * 100) : 0,
+  }));
+}
+
 module.exports = {
   getEffectiveRoundStatus,
   findPriorTerminal,
@@ -231,4 +269,5 @@ module.exports = {
   formatStatusForExport,
   roundLabelsToFields,
   isRegistered,
+  buildDriveRoundFunnel,
 };

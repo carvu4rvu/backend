@@ -4,6 +4,40 @@ const pool = require('../config/db');
 const logger = require('../utils/logger');
 const crypto = require('crypto');
 const { attachSnapVariantsToProjectsPool } = require('../utils/projectSnapVariants');
+const { buildDriveRoundFunnel } = require('../utils/placementRoundProgression');
+
+const JOB_TYPE_BUCKETS = ['Internship', 'Full Time', 'Internship + Full Time'];
+
+/** Map drive job_type values to one of the three dashboard buckets. */
+function normalizeJobTypeBucket(jobType) {
+  const jt = String(jobType || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[_-]/g, ' ')
+    .replace(/\s+/g, ' ');
+  if (!jt) return null;
+  if (
+    jt.includes('internship') &&
+    (jt.includes('full') || jt.includes('fte') || jt.includes('cum') || jt.includes('+'))
+  ) {
+    return 'Internship + Full Time';
+  }
+  if (jt.includes('internship')) return 'Internship';
+  if (jt.includes('full') || jt === 'fte') return 'Full Time';
+  return null;
+}
+
+function buildRegistrationsByJobType(drives) {
+  const counts = Object.fromEntries(JOB_TYPE_BUCKETS.map((k) => [k, 0]));
+  (drives || []).forEach((d) => {
+    const bucket = normalizeJobTypeBucket(d.job_type);
+    if (bucket) counts[bucket] += d.number_of_registrations || 0;
+  });
+  return JOB_TYPE_BUCKETS.map((job_type) => ({
+    job_type,
+    registrations: counts[job_type] || 0,
+  }));
+}
 
 /** Same image asset filter as alumni/admin showcase lists. */
 const PROJECT_IMAGE_ASSET_SQL = `(asset_type IS NULL OR UPPER(TRIM(asset_type::text)) IN ('IMAGE', ''))`;
@@ -1307,11 +1341,12 @@ exports.getDashboardStats = async (req, res) => {
     const company = companyRes.rows[0] || null;
 
     const drivesRes = await pool.query(
-      `SELECT id, placement_status, number_of_registrations, job_type, academic_year
+      `SELECT id, placement_status, number_of_registrations, job_type, academic_year, process_rounds
        FROM placements_drives WHERE company_id = $1 ORDER BY id DESC`,
       [companyId]
     );
     const drives = drivesRes.rows;
+    const drivesById = new Map((drives || []).map((d) => [Number(d.id), d]));
 
     const activeDrives = (drives || []).filter((d) => {
       const status = String(d.placement_status || 'scheduled').toLowerCase();
@@ -1320,11 +1355,49 @@ exports.getDashboardStats = async (req, res) => {
 
     const totalRegistrations = (drives || []).reduce((sum, d) => sum + (d.number_of_registrations || 0), 0);
 
-    // Chart: registrations per drive (bar)
-    const chart_drives_registrations = (drives || []).slice(0, 10).map((d, i) => ({
-      label: (d.job_type || d.academic_year || `Drive ${i + 1}`).toString().slice(0, 20),
-      registrations: d.number_of_registrations || 0,
-    }));
+    /** Ranked drives for dashboard — unique titles (not job_type alone, which duplicates). */
+    const top_drives = (drives || [])
+      .map((d) => {
+        const year = d.academic_year ? String(d.academic_year).trim() : null;
+        const jobType = d.job_type ? String(d.job_type).trim() : null;
+        const titleParts = [year, jobType].filter(Boolean);
+        const title = titleParts.length
+          ? `${titleParts.join(' · ')} (#${d.id})`
+          : `Drive #${d.id}`;
+        return {
+          id: d.id,
+          title,
+          academic_year: year,
+          job_type: jobType,
+          status: d.placement_status || 'scheduled',
+          registrations: d.number_of_registrations || 0,
+        };
+      })
+      .sort((a, b) => b.registrations - a.registrations)
+      .slice(0, 5);
+
+    const topDriveIds = top_drives.map((d) => d.id);
+    if (topDriveIds.length > 0) {
+      const funnelRes = await pool.query(
+        `SELECT placement_drive_id, registration_status, approved_status,
+                oa_status, gd_status, technical_round_status, interview_status,
+                hr_round_status, final_select_status
+         FROM student_placement_process
+         WHERE placement_drive_id = ANY($1::bigint[])`,
+        [topDriveIds]
+      );
+      const processesByDrive = new Map();
+      for (const row of funnelRes.rows || []) {
+        const driveId = Number(row.placement_drive_id);
+        if (!processesByDrive.has(driveId)) processesByDrive.set(driveId, []);
+        processesByDrive.get(driveId).push(row);
+      }
+      for (const td of top_drives) {
+        const driveRow = drivesById.get(Number(td.id));
+        const processes = processesByDrive.get(Number(td.id)) || [];
+        td.round_funnel = buildDriveRoundFunnel(driveRow?.process_rounds, processes);
+      }
+    }
 
     const offersRes = await pool.query(
       'SELECT id, is_accepted FROM offers WHERE company_id = $1',
@@ -1336,17 +1409,57 @@ exports.getDashboardStats = async (req, res) => {
     const acceptedOffers = (offers || []).filter(o => o.is_accepted === true).length;
     const pendingOffers = totalOffers - acceptedOffers;
 
-    // Chart: offers breakdown (doughnut)
     const chart_offers = { accepted: acceptedOffers, pending: pendingOffers };
 
-    // Chart: drives by status (for doughnut)
     const completedDrives = (drives || []).filter((d) => {
       const status = String(d.placement_status || '').toLowerCase();
       return ['completed', 'closed'].includes(status);
     });
-    const driveStatusCounts = { active: activeDrives.length, completed: completedDrives.length };
+    const chart_drives_status = { active: activeDrives.length, completed: completedDrives.length };
 
-    // Recent activity: recent registrations
+    const driveStatusBreakdown = { scheduled: 0, ongoing: 0, completed: 0, cancelled: 0, other: 0 };
+    (drives || []).forEach((d) => {
+      const status = String(d.placement_status || 'scheduled').toLowerCase();
+      if (['scheduled'].includes(status)) driveStatusBreakdown.scheduled += 1;
+      else if (['ongoing', 'active'].includes(status)) driveStatusBreakdown.ongoing += 1;
+      else if (['completed', 'closed'].includes(status)) driveStatusBreakdown.completed += 1;
+      else if (['cancelled', 'failed'].includes(status)) driveStatusBreakdown.cancelled += 1;
+      else driveStatusBreakdown.other += 1;
+    });
+
+    const registrations_by_job_type = buildRegistrationsByJobType(drives);
+
+    const contactsRes = await pool.query(
+      'SELECT COUNT(*)::int AS count FROM contacts WHERE company_id = $1',
+      [companyId]
+    );
+    const contactsCount = contactsRes.rows[0]?.count || 0;
+
+    const acceptanceRate = totalOffers > 0 ? Math.round((acceptedOffers / totalOffers) * 100) : 0;
+    const conversionRate = totalRegistrations > 0 ? Math.round((totalOffers / totalRegistrations) * 100) : 0;
+    const avgRegistrationsPerDrive =
+      (drives || []).length > 0 ? Math.round(totalRegistrations / drives.length) : 0;
+
+    const upcoming_drives = (drives || [])
+      .filter((d) => {
+        const status = String(d.placement_status || 'scheduled').toLowerCase();
+        return !['completed', 'closed', 'cancelled', 'failed'].includes(status);
+      })
+      .slice(0, 4)
+      .map((d) => {
+        const year = d.academic_year ? String(d.academic_year).trim() : null;
+        const jobType = d.job_type ? String(d.job_type).trim() : null;
+        const titleParts = [year, jobType].filter(Boolean);
+        const title = titleParts.length ? titleParts.join(' · ') : `Drive #${d.id}`;
+        return {
+          id: d.id,
+          title,
+          status: d.placement_status || 'scheduled',
+          registrations: d.number_of_registrations || 0,
+        };
+      });
+
+    // Recent registrations (compact feed)
     const driveIds = (drives || []).map(d => d.id);
     let recentActivity = [];
     
@@ -1358,7 +1471,7 @@ exports.getDashboardStats = async (req, res) => {
          WHERE spp.placement_drive_id = ANY($1::bigint[])
            AND spp.registration_status = 'registered'
          ORDER BY spp.created_at DESC NULLS LAST
-         LIMIT 10`,
+         LIMIT 5`,
         [driveIds]
       );
 
@@ -1379,11 +1492,19 @@ exports.getDashboardStats = async (req, res) => {
           total_registrations: totalRegistrations,
           total_offers: totalOffers,
           accepted_offers: acceptedOffers,
+          pending_offers: pendingOffers,
+          acceptance_rate: acceptanceRate,
+          conversion_rate: conversionRate,
+          avg_registrations_per_drive: avgRegistrationsPerDrive,
+          contacts_count: contactsCount,
         },
-        recent_activity: recentActivity,
-        chart_drives_registrations: chart_drives_registrations,
+        recent_registrations: recentActivity,
+        top_drives: top_drives,
+        upcoming_drives: upcoming_drives,
         chart_offers: chart_offers,
-        chart_drives_status: driveStatusCounts,
+        chart_drives_status: chart_drives_status,
+        drive_status_breakdown: driveStatusBreakdown,
+        registrations_by_job_type: registrations_by_job_type,
       }
     });
   } catch (err) {
