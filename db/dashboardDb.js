@@ -246,6 +246,24 @@ async function getPlacementBySchool() {
        FROM offer_flags of
        GROUP BY COALESCE(of.school_name, 'Unknown')
      ),
+     school_ctc AS (
+       SELECT
+         COALESCE(of.school_name, 'Unknown') AS school,
+         COUNT(*) FILTER (WHERE of.ctc_lpa > 0)::int AS ctc_offer_count,
+         COALESCE(MAX(of.ctc_lpa) FILTER (WHERE of.ctc_lpa > 0), 0)::float AS max_ctc,
+         COALESCE(MIN(of.ctc_lpa) FILTER (WHERE of.ctc_lpa > 0), 0)::float AS min_ctc,
+         COALESCE(AVG(of.ctc_lpa) FILTER (WHERE of.ctc_lpa > 0), 0)::float AS avg_ctc,
+         COUNT(*) FILTER (WHERE of.ctc_lpa > 0 AND of.ctc_lpa < 4)::int AS ctc_b0,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 4 AND of.ctc_lpa < 8)::int AS ctc_b1,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 8 AND of.ctc_lpa < 12)::int AS ctc_b2,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 12 AND of.ctc_lpa < 16)::int AS ctc_b3,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 16 AND of.ctc_lpa < 20)::int AS ctc_b4,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 20 AND of.ctc_lpa < 24)::int AS ctc_b5,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 24 AND of.ctc_lpa < 28)::int AS ctc_b6,
+         COUNT(*) FILTER (WHERE of.ctc_lpa >= 28)::int AS ctc_b7
+       FROM offer_flags of
+       GROUP BY COALESCE(of.school_name, 'Unknown')
+     ),
      school_buckets AS (
        SELECT
          COALESCE(sb.school_name, 'Unknown') AS school,
@@ -267,10 +285,23 @@ async function getPlacementBySchool() {
        CASE
          WHEN ss.total > 0 THEN ROUND((COALESCE(sb.placed, 0)::numeric / ss.total) * 100, 2)
          ELSE 0
-       END AS percent
+       END AS percent,
+       COALESCE(sc.ctc_offer_count, 0)::int AS ctc_offer_count,
+       COALESCE(sc.max_ctc, 0)::float AS max_ctc,
+       COALESCE(sc.min_ctc, 0)::float AS min_ctc,
+       COALESCE(sc.avg_ctc, 0)::float AS avg_ctc,
+       COALESCE(sc.ctc_b0, 0)::int AS ctc_b0,
+       COALESCE(sc.ctc_b1, 0)::int AS ctc_b1,
+       COALESCE(sc.ctc_b2, 0)::int AS ctc_b2,
+       COALESCE(sc.ctc_b3, 0)::int AS ctc_b3,
+       COALESCE(sc.ctc_b4, 0)::int AS ctc_b4,
+       COALESCE(sc.ctc_b5, 0)::int AS ctc_b5,
+       COALESCE(sc.ctc_b6, 0)::int AS ctc_b6,
+       COALESCE(sc.ctc_b7, 0)::int AS ctc_b7
      FROM school_students ss
      LEFT JOIN school_buckets sb ON sb.school = ss.school
      LEFT JOIN school_offer_counts soc ON soc.school = ss.school
+     LEFT JOIN school_ctc sc ON sc.school = ss.school
      ORDER BY ss.school ASC`
   );
 
@@ -283,6 +314,25 @@ async function getPlacementBySchool() {
     totalOffers: r.total_offers,
     placed: r.placed,
     percent: Number(r.percent) || 0,
+    ctcOfferCount: r.ctc_offer_count ?? 0,
+    ctc: {
+      highest: formatLpa(r.max_ctc),
+      average: formatLpa(r.avg_ctc),
+      lowest: formatLpa(r.min_ctc),
+      maxLpa: r.max_ctc ?? 0,
+      avgLpa: r.avg_ctc ?? 0,
+      minLpa: r.min_ctc ?? 0,
+    },
+    ctcDistribution: [
+      r.ctc_b0 ?? 0,
+      r.ctc_b1 ?? 0,
+      r.ctc_b2 ?? 0,
+      r.ctc_b3 ?? 0,
+      r.ctc_b4 ?? 0,
+      r.ctc_b5 ?? 0,
+      r.ctc_b6 ?? 0,
+      r.ctc_b7 ?? 0,
+    ],
   }));
 }
 

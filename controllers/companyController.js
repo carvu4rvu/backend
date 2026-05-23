@@ -2,6 +2,43 @@ const catalogDb = require('../db/catalogDb');
 const placementDb = require('../db/placementDb');
 const pool = require('../config/db');
 const logger = require('../utils/logger');
+const crypto = require('crypto');
+const { attachSnapVariantsToProjectsPool } = require('../utils/projectSnapVariants');
+
+/** Same image asset filter as alumni/admin showcase lists. */
+const PROJECT_IMAGE_ASSET_SQL = `(asset_type IS NULL OR UPPER(TRIM(asset_type::text)) IN ('IMAGE', ''))`;
+
+/** USNs that registered to any of this company's placement drives. */
+async function getAllowedUsnsForCompany(companyId) {
+  const driveIdsRes = await pool.query(
+    'SELECT id FROM placements_drives WHERE company_id = $1',
+    [companyId]
+  );
+  const driveIds = (driveIdsRes.rows || []).map((r) => r.id);
+  if (!driveIds.length) return new Set();
+
+  const usnsRes = await pool.query(
+    `SELECT DISTINCT usn FROM student_placement_process
+     WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != ''`,
+    [driveIds]
+  );
+  return new Set((usnsRes.rows || []).map((r) => r.usn));
+}
+
+/** True when project is approved and owned by a student on one of the company's drives. */
+async function companyCanAccessProject(companyId, projectId) {
+  const allowedUsns = await getAllowedUsnsForCompany(companyId);
+  if (!allowedUsns.size) return null;
+
+  const projRes = await pool.query(
+    `SELECT id, owner_usn FROM projects
+     WHERE id = $1 AND LOWER(TRIM(project_status::text)) = 'approved'`,
+    [projectId]
+  );
+  const p = projRes.rows?.[0];
+  if (!p || !allowedUsns.has(p.owner_usn)) return null;
+  return p;
+}
 
 /**
  * Helper: Get company_id from authenticated user (uses pool = same DB as auth).
@@ -861,19 +898,15 @@ exports.getProjects = async (req, res) => {
       return res.json([]);
     }
 
-    const usnsRes = await pool.query(
-      `SELECT DISTINCT usn FROM student_placement_process
-       WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != ''`,
-      [driveIds]
-    );
-    const usns = (usnsRes.rows || []).map((r) => r.usn);
+    const usns = [...(await getAllowedUsnsForCompany(companyId))];
     if (usns.length === 0) {
       return res.json([]);
     }
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
-        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility
+        p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.visibility,
+        p.project_status, p.created_at
        FROM projects p
        LEFT JOIN project_metrics m ON m.project_id = p.id
        WHERE LOWER(TRIM(p.project_status::text)) = 'approved'
@@ -895,7 +928,8 @@ exports.getProjects = async (req, res) => {
       pool.query(
         `SELECT project_id, original_url, position
          FROM project_assets
-         WHERE project_id = ANY($1::bigint[]) AND asset_role IN ('COVER','GALLERY')
+         WHERE project_id = ANY($1::bigint[])
+           AND ${PROJECT_IMAGE_ASSET_SQL}
          ORDER BY project_id, position`,
         [projectIds]
       ),
@@ -909,8 +943,10 @@ exports.getProjects = async (req, res) => {
       ),
     ]);
     (assetRes.rows || []).forEach((a) => {
+      const url = a.original_url && String(a.original_url).trim();
+      if (!url) return;
       if (!assetsByProj[a.project_id]) assetsByProj[a.project_id] = [];
-      assetsByProj[a.project_id].push(a.original_url);
+      assetsByProj[a.project_id].push(url);
     });
     (likeRes.rows || []).forEach((r) => likedSet.add(r.project_id));
     (favRes.rows || []).forEach((r) => favoritedSet.add(r.project_id));
@@ -924,6 +960,7 @@ exports.getProjects = async (req, res) => {
 
     const list = rows.map((p) => {
       const m = metricMap[p.id] || {};
+      const snaps = assetsByProj[p.id] || [];
       return {
         id: p.id,
         owner_usn: p.owner_usn,
@@ -943,8 +980,11 @@ exports.getProjects = async (req, res) => {
         tech_stack: Array.isArray(p.tech_stack) ? p.tech_stack : [],
         technologies: Array.isArray(p.tech_stack) ? p.tech_stack : [],
         published_at: p.published_at,
-        project_snaps: assetsByProj[p.id] || [],
-        cover_url: (assetsByProj[p.id] && assetsByProj[p.id][0]) || null,
+        created_at: p.created_at,
+        visibility: p.visibility || 'PRIVATE',
+        project_status: p.project_status,
+        project_snaps: snaps,
+        cover_url: snaps[0] || null,
         views_count: m.views ?? 0,
         likes_count: m.likes ?? 0,
         favorites_count: m.favorites ?? 0,
@@ -953,9 +993,16 @@ exports.getProjects = async (req, res) => {
       };
     });
 
+    await attachSnapVariantsToProjectsPool(list).catch((variantErr) => {
+      logger.warn('getProjects: snap_variants attach failed, returning without variants:', variantErr?.message);
+      list.forEach((p) => {
+        if (!p.snap_variants) p.snap_variants = {};
+      });
+    });
+
     res.json(list);
   } catch (err) {
-    logger.error('getProjects error:', err);
+    logger.error('getProjects error:', err?.message || err, err?.stack);
     res.status(500).json({ error: 'Failed to fetch projects' });
   }
 };
@@ -979,34 +1026,26 @@ exports.getProjectById = async (req, res) => {
       return res.status(400).json({ error: 'Invalid project id' });
     }
 
-    const driveIdsRes = await pool.query(
-      'SELECT id FROM placements_drives WHERE company_id = $1',
-      [companyId]
-    );
-    const driveIds = (driveIdsRes.rows || []).map((r) => r.id);
-    const usnsRes = await pool.query(
-      `SELECT DISTINCT usn FROM student_placement_process
-       WHERE placement_drive_id = ANY($1::bigint[]) AND usn IS NOT NULL AND TRIM(usn) != ''`,
-      [driveIds.length ? driveIds : [-1]]
-    );
-    const allowedUsns = new Set((usnsRes.rows || []).map((r) => r.usn));
+    const access = await companyCanAccessProject(companyId, projectId);
+    if (!access) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
 
     const projRes = await pool.query(
       `SELECT p.id, p.owner_usn, p.title, p.short_description, p.description, p.category,
         p.hosted_url, p.github_url, p.mentor_name, p.tech_stack, p.published_at, p.project_status, p.created_at
        FROM projects p
-       WHERE p.id = $1 AND LOWER(TRIM(p.project_status::text)) = 'approved'`,
+       WHERE p.id = $1`,
       [projectId]
     );
     const p = projRes.rows?.[0];
-    if (!p || !allowedUsns.has(p.owner_usn)) {
-      return res.status(404).json({ error: 'Project not found' });
-    }
 
     const [assetRes, likeRes, favRes, metricRes, reviewsRes] = await Promise.all([
       pool.query(
-        `SELECT project_id, original_url, position FROM project_assets
-         WHERE project_id = $1 AND asset_role IN ('COVER','GALLERY') ORDER BY position`,
+        `SELECT project_id, original_url, position
+         FROM project_assets
+         WHERE project_id = $1 AND ${PROJECT_IMAGE_ASSET_SQL}
+         ORDER BY position`,
         [projectId]
       ),
       pool.query('SELECT 1 FROM project_likes WHERE project_id = $1 AND user_id = $2', [projectId, userId]),
@@ -1018,7 +1057,9 @@ exports.getProjectById = async (req, res) => {
         [projectId]
       ),
     ]);
-    const assets = (assetRes.rows || []).map((a) => a.original_url);
+    const assets = (assetRes.rows || [])
+      .map((a) => (a.original_url && String(a.original_url).trim()) || null)
+      .filter(Boolean);
     const metric = metricRes.rows?.[0] || {};
     const reviews = reviewsRes.rows || [];
 
@@ -1058,10 +1099,74 @@ exports.getProjectById = async (req, res) => {
         reviewer_id: r.reviewer_id,
       })),
     };
+
+    await attachSnapVariantsToProjectsPool([project]).catch((variantErr) => {
+      logger.warn('getProjectById: snap_variants attach failed, returning without variants:', variantErr?.message);
+      if (!project.snap_variants) project.snap_variants = {};
+    });
+
     res.json(project);
   } catch (err) {
-    logger.error('getProjectById error:', err);
+    logger.error('getProjectById error:', err?.message || err, err?.stack);
     res.status(500).json({ error: 'Failed to fetch project' });
+  }
+};
+
+/**
+ * POST /company/projects/:projectId/share-links
+ * Create a share link for a project visible to this company (same payload shape as admin share-links).
+ */
+exports.createProjectShareLink = async (req, res) => {
+  try {
+    const companyId = await getCompanyIdFromUser(req);
+    if (!companyId) {
+      return res.status(403).json({ error: 'Company not linked to this account' });
+    }
+
+    const projectId = parseInt(req.params.projectId, 10);
+    if (Number.isNaN(projectId)) {
+      return res.status(400).json({ error: 'Invalid project id' });
+    }
+
+    const access = await companyCanAccessProject(companyId, projectId);
+    if (!access) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const expiresInHours = req.body?.expires_in_hours != null
+      ? parseInt(req.body.expires_in_hours, 10)
+      : 168;
+    const expiresAt = expiresInHours > 0
+      ? new Date(Date.now() + expiresInHours * 60 * 60 * 1000)
+      : null;
+
+    const shareToken = crypto.randomBytes(24).toString('hex');
+    await pool.query(
+      `INSERT INTO project_share_links (project_id, share_token, expires_at, is_active)
+       VALUES ($1, $2, $3, true)`,
+      [projectId, shareToken, expiresAt]
+    );
+
+    const linkRes = await pool.query(
+      `SELECT id, share_token, expires_at, is_active, created_at
+       FROM project_share_links
+       WHERE project_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [projectId]
+    );
+    const link = linkRes.rows?.[0];
+    if (!link) {
+      return res.status(500).json({ error: 'Failed to create share link' });
+    }
+
+    res.status(201).json({
+      ...link,
+      url: `/projects/share/${link.share_token}`,
+    });
+  } catch (err) {
+    logger.error('createProjectShareLink error:', err?.message || err, err?.stack);
+    res.status(500).json({ error: 'Failed to create share link' });
   }
 };
 

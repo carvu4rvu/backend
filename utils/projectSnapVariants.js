@@ -33,7 +33,7 @@ async function loadSnapVariantsByProjectIds(client, projectIds) {
     if (!byProject[pid][url]) byProject[pid][url] = {};
     byProject[pid][url][row.variant_type] = {
       url: row.variant_url,
-      width: row.width ?? null,
+      width: row.width != null ? Number(row.width) : null,
     };
   });
   return byProject;

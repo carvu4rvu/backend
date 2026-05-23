@@ -34,6 +34,7 @@ router.get('/events', ...companyAuth, companyController.getEvents);
 
 // Student projects (only students who registered to company's drives)
 router.get('/projects', ...companyAuth, companyController.getProjects);
+router.post('/projects/:projectId/share-links', ...companyAuth, companyController.createProjectShareLink);
 router.get('/projects/:projectId', ...companyAuth, companyController.getProjectById);
 
 // Notifications
